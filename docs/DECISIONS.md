@@ -513,3 +513,31 @@ ADR-022), Jobs (live progress).
 5. Both front ends: `nest plan` / `nest group` and the web UI's Space view
    (targets per host or group, the proposed steps with their files, the
    blockers, Apply, and group editing).
+
+## ADR-023 — FUSE over io_uring: deferred behind the idle-state experiment (2026-09-27)
+
+**Context.** On the Sparks, daemon-mediated I/O is bound by about 0.5 ms
+per FUSE request (benchmarks/M4-FIRST-MEASUREMENTS.md). The suspected cause
+is waking an idle core: Spark ACPI LPI states take 231–433 µs to exit.
+FUSE over io_uring (kernel 6.14+) gives each CPU its own request queue, so
+a request is answered on the core that issued it, which is awake, and
+each round trip saves a read/write syscall pair.
+
+**Findings.** The kernels have `CONFIG_FUSE_IO_URING=y`, but
+`/sys/module/fuse/parameters/enable_uring` is off and only root can turn it
+on (`options fuse enable_uring=1` in modprobe.d). fuser 0.18 defines the
+`FUSE_OVER_IO_URING` init flag but has no ring transport: no
+`FUSE_IO_URING_CMD_REGISTER` / commit-and-fetch loop. Adopting it means
+writing that session layer (io_uring `URING_CMD` on `/dev/fuse`, one queue
+per core, fixed buffers sized to `max_write`) under fuser's request
+decoding: roughly 1–2k lines plus fallback to the read/write channel.
+
+**Decision.** Deferred. The cheaper experiment tests the same hypothesis
+first: `sudo cpupower idle-set -D 100` on one Spark and rerun the FUSE
+single-stream benchmark (root, reversible with `idle-set -E`). If
+latency drops toward raptor's (about 0.1 ms per request), core-affine
+queues are worth building. Do it as a sparknest-owned transport behind a
+config switch, keeping the /dev/fuse read path as the fallback. If latency
+does not move, the bottleneck is elsewhere and io_uring is not the lever.
+Sealed files already bypass the daemon via passthrough (ADR-014), so this
+matters only for unsealed files and metadata-heavy work.
