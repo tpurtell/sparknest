@@ -178,8 +178,11 @@ repo `blobs/<etag>` a relative symlink. Every existing cache on raptor and the
 Sparks is the older repo-local layout (venvs run 1.24–1.30); the marker on
 raptor was created on 2026-09-25 by a newer client.
 
-**Decision.** The sparknest-managed hub targets the shared-blob layout; all
-nodes download with huggingface_hub ≥ 1.32. The resolver reads any layout by
+**Decision.** The sparknest-managed hub targets the shared-blob layout.
+Validation target is huggingface_hub 2.0.x (what the user runs via Homebrew);
+the layout floor is 1.32, and 2.0 changed the HTTP stack and removed deprecated
+APIs without touching the cache format. Venv pins may lag as long as they are
+≥ 1.32 for anything that downloads into the mount. The resolver reads any layout by
 following symlink chains to terminal files. `nest import --adopt` preserves
 legacy layouts unchanged. Sealing triggers on rename from `*.incomplete` under
 any `blobs/` directory. `trees/<commit>.json` drives completeness.

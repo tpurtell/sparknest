@@ -321,7 +321,8 @@ repo-local blob into the shared store: that would require the Xet hash, which
 only the downloader knows (ADR-008, no hashing). Legacy content is still
 deduplicated for placement and accounting by shared terminal identity within a
 repo, and across hosts by path+size adoption. New downloads land in the shared
-store because all nodes run huggingface_hub ≥ 1.32 against the mount.
+store because downloads use huggingface_hub 2.x (the `hf` CLI is 2.0.0 via
+Homebrew; 1.32 is the floor for the layout, 2.0 changed only the HTTP stack).
 
 Download mechanics that shape the FUSE/write design (from `file_download.py`):
 `hf_xet` writes **directly into `<blob>.incomplete` with parallel random-offset

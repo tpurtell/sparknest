@@ -63,7 +63,7 @@ raw CSV).
 - HF resolver: shared-blob store normative, legacy repo-local and no-symlink
   layouts readable (ADR-010); `trees/<commit>.json` for completeness; auto-seal
   at `*.incomplete` rename under `blobs/`; readiness matrix.
-- Validation with huggingface_hub ≥ 1.32 (and one legacy 1.2x client) on a
+- Validation with huggingface_hub 2.0.x (and one legacy 1.2x client) on a
   trial mount: real `hf download` of a small Xet-backed model lands in
   `hub/blobs/<xx>/` with `.refs` appended and no silent fallback; concurrent
   download of the same repo from two nodes with `.locks` working; parallel

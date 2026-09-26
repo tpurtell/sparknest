@@ -59,8 +59,9 @@ one-time root checklist below.
   root `hub/blobs/` with marker `.huggingface-shared-blobs` and one entry
   `blobs/09/<sha>` + `.refs` (created 2026-09-25 by a client ≥ 1.32; the
   referencing repo has since been deleted). One repo has a `trees/` dir.
-  `huggingface_hub` in venvs: 1.24, 1.26, 1.30 (predate shared blobs; upgrade
-  to ≥ 1.32 before migration). `~/.cache/huggingface/xet/` exists (chunk cache,
+  `huggingface_hub` in venvs: 1.24, 1.26, 1.30 (predate shared blobs; the Homebrew
+  `hf` CLI is 2.0.0 as of 2026-09-26; venvs that download into the mount need
+  ≥ 1.32). `~/.cache/huggingface/xet/` exists (chunk cache,
   disabled by default since hf_xet 1.2; keep local).
 
 ## Toolchains
