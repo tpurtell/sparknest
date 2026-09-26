@@ -7,7 +7,7 @@
 # Never touches real data: trial layout only (scripts/cluster.env).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-source scripts/cluster.env
+source "${SPARKNEST_ENV:-scripts/cluster.env}"
 
 build=1 restart=0
 for a in "$@"; do

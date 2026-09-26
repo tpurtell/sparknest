@@ -85,20 +85,21 @@ web UI with its token (`api_listen` must be set for the web UI).
 
 ## Hugging Face cache
 
-Point the cache at the mount. Every host then shares one cache:
+Give the hub a seal policy, adopt the existing cache, and point the hub
+directory at the mount (tokens and `xet/` stay local):
 
 ```sh
-mv ~/.cache/huggingface ~/.cache/huggingface.old   # or import it, below
-ln -s /mnt/sparknest ~/.cache/huggingface
+mkdir /mnt/sparknest/hub && nest policy /hub incomplete
+nest import --move --wait ~/.cache/huggingface/hub /hub
+mv ~/.cache/huggingface/hub ~/.cache/huggingface/hub.old   # leftovers only
+ln -s /mnt/sparknest/hub ~/.cache/huggingface/hub
 ```
 
-Use `huggingface_hub` 1.32 or newer (2.0 recommended). Existing caches, in
-either the current shared-blob layout or older ones, can be adopted without
-copying when they are on the same filesystem as the state directory:
-
-```sh
-nest import --wait ~/.cache/huggingface.old/hub /hub
-```
+Import hard-links, so the cache must share a filesystem with the state
+directory. On further hosts, blobs the cluster already has become that
+host's copies without any transfer. Either Hugging Face cache layout is
+accepted. Use `huggingface_hub` 1.32 or newer (2.0 recommended).
+`docs/MIGRATION.md` is the full walk-through for an existing fleet.
 
 ## Placement, archives and space
 

@@ -3,6 +3,25 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-27 — M8: release tooling, migration tooling
+
+- Every CLI command prints plain text (`--json` for machines); the web UI
+  has a Space view for plans and groups; plans revalidate rules per step.
+- `scripts/release.sh` builds v0.1.0 from `git archive`: native x86_64 and
+  aarch64 tarballs (max GLIBC_2.39, the tap's ceiling), checksums, and the
+  Homebrew formula rendered from `packaging/homebrew/sparknest.rb.in`.
+  `scripts/test-formula.sh` builds, tests (a one-node import, offload,
+  snapshot and export round trip), audits style, linkage and ABI through a
+  throwaway tap: passes on raptor.
+- Import adopts blobs the namespace already has (hard link, no transfer),
+  so each Spark's existing cache joins without copies or extra space.
+- `scripts/cluster.sh` + `scripts/cluster-main.env` run the real cluster
+  beside the trial; `cluster.sh bootstrap` founds it once and refuses when
+  Raft state exists. `docs/MIGRATION.md` is the user-driven playbook;
+  `docs/INSTALL.md` and `docs/RELEASING.md` cover new users and releases.
+- Blocked on the user: making the GitHub repo public and publishing the
+  release; the root checklist; the switch at 200G for benchmarks.
+
 ## 2026-09-27 — Backups, web UI, groups and free-space plans
 
 - M6 finished: versioned backups and restore into archive stores, periodic
