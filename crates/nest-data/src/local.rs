@@ -1,7 +1,7 @@
 use nest_meta::{Effect, query};
 use nest_raft::{EffectHandler, MetaNode, SmEvent};
 use nest_store::{ObjectKey, ObjectStore};
-use nest_types::{FileId, Generation, NodeId, SessionId};
+use nest_types::{FileId, Generation, NodeId, SessionId, StoreId};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +22,38 @@ enum ObjOp {
         key: ObjectKey,
         from: Option<ObjectKey>,
     },
+}
+
+/// First store id used for archive stores; lower ids are node live stores.
+pub const ARCHIVE_STORE_BASE: u64 = 1 << 20;
+
+/// Whether `store` is an archive store (as opposed to a node's live store).
+pub fn is_archive(store: StoreId) -> bool {
+    store.0 >= ARCHIVE_STORE_BASE
+}
+
+/// Configuration of an archive store (the `config` JSON of its row).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ArchiveConfig {
+    pub path: String,
+    pub gateways: Vec<NodeId>,
+}
+
+/// An archive store this node is a gateway for.
+pub struct Archive {
+    pub id: StoreId,
+    pub name: String,
+    pub config: ArchiveConfig,
+    pub identity: String,
+    pub store: Arc<ObjectStore>,
+}
+
+impl Archive {
+    /// Healthy means the marker is present: never read from or write into an
+    /// unmounted share's empty mountpoint.
+    pub fn healthy(&self) -> bool {
+        nest_store::marker_ok(std::path::Path::new(&self.config.path), &self.identity)
+    }
 }
 
 /// An observer of applied effects, with the log index of the batch that
@@ -84,6 +116,8 @@ pub struct DataNode {
     /// Pooled read-only metadata connections for hot paths (opening one
     /// costs far more than a query).
     readers: Mutex<Vec<rusqlite::Connection>>,
+    /// Archive stores this node is a gateway for, opened on first use.
+    archives: Mutex<HashMap<StoreId, Arc<Archive>>>,
     weak: Weak<DataNode>,
 }
 
@@ -133,6 +167,7 @@ impl DataNode {
             lease_until: Mutex::new(None),
             lease,
             readers: Mutex::new(Vec::new()),
+            archives: Mutex::new(HashMap::new()),
         });
         for rx in receivers {
             tokio::spawn(worker(Arc::downgrade(&d), rx, d.gate.subscribe()));
@@ -160,6 +195,67 @@ impl DataNode {
 
     pub fn session(&self) -> Option<SessionId> {
         self.st.lock().session
+    }
+
+    /// The identity string written into a store's marker.
+    pub fn store_identity(&self, id: StoreId, name: &str) -> String {
+        format!(
+            "cluster={} store={} name={name}",
+            self.meta().cluster(),
+            id.0
+        )
+    }
+
+    /// Configuration and gateways of an archive store, from metadata.
+    pub fn archive_row(&self, id: StoreId) -> Option<(String, ArchiveConfig)> {
+        let rows = self.with_reader(query::stores).ok()?;
+        let row = rows.into_iter().find(|r| r.id == id)?;
+        let cfg: ArchiveConfig = serde_json::from_str(&row.config).ok()?;
+        Some((row.name, cfg))
+    }
+
+    /// An archive store this node serves as gateway, if healthy.
+    pub fn archive(&self, id: StoreId) -> Option<Arc<Archive>> {
+        if !is_archive(id) {
+            return None;
+        }
+        if let Some(a) = self.archives.lock().get(&id).cloned() {
+            return a.healthy().then_some(a);
+        }
+        let (name, config) = self.archive_row(id)?;
+        if !config.gateways.contains(&self.id) {
+            return None;
+        }
+        let identity = self.store_identity(id, &name);
+        if !nest_store::marker_ok(std::path::Path::new(&config.path), &identity) {
+            return None;
+        }
+        let store = ObjectStore::open_with_staging(
+            std::path::Path::new(&config.path),
+            &format!("staging-{}", self.id),
+        )
+        .ok()?;
+        let a = Arc::new(Archive {
+            id,
+            name,
+            config,
+            identity,
+            store: Arc::new(store),
+        });
+        self.archives.lock().insert(id, a.clone());
+        Some(a)
+    }
+
+    /// True if this node may serve `key` from archive store `store` now.
+    pub fn servable_archive(&self, store: StoreId, key: ObjectKey) -> Option<Arc<Archive>> {
+        if !self.lease_valid() {
+            return None;
+        }
+        let a = self.archive(store)?;
+        let live = self
+            .with_reader(|c| query::has_live_replica(c, key.file, key.generation, store))
+            .unwrap_or(false);
+        (live && a.store.exists(key)).then_some(a)
     }
 
     /// Run `f` with a pooled read-only metadata connection.
@@ -293,6 +389,26 @@ impl DataNode {
     fn on_effect(&self, e: &Effect) {
         let mine = self.id.live_store();
         match e {
+            Effect::ReplicaInvalidated {
+                file,
+                generation,
+                store,
+            } if is_archive(*store) => {
+                // The primary gateway removes stale archive copies.
+                let primary = self
+                    .archive_row(*store)
+                    .and_then(|(_, c)| c.gateways.first().copied());
+                if primary == Some(self.id)
+                    && let Some(a) = self.archive(*store)
+                {
+                    let key = ObjectKey::new(*file, *generation);
+                    std::thread::spawn(move || {
+                        if let Err(e) = a.store.delete(key) {
+                            tracing::error!(?key, store = %a.name, error = %e, "deleting stale archive copy failed");
+                        }
+                    });
+                }
+            }
             Effect::ReplicaInvalidated {
                 file,
                 generation,

@@ -74,8 +74,15 @@ impl ObjectStore {
     /// Incomplete staging files from a previous run are discarded:
     /// interrupted transfers restart from scratch.
     pub fn open(root: &Path) -> io::Result<Self> {
+        Self::open_with_staging(root, "staging")
+    }
+
+    /// Open with a named staging directory (archive stores shared by several
+    /// gateways give each gateway its own, so none discards another's
+    /// in-flight transfers).
+    pub fn open_with_staging(root: &Path, staging_dir: &str) -> io::Result<Self> {
         let objects = root.join("objects");
-        let staging = root.join("staging");
+        let staging = root.join(staging_dir);
         fs::create_dir_all(&objects)?;
         fs::create_dir_all(&staging)?;
         for i in 0..=255u8 {
@@ -280,14 +287,62 @@ impl Drop for Staging {
 }
 
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    nix::fcntl::renameat2(
+    match nix::fcntl::renameat2(
         nix::fcntl::AT_FDCWD,
         from,
         nix::fcntl::AT_FDCWD,
         to,
         nix::fcntl::RenameFlags::RENAME_NOREPLACE,
-    )
-    .map_err(io::Error::from)
+    ) {
+        Ok(()) => Ok(()),
+        // Some filesystems (CIFS, ntfs3) reject the flag. Object names are
+        // unique per (file, generation) and this node is their only writer,
+        // so check-then-rename is safe here.
+        Err(
+            nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS | nix::errno::Errno::EOPNOTSUPP,
+        ) => {
+            if to.exists() {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            fs::rename(from, to)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Name of the marker file identifying a store's root.
+pub const MARKER: &str = ".sparknest-store";
+
+/// Write (or verify) the marker identifying `root` as `identity`. Refuses a
+/// root that holds a different store's marker, or files but no marker.
+pub fn init_marker(root: &Path, identity: &str) -> io::Result<()> {
+    let m = root.join(MARKER);
+    match fs::read_to_string(&m) {
+        Ok(existing) if existing.trim() == identity.trim() => return Ok(()),
+        Ok(existing) => {
+            return Err(io::Error::other(format!(
+                "{} belongs to another store ({})",
+                root.display(),
+                existing.trim()
+            )));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+    fs::write(&m, format!("{}\n", identity.trim()))?;
+    File::open(root)?.sync_all()
+}
+
+/// True if `root` carries the marker for `identity`: an unmounted share
+/// shows an empty mountpoint without it and is never written to.
+pub fn marker_ok(root: &Path, identity: &str) -> bool {
+    fs::read_to_string(root.join(MARKER)).is_ok_and(|s| s.trim() == identity.trim())
 }
 
 fn sync_dir(child: &Path) -> io::Result<()> {

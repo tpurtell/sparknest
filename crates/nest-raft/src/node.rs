@@ -184,6 +184,10 @@ impl MetaNode {
         self.cfg.node
     }
 
+    pub fn cluster(&self) -> &str {
+        &self.cfg.cluster
+    }
+
     pub fn raft(&self) -> &Raft {
         &self.raft
     }

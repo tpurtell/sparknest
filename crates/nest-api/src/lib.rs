@@ -111,6 +111,8 @@ pub fn router(api: Api) -> Router {
         .route("/v1/jobs", get(jobs))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/import", post(import))
+        .route("/v1/stores", get(stores).post(add_store))
+        .route("/v1/offload", post(offload))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/remove", post(cluster_remove))
         .route("/v1/cluster/add", post(cluster_add))
@@ -459,4 +461,39 @@ async fn cluster_add(State(api): State<Api>, Json(r): Json<AddReq>) -> R<serde_j
         })
         .await?;
     Ok(Json(json!({ "added": r.id, "voter": r.voter })))
+}
+
+async fn stores(State(api): State<Api>) -> R<serde_json::Value> {
+    Ok(Json(json!({ "stores": api.placer.stores().await? })))
+}
+
+#[derive(Deserialize)]
+struct AddStoreReq {
+    name: String,
+    path: String,
+    gateways: Vec<String>,
+}
+
+async fn add_store(State(api): State<Api>, Json(r): Json<AddStoreReq>) -> R<serde_json::Value> {
+    let results = api.placer.add_store(&r.name, &r.path, &r.gateways).await?;
+    let gateways: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|(g, r)| json!({ "gateway": g, "ok": r.is_ok(), "error": r.err() }))
+        .collect();
+    Ok(Json(json!({ "name": r.name, "gateways": gateways })))
+}
+
+#[derive(Deserialize)]
+struct OffloadReq {
+    selector: String,
+    store: String,
+    #[serde(default = "par")]
+    parallel: usize,
+}
+
+async fn offload(State(api): State<Api>, Json(r): Json<OffloadReq>) -> R<serde_json::Value> {
+    let sel = api.selector(&r.selector)?;
+    Ok(Json(
+        json!({ "job": api.placer.offload(sel, r.store, r.parallel).await? }),
+    ))
 }

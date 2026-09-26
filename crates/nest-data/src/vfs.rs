@@ -744,16 +744,30 @@ impl Vfs {
     /// Nodes holding a live copy of the current generation, this node last,
     /// rotated by file id to spread load.
     fn holders(&self, a: &FileAttr) -> NestResult<Vec<NodeId>> {
-        let mut nodes: Vec<NodeId> = self
+        let replicas: Vec<_> = self
             .q(|c| query::replicas(c, a.id))?
             .into_iter()
             .filter(|r| r.generation == a.generation && r.state == nest_types::ReplicaState::Live)
+            .collect();
+        let mut nodes: Vec<NodeId> = replicas
+            .iter()
+            .filter(|r| !crate::is_archive(r.store))
             .map(|r| NodeId(r.store.0))
             .filter(|n| *n != self.me())
             .collect();
         if !nodes.is_empty() {
             let k = (a.id.0 as usize) % nodes.len();
             nodes.rotate_left(k);
+        }
+        // Archive copies are read through their gateways, after live copies.
+        for r in replicas.iter().filter(|r| crate::is_archive(r.store)) {
+            if let Some((_, cfg)) = self.d.archive_row(r.store) {
+                for g in cfg.gateways {
+                    if g != self.me() && !nodes.contains(&g) {
+                        nodes.push(g);
+                    }
+                }
+            }
         }
         Ok(nodes)
     }
@@ -1009,23 +1023,46 @@ impl Vfs {
 
     /// The object holding exactly `generation` of `file`, if this node may
     /// serve it right now (the rule every remote read goes through).
+    /// Where this node can read `a`'s current generation locally: its live
+    /// store (owned here, or a servable live copy) or an archive store it is
+    /// a gateway for.
+    fn local_source(&self, a: &FileAttr) -> Option<Arc<nest_store::ObjectStore>> {
+        let key = ObjectKey::new(a.id, a.generation);
+        match (a.gen_state, a.owner) {
+            (GenState::Owned, Some(o)) if o == self.me() => Some(self.d.store().clone()),
+            (GenState::Stable, _) => {
+                if self.d.servable(key) {
+                    return Some(self.d.store().clone());
+                }
+                let replicas = self.q(|c| query::replicas(c, a.id)).ok()?;
+                replicas
+                    .into_iter()
+                    .filter(|r| r.generation == a.generation && crate::is_archive(r.store))
+                    .find_map(|r| self.d.servable_archive(r.store, key))
+                    .map(|arch| arch.store.clone())
+            }
+            _ => None,
+        }
+    }
+
     fn servable_object(&self, file: FileId, generation: Generation) -> NestResult<std::fs::File> {
         let a = self.raw_attr(file)?;
         if a.generation != generation {
             return Err(NestError::Stale);
         }
         let key = ObjectKey::new(file, generation);
-        let ok = match (a.gen_state, a.owner) {
-            (GenState::Owned, Some(o)) => o == self.me(),
-            (GenState::Stable, _) => self.d.servable(key),
-            _ => false,
-        };
-        if !ok {
+        let Some(src) = self.local_source(&a) else {
             return Err(NestError::Unavailable(
                 "no copy of that generation here".into(),
             ));
-        }
-        self.d.store().open_read(key).map_err(io)
+        };
+        src.open_read(key).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NestError::Stale // invalidated since the check
+            } else {
+                io(e)
+            }
+        })
     }
 
     /// Read bytes of exactly `generation` from this node, if it may serve it.
@@ -1227,18 +1264,13 @@ impl Vfs {
             }
             let a = self.raw_attr(h.file)?;
             let key = ObjectKey::new(h.file, a.generation);
-            let local = match (a.gen_state, a.owner) {
-                (GenState::Owned, Some(o)) => o == self.me(),
-                (GenState::Stable, _) => self.d.servable(key),
-                _ => false,
-            };
-            if local {
+            if let Some(src) = self.local_source(&a) {
                 let _t = self.track(h.file);
                 let f = {
                     let mut r = h.reader.lock();
                     match r.as_ref() {
                         Some((k, f)) if *k == key => f.clone(),
-                        _ => match self.d.store().open_read(key) {
+                        _ => match src.open_read(key) {
                             Ok(f) => {
                                 let f = Arc::new(f);
                                 *r = Some((key, f.clone()));
@@ -1371,19 +1403,14 @@ impl Vfs {
         let h = self.handle(fh).ok()?;
         let a = self.raw_attr(h.file).ok()?;
         let key = ObjectKey::new(h.file, a.generation);
-        let local = match (a.gen_state, a.owner) {
-            (GenState::Owned, Some(o)) => o == self.me(),
-            (GenState::Stable, _) => self.d.servable(key),
-            _ => false,
-        };
-        if local {
+        if let Some(src) = self.local_source(&a) {
             let _t = self.track(h.file);
             let f = {
                 let mut r = h.reader.lock();
                 match r.as_ref() {
                     Some((k, f)) if *k == key => f.clone(),
                     _ => {
-                        let f = match self.d.store().open_read(key) {
+                        let f = match src.open_read(key) {
                             Ok(f) => Arc::new(f),
                             // Invalidated since the check: the slow path
                             // refreshes and routes to the new owner.
@@ -1657,6 +1684,28 @@ impl Vfs {
     /// place, then published conditionally: if the generation moved in the
     /// meantime publication is refused and the copy deleted.
     pub async fn replicate_here(&self, file: FileId) -> NestResult<u64> {
+        self.replicate_into(file, self.me().live_store()).await
+    }
+
+    /// Replicate into `target`: this node's live store, or an archive store
+    /// this node is a (healthy) gateway for.
+    pub async fn replicate_into(
+        &self,
+        file: FileId,
+        target: nest_types::StoreId,
+    ) -> NestResult<u64> {
+        let dest: Arc<nest_store::ObjectStore> = if target == self.me().live_store() {
+            self.d.store().clone()
+        } else {
+            match self.d.archive(target) {
+                Some(a) => a.store.clone(),
+                None => {
+                    return Err(NestError::Unavailable(format!(
+                        "store {target} is not reachable through this node (not a gateway, or its marker is missing)"
+                    )));
+                }
+            }
+        };
         let a = self.raw_attr(file)?;
         if a.kind != FileKind::Regular {
             return Err(NestError::Invalid(
@@ -1667,17 +1716,30 @@ impl Vfs {
             return Err(NestError::Busy("file is being written".into()));
         }
         let key = ObjectKey::new(file, a.generation);
-        let me_store = self.me().live_store();
+        let me_store = target;
         if self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
             return Ok(0);
         }
         let holders = self.holders(&a)?;
-        if holders.is_empty() {
+        // A copy on this node (live store or another archive we gateway) is
+        // the cheapest source: copy it locally.
+        let mut sources: Vec<Option<NodeId>> = Vec::new();
+        if let Some(local) = self.local_source(&a)
+            && !Arc::ptr_eq(&local, &dest)
+        {
+            sources.push(None);
+        }
+        sources.extend(holders.into_iter().map(Some));
+        if sources.is_empty() {
             return Err(NestError::Unavailable("no live copy to copy from".into()));
         }
         let mut last = NestError::Unavailable("no holder reachable".into());
-        for src in holders {
-            match self.copy_from(src, &a).await {
+        for src in sources {
+            let copied = match src {
+                None => self.copy_local(&a, &dest).await,
+                Some(n) => self.copy_from(n, &a, &dest).await,
+            };
+            match copied {
                 Ok(()) => {
                     let r = self
                         .propose(Command::PublishReplica {
@@ -1689,7 +1751,7 @@ impl Vfs {
                     return match r {
                         Ok(_) => Ok(a.size),
                         Err(e) => {
-                            let _ = self.d.store().delete(key);
+                            let _ = dest.delete(key);
                             Err(e)
                         }
                     };
@@ -1701,9 +1763,14 @@ impl Vfs {
         Err(last)
     }
 
-    async fn copy_from(&self, src: NodeId, a: &FileAttr) -> NestResult<()> {
+    async fn copy_from(
+        &self,
+        src: NodeId,
+        a: &FileAttr,
+        dest: &Arc<nest_store::ObjectStore>,
+    ) -> NestResult<()> {
         let key = ObjectKey::new(a.id, a.generation);
-        let store = self.d.store().clone();
+        let store = dest.clone();
         let staging = tokio::task::spawn_blocking(move || store.begin_staging(key))
             .await
             .expect("blocking task")
@@ -1760,7 +1827,7 @@ impl Vfs {
             }
         }
         let st = staging.lock().take().expect("staging open");
-        let store = self.d.store().clone();
+        let store = dest.clone();
         let size = a.size;
         tokio::task::spawn_blocking(move || {
             st.file().set_len(size)?;
@@ -1770,6 +1837,58 @@ impl Vfs {
         .expect("blocking task")
         .map_err(io)?;
         Ok(())
+    }
+
+    /// Copy the local object into `dest` (e.g. live store to an archive this
+    /// node is a gateway for) with `copy_file_range`, then commit.
+    async fn copy_local(
+        &self,
+        a: &FileAttr,
+        dest: &Arc<nest_store::ObjectStore>,
+    ) -> NestResult<()> {
+        let key = ObjectKey::new(a.id, a.generation);
+        let src = self.local_source(a).ok_or(NestError::Stale)?;
+        let dest = dest.clone();
+        let size = a.size;
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let from = src.open_read(key)?;
+            let st = dest.begin_staging(key)?;
+            use std::os::fd::AsRawFd;
+            let (mut off_in, mut off_out): (libc::loff_t, libc::loff_t) = (0, 0);
+            while (off_in as u64) < size {
+                let want = ((size - off_in as u64) as usize).min(1 << 30);
+                // SAFETY: both fds are open for the duration; offsets are
+                // valid pointers to locals.
+                let n = unsafe {
+                    libc::copy_file_range(
+                        from.as_raw_fd(),
+                        &mut off_in,
+                        st.file().as_raw_fd(),
+                        &mut off_out,
+                        want,
+                        0,
+                    )
+                };
+                if n < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if n == 0 {
+                    return Err(std::io::Error::other(format!(
+                        "short copy: {off_in} of {size} bytes"
+                    )));
+                }
+            }
+            dest.commit_staging(st).map(|_| ())
+        })
+        .await
+        .expect("blocking task")
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NestError::Stale
+            } else {
+                io(e)
+            }
+        })
     }
 
     async fn tcp_read(
@@ -1799,8 +1918,13 @@ impl Vfs {
 
     /// Remove this node's copy of `file` (refused for the last live copy).
     pub async fn evict_here(&self, file: FileId) -> NestResult<bool> {
+        self.evict_from(file, self.me().live_store()).await
+    }
+
+    /// Remove `store`'s copy of `file` (refused for the last live copy).
+    pub async fn evict_from(&self, file: FileId, store: nest_types::StoreId) -> NestResult<bool> {
         let a = self.raw_attr(file)?;
-        let me_store = self.me().live_store();
+        let me_store = store;
         if !self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
             return Ok(false);
         }

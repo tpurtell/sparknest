@@ -5,7 +5,7 @@ use crate::selector::{self, Manifest};
 use crate::spec::{RuleSpec, Selector};
 use nest_data::Vfs;
 use nest_meta::{Command, StoreClass, query};
-use nest_types::{FileId, NestError, NestResult, NodeId};
+use nest_types::{FileId, NestError, NestResult, NodeId, StoreId};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -17,6 +17,23 @@ use std::time::Duration;
 pub struct HostRef {
     pub node: NodeId,
     pub name: String,
+}
+
+/// Where copies go: a node's live store or an archive store, and the node
+/// that does the work (the node itself, or a gateway of the archive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Target {
+    pub name: String,
+    pub store: StoreId,
+    pub node: NodeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoreStatus {
+    pub id: StoreId,
+    pub name: String,
+    pub path: String,
+    pub gateways: Vec<(String, admin::StoreHealth)>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -75,7 +92,10 @@ async fn auto_reconcile(p: std::sync::Weak<Placer>) {
         };
         dirty.notified().await;
         // Debounce: wait until no change for the quiet period.
-        while tokio::time::timeout(AUTO_DEBOUNCE, dirty.notified()).await.is_ok() {}
+        while tokio::time::timeout(AUTO_DEBOUNCE, dirty.notified())
+            .await
+            .is_ok()
+        {}
         let Some(p) = p.upgrade() else { return };
         if p.vfs.data().meta().leader() != Some(p.vfs.data().id()) {
             continue;
@@ -217,6 +237,179 @@ impl Placer {
         Ok(out)
     }
 
+    /// Archive stores: (id, name, config).
+    pub fn archive_stores(&self) -> NestResult<Vec<(StoreId, String, nest_data::ArchiveConfig)>> {
+        Ok(query::stores(&self.conn()?)
+            .map_err(sql)?
+            .into_iter()
+            .filter(|r| nest_data::is_archive(r.id))
+            .filter_map(|r| {
+                serde_json::from_str(&r.config)
+                    .ok()
+                    .map(|c| (r.id, r.name, c))
+            })
+            .collect())
+    }
+
+    /// Check that every name is a node, "@all", or an archive store.
+    pub fn validate_targets(&self, names: &[String]) -> NestResult<()> {
+        let nodes = self.nodes()?;
+        let stores = self.archive_stores()?;
+        for n in names {
+            let known = n == "@all"
+                || nodes
+                    .iter()
+                    .any(|h| h.name == *n || format!("node{}", h.node) == *n)
+                || stores.iter().any(|(_, s, _)| s == n);
+            if !known {
+                return Err(NestError::Invalid(format!("unknown host or store {n:?}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve names to targets. Archive stores are worked by their first
+    /// gateway that reports the store healthy.
+    pub async fn resolve_targets(&self, names: &[String]) -> NestResult<Vec<Target>> {
+        self.validate_targets(names)?;
+        let stores = self.archive_stores()?;
+        let node_names: Vec<String> = names
+            .iter()
+            .filter(|n| !stores.iter().any(|(_, s, _)| s == *n))
+            .cloned()
+            .collect();
+        let mut out: Vec<Target> = self
+            .resolve_hosts(&node_names)?
+            .into_iter()
+            .map(|h| Target {
+                name: h.name,
+                store: h.node.live_store(),
+                node: h.node,
+            })
+            .collect();
+        for (id, name, cfg) in stores.into_iter().filter(|(_, s, _)| names.contains(s)) {
+            let mut chosen = None;
+            for g in &cfg.gateways {
+                if matches!(self.store_health(*g, id).await, Ok(h) if h.healthy) {
+                    chosen = Some(*g);
+                    break;
+                }
+            }
+            let node = chosen.ok_or_else(|| {
+                NestError::Unavailable(format!("no gateway of store {name} can reach it"))
+            })?;
+            out.push(Target {
+                name,
+                store: id,
+                node,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn store_health(
+        &self,
+        gateway: NodeId,
+        store: StoreId,
+    ) -> NestResult<admin::StoreHealth> {
+        match admin::call(
+            self.rpc(),
+            gateway,
+            &AdminReq::StoreHealth { store },
+            Duration::from_secs(10),
+        )
+        .await?
+        {
+            AdminResp::Health(h) => Ok(h),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
+    }
+
+    /// Register an archive store rooted at `path` on each gateway (a folder:
+    /// an SMB share mounted on every node, or a disk on one node) and write
+    /// its marker through every gateway.
+    pub async fn add_store(
+        &self,
+        name: &str,
+        path: &str,
+        gateways: &[String],
+    ) -> NestResult<Vec<(String, Result<(), String>)>> {
+        let gws = self.resolve_hosts(gateways)?;
+        if gws.is_empty() {
+            return Err(NestError::Invalid(
+                "an archive store needs at least one gateway".into(),
+            ));
+        }
+        let cfg = nest_data::ArchiveConfig {
+            path: path.to_string(),
+            gateways: gws.iter().map(|g| g.node).collect(),
+        };
+        let json = serde_json::to_string(&cfg).map_err(|e| NestError::Io(e.to_string()))?;
+        let id = match self
+            .vfs
+            .data()
+            .meta()
+            .propose(Command::RegisterStore {
+                name: name.into(),
+                class: StoreClass::Archive,
+                node: None,
+                config: json,
+            })
+            .await?
+        {
+            nest_meta::Reply::Store(id) => id,
+            other => return Err(NestError::Io(format!("unexpected {other:?}"))),
+        };
+        let mut out = Vec::new();
+        for g in gws {
+            let r = admin::call(
+                self.rpc(),
+                g.node,
+                &AdminReq::InitStore {
+                    store: id,
+                    name: name.into(),
+                    path: path.into(),
+                },
+                Duration::from_secs(30),
+            )
+            .await;
+            out.push((g.name, r.map(|_| ()).map_err(|e| e.to_string())));
+        }
+        Ok(out)
+    }
+
+    pub async fn stores(&self) -> NestResult<Vec<StoreStatus>> {
+        let names: HashMap<NodeId, String> = self
+            .nodes()?
+            .into_iter()
+            .map(|h| (h.node, h.name))
+            .collect();
+        let mut out = Vec::new();
+        for (id, name, cfg) in self.archive_stores()? {
+            let mut gateways = Vec::new();
+            for g in &cfg.gateways {
+                let h = self
+                    .store_health(*g, id)
+                    .await
+                    .unwrap_or_else(|e| admin::StoreHealth {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    });
+                gateways.push((
+                    names.get(g).cloned().unwrap_or_else(|| format!("node{g}")),
+                    h,
+                ));
+            }
+            out.push(StoreStatus {
+                id,
+                name,
+                path: cfg.path,
+                gateways,
+            });
+        }
+        Ok(out)
+    }
+
     pub async fn manifest(&self, sel: &Selector) -> NestResult<Manifest> {
         let vfs = self.vfs.clone();
         selector::resolve(
@@ -269,8 +462,57 @@ impl Placer {
         hosts: &[String],
     ) -> NestResult<(Manifest, Vec<Readiness>)> {
         let m = self.manifest(sel).await?;
-        let all = ["@all".to_string()];
-        let hosts = self.resolve_hosts(if hosts.is_empty() { &all[..] } else { hosts })?;
+        let hosts: Vec<Target> = if hosts.is_empty() {
+            // Every node, plus every archive store (without health checks).
+            let mut t: Vec<Target> = self
+                .nodes()?
+                .into_iter()
+                .map(|h| Target {
+                    name: h.name,
+                    store: h.node.live_store(),
+                    node: h.node,
+                })
+                .collect();
+            t.extend(
+                self.archive_stores()?
+                    .into_iter()
+                    .map(|(id, name, cfg)| Target {
+                        name,
+                        store: id,
+                        node: cfg.gateways.first().copied().unwrap_or_default(),
+                    }),
+            );
+            t
+        } else {
+            self.validate_targets(hosts)?;
+            let stores = self.archive_stores()?;
+            let mut t: Vec<Target> = self
+                .resolve_hosts(
+                    &hosts
+                        .iter()
+                        .filter(|n| !stores.iter().any(|(_, s, _)| s == *n))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(|h| Target {
+                    name: h.name,
+                    store: h.node.live_store(),
+                    node: h.node,
+                })
+                .collect();
+            t.extend(
+                stores
+                    .into_iter()
+                    .filter(|(_, s, _)| hosts.contains(s))
+                    .map(|(id, name, cfg)| Target {
+                        name,
+                        store: id,
+                        node: cfg.gateways.first().copied().unwrap_or_default(),
+                    }),
+            );
+            t
+        };
         let c = self.conn()?;
         let mut out = Vec::new();
         for h in hosts {
@@ -284,8 +526,7 @@ impl Placer {
             };
             for e in &m.entries {
                 if !(e.stable
-                    && query::has_live_replica(&c, e.file, e.generation, h.node.live_store())
-                        .map_err(sql)?)
+                    && query::has_live_replica(&c, e.file, e.generation, h.store).map_err(sql)?)
                 {
                     r.missing_files += 1;
                     r.missing_bytes += e.size;
@@ -306,7 +547,7 @@ impl Placer {
         parallel: usize,
     ) -> NestResult<u64> {
         let m = self.manifest(&sel).await?;
-        let hosts = self.resolve_hosts(&hosts)?;
+        let hosts = self.resolve_targets(&hosts).await?;
         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
@@ -328,7 +569,7 @@ impl Placer {
         &self,
         job: &Mutex<ClusterJob>,
         m: Manifest,
-        hosts: Vec<HostRef>,
+        hosts: Vec<Target>,
         parallel: usize,
     ) -> NestResult<()> {
         let c = self.conn()?;
@@ -340,8 +581,7 @@ impl Placer {
                 .iter()
                 .filter(|e| e.stable)
                 .filter(|e| {
-                    !query::has_live_replica(&c, e.file, e.generation, h.node.live_store())
-                        .unwrap_or(false)
+                    !query::has_live_replica(&c, e.file, e.generation, h.store).unwrap_or(false)
                 })
                 .map(|e| (e.file, e.size))
                 .collect();
@@ -365,6 +605,7 @@ impl Placer {
                     job: hid,
                     files,
                     parallel,
+                    target: h.store,
                 },
                 Duration::from_secs(10),
             )
@@ -446,12 +687,13 @@ impl Placer {
         let m = self.manifest(sel).await?;
         let files: Vec<FileId> = m.entries.iter().map(|e| e.file).collect();
         let mut out = Vec::new();
-        for h in self.resolve_hosts(hosts)? {
+        for h in self.resolve_targets(hosts).await? {
             match admin::call(
                 self.rpc(),
                 h.node,
                 &AdminReq::Evict {
                     files: files.clone(),
+                    store: h.store,
                 },
                 Duration::from_secs(600),
             )
@@ -466,6 +708,73 @@ impl Placer {
             }
         }
         Ok(out)
+    }
+
+    /// Copy the selection into archive store `store`, then remove every live
+    /// copy (the archive copy keeps it available; reads stream through a
+    /// gateway, `replicate` recalls it).
+    pub async fn offload(
+        self: &Arc<Self>,
+        sel: Selector,
+        store: String,
+        parallel: usize,
+    ) -> NestResult<u64> {
+        let m = self.manifest(&sel).await?;
+        let targets = self.resolve_targets(std::slice::from_ref(&store)).await?;
+        if targets.len() != 1 || !nest_data::is_archive(targets[0].store) {
+            return Err(NestError::Invalid(format!(
+                "{store:?} is not an archive store"
+            )));
+        }
+        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let job = Arc::new(Mutex::new(ClusterJob {
+            id,
+            what: format!("offload {} -> {store}", sel.describe()),
+            ..Default::default()
+        }));
+        self.jobs.lock().insert(id, job.clone());
+        let me = self.clone();
+        tokio::spawn(async move {
+            let r = async {
+                me.run_replicate(&job, m.clone(), targets, parallel).await?;
+                let failed: usize = job.lock().hosts.values().map(|p| p.failed.len()).sum();
+                if failed > 0 {
+                    return Err(NestError::Io(format!(
+                        "{failed} files failed to reach the archive; live copies kept"
+                    )));
+                }
+                let files: Vec<FileId> = m
+                    .entries
+                    .iter()
+                    .filter(|e| e.stable)
+                    .map(|e| e.file)
+                    .collect();
+                let nodes: Vec<String> = me.nodes()?.into_iter().map(|h| h.name).collect();
+                me.evict_files(&files, &nodes).await?;
+                Ok(())
+            }
+            .await;
+            let mut j = job.lock();
+            j.finished = true;
+            j.error = r.err().map(|e: NestError| e.to_string());
+        });
+        Ok(id)
+    }
+
+    async fn evict_files(&self, files: &[FileId], hosts: &[String]) -> NestResult<()> {
+        for h in self.resolve_targets(hosts).await? {
+            admin::call(
+                self.rpc(),
+                h.node,
+                &AdminReq::Evict {
+                    files: files.to_vec(),
+                    store: h.store,
+                },
+                Duration::from_secs(600),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ membership
@@ -527,7 +836,7 @@ impl Placer {
     }
 
     pub async fn set_rule(&self, name: &str, spec: &RuleSpec) -> NestResult<u64> {
-        self.resolve_hosts(&spec.hosts)?;
+        self.validate_targets(&spec.hosts)?;
         let json = serde_json::to_string(spec).map_err(|e| NestError::Io(e.to_string()))?;
         match self
             .vfs

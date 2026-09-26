@@ -413,3 +413,25 @@ position. Any other change (a field added to a persisted struct, a removed
 variant) bumps the version and needs an upgrade procedure: drain, snapshot
 with the old version, and install with the new one (to be built with the
 first such change). Decode failures are storage errors, never panics.
+
+## ADR-019 — Archive stores are stores that hold replicas (2026-09-26)
+
+An archive store (a folder reachable from one or more gateway nodes: an SMB
+share mounted everywhere, or a disk on one node) holds complete replicas in
+the same object layout as a live store, with store ids from 2^20 up.
+Everything else follows from existing rules:
+
+- **Offload** = replicate into the archive, then evict the live copies (the
+  last-copy rule allows it because the archive copy is live).
+- **Reads** of archive-only files stream through a gateway (the gateway's
+  data service serves from the archive object), after any live copy.
+- **Recall** = ordinary replication; archive gateways are holders.
+- **Writes** invalidate archive copies like any replica; the store's first
+  gateway deletes them.
+- **Health**: a marker file (`.sparknest-store`, cluster + store id) must be
+  present; an unmounted share is never read from or written into.
+- Each gateway stages into its own directory; renames fall back to
+  check-then-rename where `RENAME_NOREPLACE` is unsupported (CIFS, ntfs3).
+
+Backups as retained, versioned snapshots (separate from replicas) and
+metadata snapshots to an archive remain to be built.

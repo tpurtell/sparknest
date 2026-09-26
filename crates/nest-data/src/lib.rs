@@ -19,5 +19,7 @@ mod remote;
 mod session;
 pub mod vfs;
 
-pub use local::{DataNode, ReconcileReport};
+pub use local::{
+    ARCHIVE_STORE_BASE, Archive, ArchiveConfig, DataNode, ReconcileReport, is_archive,
+};
 pub use vfs::{FenceHook, OpenMode, Vfs, VfsConfig};

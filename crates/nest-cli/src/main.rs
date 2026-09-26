@@ -74,6 +74,21 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RuleCmd,
     },
+    /// Archive stores.
+    Store {
+        #[command(subcommand)]
+        cmd: StoreCmd,
+    },
+    /// Copy a selection into an archive store, then drop its live copies.
+    Offload {
+        selector: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long, default_value_t = 8)]
+        parallel: usize,
+        #[arg(long)]
+        wait: bool,
+    },
     /// Cluster membership.
     Cluster {
         #[command(subcommand)]
@@ -105,6 +120,20 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum StoreCmd {
+    /// Register an archive store: a folder reachable from each gateway
+    /// (e.g. an SMB share mounted on every node, or a disk on one node).
+    Add {
+        name: String,
+        path: String,
+        #[arg(long, value_delimiter = ',', required = true)]
+        gateways: Vec<String>,
+    },
+    /// Archive stores with health and capacity per gateway.
+    Ls,
 }
 
 #[derive(Subcommand, Debug)]
@@ -515,6 +544,78 @@ async fn main() -> Result<()> {
                     .await?
             }
         },
+        Cmd::Store { cmd } => match cmd {
+            StoreCmd::Add {
+                name,
+                path,
+                gateways,
+            } => {
+                let v = c
+                    .post(
+                        "/v1/stores",
+                        json!({ "name": name, "path": path, "gateways": gateways }),
+                    )
+                    .await?;
+                if !cli.json {
+                    for g in v["gateways"].as_array().into_iter().flatten() {
+                        match g["error"].as_str() {
+                            None => println!("  {:<9} ok", g["gateway"].as_str().unwrap_or("")),
+                            Some(e) => println!("  {:<9} {e}", g["gateway"].as_str().unwrap_or("")),
+                        }
+                    }
+                    return Ok(());
+                }
+                v
+            }
+            StoreCmd::Ls => {
+                let v = c.get("/v1/stores").await?;
+                if !cli.json {
+                    for st in v["stores"].as_array().into_iter().flatten() {
+                        println!(
+                            "{} ({})",
+                            st["name"].as_str().unwrap_or(""),
+                            st["path"].as_str().unwrap_or("")
+                        );
+                        for g in st["gateways"].as_array().into_iter().flatten() {
+                            let (name, h) = (&g[0], &g[1]);
+                            match h["error"].as_str() {
+                                None => println!(
+                                    "  {:<9} {}  free {} of {}, {} objects ({})",
+                                    name.as_str().unwrap_or(""),
+                                    if h["healthy"].as_bool() == Some(true) {
+                                        "healthy"
+                                    } else {
+                                        "UNHEALTHY"
+                                    },
+                                    human(h["free_bytes"].as_u64().unwrap_or(0)),
+                                    human(h["total_bytes"].as_u64().unwrap_or(0)),
+                                    h["objects"],
+                                    human(h["object_bytes"].as_u64().unwrap_or(0))
+                                ),
+                                Some(e) => println!("  {:<9} {e}", name.as_str().unwrap_or("")),
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                v
+            }
+        },
+        Cmd::Offload {
+            selector,
+            store,
+            parallel,
+            wait,
+        } => {
+            let v = c
+                .post(
+                    "/v1/offload",
+                    json!({ "selector": abspath(selector), "store": store, "parallel": parallel }),
+                )
+                .await?;
+            let id = v["job"].as_u64().unwrap_or(0);
+            if *wait { wait_job(&c, id).await? } else { v }
+        }
         Cmd::Cluster { cmd } => match cmd {
             ClusterCmd::Ls => {
                 let v = c.get("/v1/cluster").await?;
