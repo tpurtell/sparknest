@@ -73,9 +73,11 @@ fn sql(e: rusqlite::Error) -> NestError {
 pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
     let status = placer.status().await?;
     let nodes = placer.nodes()?;
-    // Desired free space per node (a later entry overrides an earlier one).
+    // Desired free space per node. A host named directly beats a group it
+    // belongs to, whatever the order; otherwise a later entry wins.
     let mut want: BTreeMap<NodeId, u64> = BTreeMap::new();
-    for (name, bytes) in free {
+    let (groups, hosts): (Vec<_>, Vec<_>) = free.iter().partition(|(n, _)| n.starts_with('@'));
+    for (name, bytes) in groups.into_iter().chain(hosts) {
         for h in placer.resolve_hosts(std::slice::from_ref(name))? {
             want.insert(h.node, *bytes);
         }

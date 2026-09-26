@@ -726,12 +726,18 @@ async fn main() -> Result<()> {
         }
         Cmd::Group { cmd } => match cmd {
             GroupCmd::Set { name, members } => {
-                c.call(
-                    Method::PUT,
-                    &format!("/v1/groups/{}", enc(name)),
-                    Some(json!({ "members": members })),
-                )
-                .await?
+                let v = c
+                    .call(
+                        Method::PUT,
+                        &format!("/v1/groups/{}", enc(name)),
+                        Some(json!({ "members": members })),
+                    )
+                    .await?;
+                if !cli.json {
+                    println!("@{name} = {}", members.join(","));
+                    return Ok(());
+                }
+                v
             }
             GroupCmd::Ls => {
                 let v = c.get("/v1/groups").await?;
@@ -755,8 +761,14 @@ async fn main() -> Result<()> {
                 v
             }
             GroupCmd::Rm { name } => {
-                c.call(Method::DELETE, &format!("/v1/groups/{}", enc(name)), None)
-                    .await?
+                let v = c
+                    .call(Method::DELETE, &format!("/v1/groups/{}", enc(name)), None)
+                    .await?;
+                if !cli.json {
+                    println!("removed @{name}");
+                    return Ok(());
+                }
+                v
             }
         },
         Cmd::Backup { cmd } => match cmd {
@@ -955,6 +967,11 @@ async fn main() -> Result<()> {
             if *wait { wait_job(&c, id).await? } else { v }
         }
     };
+    if !cli.json && out["job"]["finished"].as_bool() == Some(true) {
+        // Progress was already shown on stderr; a failure would have bailed.
+        println!("done");
+        return Ok(());
+    }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
