@@ -37,7 +37,11 @@ async fn sequential_remote_read_uses_rdma_with_readahead() {
         return;
     };
     let v1 = &c.node(1).vfs;
-    let size: u64 = 64 << 20;
+    let size: u64 = std::env::var("NEST_BENCH_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(64)
+        << 20;
     let (a, fh, _) = v1
         .create(FileId::ROOT, b"shard", 0o644, oflags::WRONLY)
         .await
@@ -62,7 +66,21 @@ async fn sequential_remote_read_uses_rdma_with_readahead() {
     // Node 2 reads it 1 MiB at a time like FUSE does.
     let v2 = &c.node(2).vfs;
     let (rfh, _) = v2.open(a.id, 0).await.unwrap();
+    // Timed pass: discard the bytes (a benchmark must not measure its own
+    // page faults), then a second pass checks every byte.
     let t = std::time::Instant::now();
+    let mut pos = 0u64;
+    let mut sink = 0u64;
+    loop {
+        let b = v2.read(rfh, pos, 1 << 20).await.unwrap();
+        if b.is_empty() {
+            break;
+        }
+        sink = sink.wrapping_add(b[0] as u64);
+        pos += b.len() as u64;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    assert_eq!(pos, size);
     let mut got = Vec::with_capacity(size as usize);
     loop {
         let b = v2.read(rfh, got.len() as u64, 1 << 20).await.unwrap();
@@ -71,20 +89,48 @@ async fn sequential_remote_read_uses_rdma_with_readahead() {
         }
         got.extend_from_slice(&b);
     }
-    let secs = t.elapsed().as_secs_f64();
-    assert!(got == data, "content mismatch");
+    assert!(got == data, "content mismatch ({sink})");
     let fab = c.node(2).fabric.as_ref().unwrap();
     let reads = fab.stats.reads.load(Ordering::Relaxed);
     eprintln!(
-        "64 MiB over RDMA in {secs:.3}s ({:.2} GB/s), {reads} fabric reads",
+        "{} MiB over the Vfs read path: {:.2} GB/s ({reads} fabric reads over both passes)",
+        size >> 20,
         size as f64 / secs / 1e9
     );
     assert_eq!(
         fab.stats.read_bytes.load(Ordering::Relaxed),
-        size,
-        "every byte should arrive over RDMA once"
+        2 * size,
+        "every byte should arrive over RDMA once per pass"
     );
-    assert_eq!(reads, size / (4 << 20));
+    assert_eq!(reads, 2 * size.div_ceil(4 << 20));
+
+    // Same bytes straight from the fabric with 8 chunks in flight, to
+    // separate transport + server cost from the Vfs read path.
+    let generation = c.attr(2, a.id).unwrap().generation;
+    let t = std::time::Instant::now();
+    let chunk = 4u64 << 20;
+    let mut inflight = std::collections::VecDeque::new();
+    let mut off = 0u64;
+    let mut total = 0usize;
+    while off < size || !inflight.is_empty() {
+        while inflight.len() < 8 && off < size {
+            let f = fab.clone();
+            let o = off;
+            inflight.push_back(tokio::spawn(async move {
+                f.read(NodeId(1), a.id, generation, o, chunk as usize)
+                    .await
+                    .unwrap()
+                    .len()
+            }));
+            off += chunk;
+        }
+        total += inflight.pop_front().unwrap().await.unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "raw fabric, 8 in flight: {:.2} GB/s",
+        total as f64 / secs / 1e9
+    );
 
     // Random reads still correct (window collapses, no over-fetch beyond need).
     for off in [(37u64 << 20) + 11, 5 << 20, (63 << 20) + 1000] {
@@ -123,4 +169,33 @@ async fn rdma_reads_respect_generation_fencing() {
     assert_eq!(v3.read(rfh, 4096, 4).await.unwrap(), b"2222");
     v1.release(wfh, None).await;
     v3.release(rfh, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn owned_file_reads_see_latest_writes_within_a_generation() {
+    let Some(c) = fabric_cluster(3).await else {
+        return;
+    };
+    let v1 = &c.node(1).vfs;
+    let (a, fh, _) = v1
+        .create(FileId::ROOT, b"growing", 0o644, oflags::RDWR)
+        .await
+        .unwrap();
+    v1.write(fh, 0, vec![b'a'; 8 << 20]).await.unwrap();
+    c.converge().await;
+    let v2 = &c.node(2).vfs;
+    let (rfh, _) = v2.open(a.id, 0).await.unwrap();
+    assert_eq!(&v2.read(rfh, 0, 4).await.unwrap()[..], b"aaaa");
+    assert_eq!(&v2.read(rfh, 5 << 20, 4).await.unwrap()[..], b"aaaa");
+    // Same generation (still owned by node 1), new bytes: never cached.
+    v1.write(fh, 0, vec![b'b'; 8 << 20]).await.unwrap();
+    assert_eq!(c.attr(2, a.id).unwrap().generation, a.generation);
+    assert_eq!(&v2.read(rfh, 0, 4).await.unwrap()[..], b"bbbb");
+    assert_eq!(&v2.read(rfh, 5 << 20, 4).await.unwrap()[..], b"bbbb");
+    assert!(
+        v2.try_read_now(rfh, 0, 4).is_none(),
+        "owned remote files must not be served from readahead"
+    );
+    v2.release(rfh, None).await;
+    v1.release(fh, None).await;
 }

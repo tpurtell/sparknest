@@ -465,6 +465,13 @@ impl Filesystem for Fs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        // Local copies and readahead hits complete right here: every hand-off
+        // to another thread can cost a deep-idle wake on the Sparks.
+        match self.vfs.try_read_now(fh.0, offset, size) {
+            Some(Ok(b)) => return reply.data(&b),
+            Some(Err(e)) => return reply.error(errno(&e)),
+            None => {}
+        }
         let vfs = self.vfs.clone();
         self.spawn(async move {
             match vfs.read(fh.0, offset, size).await {
@@ -486,6 +493,12 @@ impl Filesystem for Fs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        // The owner writing its own open epoch completes right here.
+        match self.vfs.try_write_now(fh.0, offset, data) {
+            Some(Ok(n)) => return reply.written(n),
+            Some(Err(e)) => return reply.error(errno(&e)),
+            None => {}
+        }
         let vfs = self.vfs.clone();
         let data = data.to_vec();
         self.spawn(async move {

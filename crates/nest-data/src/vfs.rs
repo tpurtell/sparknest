@@ -1238,11 +1238,20 @@ impl Vfs {
                     let mut r = h.reader.lock();
                     match r.as_ref() {
                         Some((k, f)) if *k == key => f.clone(),
-                        _ => {
-                            let f = Arc::new(self.d.store().open_read(key).map_err(io)?);
-                            *r = Some((key, f.clone()));
-                            f
-                        }
+                        _ => match self.d.store().open_read(key) {
+                            Ok(f) => {
+                                let f = Arc::new(f);
+                                *r = Some((key, f.clone()));
+                                f
+                            }
+                            // Invalidated since the check: the generation
+                            // moved, so refresh and route again.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                last = NestError::Stale;
+                                continue;
+                            }
+                            Err(e) => return Err(io(e)),
+                        },
                     }
                 };
                 return tokio::task::spawn_blocking(move || pread(&f, offset, size))
@@ -1261,25 +1270,27 @@ impl Vfs {
             }
             for s in sources {
                 if let Some(fab) = self.fabric() {
-                    let r = {
+                    let r = if a.gen_state == GenState::Stable {
+                        // Immutable generation: read ahead in whole chunks.
                         let mut ra = h.readahead.lock().await;
-                        if !ra
-                            .as_ref()
-                            .is_some_and(|r| r.matches(h.file, a.generation, s))
-                        {
-                            let size = (a.gen_state == GenState::Stable).then_some(a.size);
+                        if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
                             *ra = Some(crate::readahead::Readahead::new(
                                 &fab,
                                 h.file,
                                 a.generation,
                                 s,
                                 self.cfg.readahead_chunks,
-                                size,
+                                Some(a.size),
                             ));
                         }
                         ra.as_mut()
                             .expect("just set")
                             .read(&fab, offset, size)
+                            .await
+                    } else {
+                        // Being written by its owner: fetch exactly this
+                        // range, keep nothing.
+                        self.fabric_exact(&fab, s, h.file, a.generation, offset, size)
                             .await
                     };
                     match r {
@@ -1322,6 +1333,116 @@ impl Vfs {
             }
         }
         Err(last)
+    }
+
+    /// One uncached fabric read of exactly `[offset, offset+size)`.
+    async fn fabric_exact(
+        &self,
+        fab: &Arc<nest_fabric::Fabric>,
+        source: NodeId,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        size: u32,
+    ) -> NestResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(size as usize);
+        let chunk = fab.chunk();
+        while out.len() < size as usize {
+            let want = (size as usize - out.len()).min(chunk);
+            let b = fab
+                .read(source, file, generation, offset + out.len() as u64, want)
+                .await?;
+            out.extend_from_slice(b.as_slice());
+            if b.len() < want {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Complete a read without waiting, if possible: a local copy (pread
+    /// from the page cache) or bytes readahead already holds. Returns `None`
+    /// when the read needs I/O across the network or a state change.
+    ///
+    /// Frontends call this on the thread that received the request: on the
+    /// Sparks every thread hand-off can cost a deep-idle wake (hundreds of
+    /// microseconds), which dominated small-request latency.
+    pub fn try_read_now(&self, fh: u64, offset: u64, size: u32) -> Option<NestResult<Vec<u8>>> {
+        let h = self.handle(fh).ok()?;
+        let a = self.raw_attr(h.file).ok()?;
+        let key = ObjectKey::new(h.file, a.generation);
+        let local = match (a.gen_state, a.owner) {
+            (GenState::Owned, Some(o)) => o == self.me(),
+            (GenState::Stable, _) => self.d.servable(key),
+            _ => false,
+        };
+        if local {
+            let _t = self.track(h.file);
+            let f = {
+                let mut r = h.reader.lock();
+                match r.as_ref() {
+                    Some((k, f)) if *k == key => f.clone(),
+                    _ => {
+                        let f = match self.d.store().open_read(key) {
+                            Ok(f) => Arc::new(f),
+                            // Invalidated since the check: the slow path
+                            // refreshes and routes to the new owner.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                            Err(e) => return Some(Err(io(e))),
+                        };
+                        *r = Some((key, f.clone()));
+                        f
+                    }
+                }
+            };
+            return Some(pread(&f, offset, size));
+        }
+        // Only STABLE generations are cached ahead: their bytes never change.
+        if a.gen_state != GenState::Stable {
+            return None;
+        }
+        let fab = self.fabric()?;
+        let mut ra = h.readahead.try_lock().ok()?;
+        let r = ra.as_mut()?;
+        if !r.matches(h.file, a.generation) {
+            return None;
+        }
+        let out = r.try_ready(offset, size)?;
+        r.advance(&fab, offset, size);
+        Some(Ok(out))
+    }
+
+    /// Complete a write without waiting, if this node already owns the file
+    /// in an open, fenced epoch. Returns `None` otherwise.
+    pub fn try_write_now(&self, fh: u64, offset: u64, data: &[u8]) -> Option<NestResult<u32>> {
+        let h = self.handle(fh).ok()?;
+        if !h.writable {
+            return None;
+        }
+        let o = self.owned.lock().get(&h.file).cloned()?;
+        if !*o.fenced.borrow() {
+            return None;
+        }
+        let a = self.raw_attr(h.file).ok()?;
+        if a.gen_state != GenState::Owned || a.owner != Some(self.me()) || a.epoch != o.epoch {
+            return None;
+        }
+        let guard = o.open.try_read().ok()?;
+        if !*guard {
+            return None;
+        }
+        o.participants.lock().insert((self.me(), fh));
+        o.activity.fetch_add(1, Ordering::SeqCst);
+        let r = (|| {
+            let off = if h.append {
+                o.file.metadata()?.len()
+            } else {
+                offset
+            };
+            o.file.write_all_at(data, off)?;
+            Ok::<_, std::io::Error>(data.len() as u32)
+        })();
+        Some(r.map_err(io))
     }
 
     pub async fn write(&self, fh: u64, offset: u64, data: Vec<u8>) -> NestResult<u32> {

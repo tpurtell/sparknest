@@ -58,8 +58,8 @@ impl Readahead {
         }
     }
 
-    pub(crate) fn matches(&self, file: FileId, generation: Generation, source: NodeId) -> bool {
-        self.file == file && self.generation == generation && self.source == source
+    pub(crate) fn matches(&self, file: FileId, generation: Generation) -> bool {
+        self.file == file && self.generation == generation
     }
 
     fn fetch(&mut self, fabric: &Arc<Fabric>, start: u64) {
@@ -97,6 +97,63 @@ impl Readahead {
         match self.chunks.get(&start) {
             Some(Chunk::Ready(b)) => Ok(b),
             _ => Err(NestError::Io("readahead chunk missing".into())),
+        }
+    }
+
+    /// Serve `[offset, offset+size)` only if every byte is already in ready
+    /// chunks (no waiting). Used on the FUSE thread to avoid thread hops.
+    pub(crate) fn try_ready(&mut self, offset: u64, size: u32) -> Option<Vec<u8>> {
+        let c = self.chunk;
+        let end = self
+            .eof
+            .map_or(offset + size as u64, |e| e.min(offset + size as u64));
+        if end <= offset {
+            return (self.eof.is_some_and(|e| offset >= e)).then(Vec::new);
+        }
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        let mut pos = offset;
+        while pos < end {
+            let start = pos / c * c;
+            let Some(Chunk::Ready(buf)) = self.chunks.get(&start) else {
+                return None;
+            };
+            let from = (pos - start) as usize;
+            if from >= buf.len() {
+                break;
+            }
+            let n = (buf.len() - from).min((end - pos) as usize);
+            out.extend_from_slice(&buf.as_slice()[from..from + n]);
+            pos += n as u64;
+            if buf.len() < c as usize {
+                break;
+            }
+        }
+        // Keep the pipeline moving exactly as a full read would.
+        let sequential = offset == self.next;
+        self.window = if sequential {
+            (self.window * 2).min(self.max_window)
+        } else {
+            self.window
+        };
+        self.next = offset + out.len() as u64;
+        Some(out)
+    }
+
+    /// After a fast-path hit: drop consumed chunks and top up the window.
+    pub(crate) fn advance(&mut self, fabric: &Arc<Fabric>, offset: u64, size: u32) {
+        let c = self.chunk;
+        let first = offset / c * c;
+        let stale: Vec<u64> = self.chunks.range(..first).map(|(k, _)| *k).collect();
+        for k in stale {
+            self.chunks.remove(&k);
+        }
+        let last = (offset + size as u64).saturating_sub(1) / c * c;
+        let reserve = fabric.landing_slots() / 4;
+        for i in 1..self.window as u64 {
+            if fabric.spare_landing() <= reserve {
+                break;
+            }
+            self.fetch(fabric, last + i * c);
         }
     }
 

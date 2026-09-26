@@ -81,6 +81,9 @@ pub struct DataNode {
     /// node cannot acknowledge a fence).
     lease_until: Mutex<Option<std::time::Instant>>,
     lease: std::time::Duration,
+    /// Pooled read-only metadata connections for hot paths (opening one
+    /// costs far more than a query).
+    readers: Mutex<Vec<rusqlite::Connection>>,
     weak: Weak<DataNode>,
 }
 
@@ -129,6 +132,7 @@ impl DataNode {
             caught_up: std::sync::atomic::AtomicBool::new(false),
             lease_until: Mutex::new(None),
             lease,
+            readers: Mutex::new(Vec::new()),
         });
         for rx in receivers {
             tokio::spawn(worker(Arc::downgrade(&d), rx, d.gate.subscribe()));
@@ -158,20 +162,35 @@ impl DataNode {
         self.st.lock().session
     }
 
+    /// Run `f` with a pooled read-only metadata connection.
+    pub fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let c = self.readers.lock().pop();
+        let c = match c {
+            Some(c) => c,
+            None => self.meta().open_reader()?,
+        };
+        let r = f(&c);
+        let mut pool = self.readers.lock();
+        if pool.len() < 64 {
+            pool.push(c);
+        }
+        r
+    }
+
     /// True if `key` may be served from this node's store right now: the
-    /// node is caught up, committed metadata lists it as a live replica
-    /// here, it is not fenced for deletion, and it exists.
+    /// node holds a read lease, committed metadata lists it as a live
+    /// replica here, it is not fenced for deletion, and it exists.
     pub fn servable(&self, key: ObjectKey) -> bool {
-        if !self.lease_valid() || self.st.lock().fenced.contains(&key) {
+        if !self.lease_valid() || self.st.lock().fenced.contains(&key) || self.meta.get().is_none()
+        {
             return false;
         }
-        let Some(meta) = self.meta.get() else {
-            return false;
-        };
-        let live = meta
-            .open_reader()
-            .and_then(|c| {
-                query::has_live_replica(&c, key.file, key.generation, self.id.live_store())
+        let live = self
+            .with_reader(|c| {
+                query::has_live_replica(c, key.file, key.generation, self.id.live_store())
             })
             .unwrap_or(false);
         live && self.store.exists(key)
