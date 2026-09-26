@@ -19,6 +19,10 @@ pub mod query;
 pub mod schema;
 
 pub use apply::apply;
+
+/// Version of every persisted encoding (Raft log entries, deduplicated
+/// replies, snapshots). A node refuses state written in another version.
+pub const FORMAT_VERSION: u32 = 1;
 pub use command::{Command, CreateReply, LockKind, RenameFlags, Reply, SealPolicy, StoreClass};
 pub use effect::Effect;
 pub use schema::{open_memory, open_read, open_write};

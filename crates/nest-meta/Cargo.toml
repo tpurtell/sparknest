@@ -15,4 +15,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+postcard.workspace = true
 tempfile.workspace = true

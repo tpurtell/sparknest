@@ -12,6 +12,9 @@ Read in this order: `PROPOSAL.md` (architecture and invariants),
 - Get the architecture right, then measure. Tuning constants (slot sizes,
   read-ahead, TTLs) are chosen from benchmarks in `benchmarks/`, not guessed.
 - Prefer the simplest thing that keeps the invariants. Seven nodes, one user.
+- Persisted types are append-only (ADR-018): never reorder or remove
+  variants of `Command`, `Reply`, `NestError`, or fields of anything they
+  contain. `crates/nest-meta/tests/format.rs` enforces it.
 - Tests first for anything touching lifecycle, fencing, or crash recovery;
   `nest-testkit` exists so those run in-process without hardware.
 - The user's real data is off limits until the migration milestone. Trial

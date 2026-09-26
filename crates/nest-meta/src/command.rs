@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 /// A semantic change to replicated metadata. Commands carry every
 /// nondeterministic input (timestamps, the proposing node) so that apply is a
 /// pure function of (state, command).
+///
+/// **On-disk format:** commands are stored in the Raft log with postcard,
+/// which encodes enum variants by position and struct fields in order.
+/// Never reorder, remove or change variants or fields of this type,
+/// [`Reply`], or `NestError`: append new variants at the end only, and bump
+/// `nest_meta::FORMAT_VERSION` for anything else (ADR-018). The
+/// `format_is_pinned` test fails on accidental changes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     // ---- namespace ------------------------------------------------------

@@ -397,3 +397,19 @@ forces the owner to wait out its lease while serving nothing stale.
    because huggingface_hub rewrites them in place).
 6. **Management API** on a 0600 Unix socket; `nest` CLI uses only it.
    Nodes register their names in the stores table at startup.
+
+## ADR-018 — On-disk format stability (2026-09-26)
+
+**Context.** A trial node crashed on restart after `Command` variants were
+inserted mid-enum: postcard encodes enum variants by position and struct
+fields in order, so old Raft log entries decoded as different commands.
+
+**Decision.** `nest_meta::FORMAT_VERSION` covers every persisted encoding
+(Raft log entries, deduplicated replies in `sm_dedup`, snapshots). The log
+store records it and refuses to open state written in another version with
+an actionable error. Persisted enums (`Command`, `Reply`, `NestError`) are
+append-only; `crates/nest-meta/tests/format.rs` pins every variant's
+position. Any other change (a field added to a persisted struct, a removed
+variant) bumps the version and needs an upgrade procedure: drain, snapshot
+with the old version, and install with the new one (to be built with the
+first such change). Decode failures are storage errors, never panics.

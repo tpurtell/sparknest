@@ -202,7 +202,14 @@ fn apply_entries(
                     .query_row(params![client as i64, seq as i64], |r| r.get(0))
                     .optional()?;
                 if let Some(b) = seen {
-                    responses.push(postcard::from_bytes(&b).expect("stored response decodes"));
+                    let r = postcard::from_bytes(&b).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(e),
+                        )
+                    })?;
+                    responses.push(r);
                     continue;
                 }
                 let (result, fx) = nest_meta::apply(&tx, &cmd)?;

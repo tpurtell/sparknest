@@ -21,6 +21,14 @@ fn io<E: std::error::Error + 'static>(
     move |e| f(openraft::AnyError::new(&e)).into()
 }
 
+/// A decoding failure surfaces as a storage error (never a panic): the
+/// node stops with a clear message instead of crashing mid-apply.
+fn dec<T: serde::de::DeserializeOwned>(b: &[u8]) -> rusqlite::Result<T> {
+    postcard::from_bytes(b).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
+    })
+}
+
 fn enc<T: serde::Serialize>(v: &T) -> Vec<u8> {
     postcard::to_stdvec(v).expect("raft types always encode")
 }
@@ -34,6 +42,29 @@ impl LogStore {
             "CREATE TABLE IF NOT EXISTS log (idx INTEGER PRIMARY KEY, entry BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;",
         )?;
+        let found: Option<u32> = Self::get_state(&c, "format")?;
+        let has_state: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM log) OR EXISTS (SELECT 1 FROM state)",
+            [],
+            |r| r.get(0),
+        )?;
+        match found {
+            Some(v) if v == nest_meta::FORMAT_VERSION => {}
+            None if !has_state => Self::put_state(&c, "format", &nest_meta::FORMAT_VERSION)?,
+            other => {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                    Some(format!(
+                        "{} holds on-disk format {} but this build uses {}: run a matching version, or wipe this node's state and let it rejoin",
+                        path.display(),
+                        other
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "0 (unversioned)".into()),
+                        nest_meta::FORMAT_VERSION
+                    )),
+                ));
+            }
+        }
         Ok(LogStore {
             db: Arc::new(Mutex::new(c)),
         })
@@ -68,7 +99,7 @@ impl LogStore {
             .prepare_cached("SELECT v FROM state WHERE k = ?1")?
             .query_row(params![k], |r| r.get(0))
             .optional()?;
-        Ok(v.map(|b| postcard::from_bytes(&b).expect("stored raft state decodes")))
+        v.map(|b| dec(&b)).transpose()
     }
 
     fn put_state<T: serde::Serialize>(c: &Connection, k: &str, v: &T) -> rusqlite::Result<()> {
@@ -99,8 +130,7 @@ impl RaftLogReader<TypeConfig> for LogStore {
                     "SELECT entry FROM log WHERE idx >= ?1 AND idx < ?2 ORDER BY idx",
                 )?;
                 let rows = st.query_map(params![start, end], |r| r.get::<_, Vec<u8>>(0))?;
-                rows.map(|b| Ok(postcard::from_bytes(&b?).expect("stored entry decodes")))
-                    .collect()
+                rows.map(|b| dec(&b?)).collect()
             },
             StorageIOError::read_logs,
         )
@@ -119,13 +149,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                     .prepare_cached("SELECT entry FROM log ORDER BY idx DESC LIMIT 1")?
                     .query_row([], |r| r.get(0))
                     .optional()?;
-                let last_log_id = last
-                    .map(|b| {
-                        *postcard::from_bytes::<Entry<TypeConfig>>(&b)
-                            .expect("entry decodes")
-                            .get_log_id()
-                    })
-                    .or(last_purged);
+                let last_log_id = match last {
+                    Some(b) => Some(*dec::<Entry<TypeConfig>>(&b)?.get_log_id()),
+                    None => last_purged,
+                };
                 Ok(LogState {
                     last_purged_log_id: last_purged,
                     last_log_id,
