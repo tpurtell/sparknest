@@ -334,7 +334,7 @@ async fn rules(State(api): State<Api>) -> R<serde_json::Value> {
         .placer
         .rules()?
         .into_iter()
-        .map(|(name, spec, rev)| json!({ "name": name, "selector": spec.selector.describe(), "hosts": spec.hosts, "revision": rev }))
+        .map(|(name, spec, rev)| json!({ "name": name, "selector": spec.selector.describe(), "hosts": spec.hosts, "auto": spec.auto, "revision": rev }))
         .collect();
     Ok(Json(json!({ "rules": rules })))
 }
@@ -343,6 +343,8 @@ async fn rules(State(api): State<Api>) -> R<serde_json::Value> {
 struct RuleReq {
     selector: String,
     hosts: Vec<String>,
+    #[serde(default)]
+    auto: bool,
 }
 
 async fn set_rule(
@@ -353,6 +355,7 @@ async fn set_rule(
     let spec = RuleSpec {
         selector: api.selector(&r.selector)?,
         hosts: r.hosts,
+        auto: r.auto,
     };
     let rev = api.placer.set_rule(&name, &spec).await?;
     Ok(Json(json!({ "name": name, "revision": rev })))

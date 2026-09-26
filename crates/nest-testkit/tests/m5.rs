@@ -179,6 +179,7 @@ async fn import_seal_replicate_evict_rules() {
             &RuleSpec {
                 selector: sel.clone(),
                 hosts: vec!["@all".into()],
+                auto: false,
             },
         )
         .await
@@ -240,4 +241,37 @@ async fn hf_style_download_is_sealed_at_rename() {
         v.open(a.id, oflags::RDWR).await,
         Err(NestError::NotPermitted(_))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn automatic_rules_follow_new_content() {
+    let c = ready(3).await;
+    let v2 = &c.node(2).vfs;
+    let data = v2.mkdir(FileId::ROOT, b"data", 0o755).await.unwrap().id;
+    c.node(1)
+        .placer
+        .set_rule(
+            "everything-in-data",
+            &RuleSpec {
+                selector: Selector::parse("/data", "/hub").unwrap(),
+                hosts: vec!["@all".into()],
+                auto: true,
+            },
+        )
+        .await
+        .unwrap();
+    let (a, fh, _) = v2
+        .create(data, b"weights.bin", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    v2.write(fh, 0, vec![3u8; 2 << 20]).await.unwrap();
+    v2.release(fh, None).await;
+    // After the quiet period the leader applies the rule on its own.
+    c.eventually("copies on every node", Duration::from_secs(20), |c| {
+        let r = c.node(1).meta.open_reader().unwrap();
+        nest_meta::query::replicas(&r, a.id)
+            .map(|r| r.len() == 3)
+            .unwrap_or(false)
+    })
+    .await;
 }

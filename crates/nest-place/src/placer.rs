@@ -62,6 +62,48 @@ pub struct Placer {
     jobs: Mutex<HashMap<u64, Arc<Mutex<ClusterJob>>>>,
     imports: Mutex<HashMap<u64, Arc<Mutex<crate::import::ImportProgress>>>>,
     next_job: AtomicU64,
+    dirty: Arc<tokio::sync::Notify>,
+}
+
+/// Quiet period after the last change before automatic rules are applied.
+const AUTO_DEBOUNCE: Duration = Duration::from_secs(5);
+
+async fn auto_reconcile(p: std::sync::Weak<Placer>) {
+    loop {
+        let Some(dirty) = p.upgrade().map(|p| p.dirty.clone()) else {
+            return;
+        };
+        dirty.notified().await;
+        // Debounce: wait until no change for the quiet period.
+        loop {
+            match tokio::time::timeout(AUTO_DEBOUNCE, dirty.notified()).await {
+                Ok(()) => continue,
+                Err(_) => break,
+            }
+        }
+        let Some(p) = p.upgrade() else { return };
+        if p.vfs.data().meta().leader() != Some(p.vfs.data().id()) {
+            continue;
+        }
+        let rules = match p.rules() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for (name, spec, _) in rules.into_iter().filter(|(_, s, _)| s.auto) {
+            // Skip if an earlier pass for this rule is still running.
+            let what = format!("replicate {}", spec.selector.describe());
+            if p.jobs().iter().any(|j| !j.finished && j.what == what) {
+                continue;
+            }
+            match p
+                .replicate(spec.selector.clone(), spec.hosts.clone(), 8)
+                .await
+            {
+                Ok(id) => tracing::info!(rule = %name, job = id, "automatic reconcile started"),
+                Err(e) => tracing::warn!(rule = %name, error = %e, "automatic reconcile failed"),
+            }
+        }
+    }
 }
 
 fn sql(e: rusqlite::Error) -> NestError {
@@ -80,7 +122,20 @@ impl Placer {
             jobs: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
             next_job: AtomicU64::new(rand::random::<u32>() as u64),
+            dirty: Arc::new(tokio::sync::Notify::new()),
         });
+        // Automatic rules: any settled content marks them dirty; the leader
+        // reconciles after writes go quiet (debounced per pass, not per file).
+        let dirty = p.dirty.clone();
+        vfs.data().add_tap(Arc::new(move |_i, e| {
+            if matches!(
+                e,
+                nest_meta::Effect::Finalized { .. } | nest_meta::Effect::EntryChanged { .. }
+            ) {
+                dirty.notify_one();
+            }
+        }));
+        tokio::spawn(auto_reconcile(Arc::downgrade(&p)));
         // Record our name so rules and tools can say "raptor" (needs quorum;
         // retried until it lands).
         let me = vfs.data().id();

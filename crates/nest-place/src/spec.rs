@@ -71,4 +71,7 @@ pub struct RuleSpec {
     /// Host names that must each hold a complete copy; "@all" means every
     /// node.
     pub hosts: Vec<String>,
+    /// Re-apply automatically (debounced) after files finish being written.
+    #[serde(default)]
+    pub auto: bool,
 }

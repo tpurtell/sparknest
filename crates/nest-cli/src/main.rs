@@ -110,6 +110,9 @@ enum RuleCmd {
         selector: String,
         #[arg(long, value_delimiter = ',', required = true)]
         hosts: Vec<String>,
+        /// Re-apply automatically after new content settles.
+        #[arg(long)]
+        auto: bool,
     },
     Ls,
     Rm {
@@ -450,11 +453,12 @@ async fn main() -> Result<()> {
                 name,
                 selector,
                 hosts,
+                auto,
             } => {
                 c.call(
                     Method::PUT,
                     &format!("/v1/rules/{}", enc(name)),
-                    Some(json!({ "selector": abspath(selector), "hosts": hosts })),
+                    Some(json!({ "selector": abspath(selector), "hosts": hosts, "auto": auto })),
                 )
                 .await?
             }
@@ -463,8 +467,13 @@ async fn main() -> Result<()> {
                 if !cli.json {
                     for r in v["rules"].as_array().into_iter().flatten() {
                         println!(
-                            "{:<20} {:<50} -> {}",
+                            "{:<20} {:<5} {:<50} -> {}",
                             r["name"].as_str().unwrap_or(""),
+                            if r["auto"].as_bool() == Some(true) {
+                                "auto"
+                            } else {
+                                ""
+                            },
                             r["selector"].as_str().unwrap_or(""),
                             r["hosts"]
                                 .as_array()
