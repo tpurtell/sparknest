@@ -122,6 +122,7 @@ impl TestCluster {
             fuse: FuseSection {
                 allow_other: false,
                 ttl_ms: 1000,
+                io_uring: true,
             },
         }
     }

@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor"]
 resolver = "3"
 members = ["crates/*"]
 
@@ -37,6 +38,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "loosen-follower-log-revert"] }
 fuser = { version = "0.18", default-features = false }
+io-uring = "0.7"
 axum = { version = "0.8", features = ["json", "query", "tokio", "http1"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -63,3 +65,7 @@ sha2 = "0.10"
 debug = "line-tables-only"
 lto = "thin"
 codegen-units = 4
+
+# fuser with a FUSE-over-io_uring reply path (vendor/fuser/SPARKNEST.md).
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }

@@ -11,6 +11,7 @@ nest-types.workspace = true
 nest-meta.workspace = true
 nest-data.workspace = true
 fuser.workspace = true
+io-uring.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true

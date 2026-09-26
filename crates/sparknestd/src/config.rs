@@ -87,6 +87,10 @@ pub struct FuseSection {
     /// Kernel entry/attr cache TTL in milliseconds.
     #[serde(default = "default_ttl_ms")]
     pub ttl_ms: u64,
+    /// FUSE over io_uring when the kernel offers it (Linux 6.14+ with
+    /// `fuse.enable_uring=1`); otherwise /dev/fuse, with a warning.
+    #[serde(default = "default_true")]
+    pub io_uring: bool,
 }
 
 impl Default for FuseSection {
@@ -94,6 +98,7 @@ impl Default for FuseSection {
         Self {
             allow_other: true,
             ttl_ms: default_ttl_ms(),
+            io_uring: true,
         }
     }
 }

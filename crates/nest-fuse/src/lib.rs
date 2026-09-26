@@ -22,6 +22,8 @@ use nest_data::{OpenMode, Vfs};
 use nest_meta::{Effect, LockKind};
 use nest_types::{FileAttr, FileId, FileKind, NestError, Timestamp};
 use parking_lot::Mutex;
+
+mod uring;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -29,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
+pub use uring::kernel_enabled as io_uring_kernel_enabled;
 
 #[derive(Clone, Debug)]
 pub struct MountConfig {
@@ -38,10 +41,15 @@ pub struct MountConfig {
     pub ttl: Duration,
     /// `/dev/fuse` reader threads.
     pub threads: usize,
+    /// Use FUSE over io_uring when the kernel offers it (see `uring`).
+    pub io_uring: bool,
 }
 
 /// The value handed to fuser. Everything a spawned task needs lives in
 /// `Inner`, shared by `Arc`.
+const MAX_WRITE: u32 = 1 << 20;
+const MAX_READAHEAD: u32 = 4 << 20;
+
 struct Fs {
     inner: Arc<Inner>,
     rt: tokio::runtime::Handle,
@@ -56,6 +64,10 @@ struct Inner {
     backing: Mutex<HashMap<u64, BackingId>>,
     passthrough: AtomicBool,
     passthrough_warned: AtomicBool,
+    uring_wanted: bool,
+    /// Negotiated at INIT: the kernel will use rings once they are registered.
+    uring: AtomicBool,
+    uring_stats: Arc<uring::Stats>,
 }
 
 impl std::ops::Deref for Fs {
@@ -168,8 +180,26 @@ impl Filesystem for Fs {
         if let Err(missing) = config.add_capabilities(want & have) {
             tracing::warn!(?missing, "kernel lacks some FUSE capabilities");
         }
-        let _ = config.set_max_write(1 << 20);
-        let _ = config.set_max_readahead(4 << 20);
+        let _ = config.set_max_write(MAX_WRITE);
+        let _ = config.set_max_readahead(MAX_READAHEAD);
+        if this.uring_wanted {
+            if have.contains(InitFlags::FUSE_OVER_IO_URING)
+                && config
+                    .add_capabilities(InitFlags::FUSE_OVER_IO_URING)
+                    .is_ok()
+            {
+                this.uring.store(true, Ordering::Relaxed);
+            } else if uring::kernel_enabled() == Some(false) {
+                tracing::warn!(
+                    "FUSE over io_uring is off in the kernel, so every request takes the /dev/fuse path; \
+                     enable it with `echo 1 | sudo tee {}` (and persist it, e.g. with a tmpfiles.d entry), \
+                     then restart sparknestd",
+                    uring::PARAM
+                );
+            } else {
+                tracing::info!("this kernel does not offer FUSE over io_uring; using /dev/fuse");
+            }
+        }
         let _ = config.set_max_background(128);
         if have.contains(InitFlags::FUSE_PASSTHROUGH)
             && config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok()
@@ -810,9 +840,18 @@ impl Fs {
 pub struct Mounted {
     session: Option<fuser::BackgroundSession>,
     stop_notify: std::sync::mpsc::Sender<Inval>,
+    uring: Arc<uring::Stats>,
 }
 
 impl Mounted {
+    /// FUSE over io_uring: (queues running, requests served through them).
+    pub fn io_uring(&self) -> (usize, usize) {
+        (
+            self.uring.queues.load(Ordering::Relaxed),
+            self.uring.requests.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn unmount(mut self) {
         self.do_unmount();
     }
@@ -862,9 +901,12 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
         backing: Mutex::new(HashMap::new()),
         passthrough: AtomicBool::new(false),
         passthrough_warned: AtomicBool::new(false),
+        uring_wanted: cfg.io_uring,
+        uring: AtomicBool::new(false),
+        uring_stats: Arc::new(uring::Stats::default()),
     });
     let fs = Fs {
-        inner,
+        inner: inner.clone(),
         rt: tokio::runtime::Handle::current(),
     };
     let mut options = vec![
@@ -886,6 +928,25 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
     config.n_threads = Some(cfg.threads.max(1));
     config.clone_fd = cfg.threads > 1;
     let session = fuser::Session::new(fs, &cfg.mountpoint, &config)?;
+    if inner.uring.load(Ordering::Relaxed) {
+        let ring_fs = Fs {
+            inner: inner.clone(),
+            rt: tokio::runtime::Handle::current(),
+        };
+        let max_pages = (MAX_READAHEAD.max(MAX_WRITE) as usize).div_ceil(4096);
+        match uring::start(
+            session.ring_dispatcher(ring_fs),
+            MAX_WRITE as usize,
+            max_pages,
+            inner.uring_stats.clone(),
+        ) {
+            Ok(n) => tracing::info!(
+                queues = n,
+                "FUSE over io_uring: requests are served on the issuing CPU"
+            ),
+            Err(e) => tracing::warn!(error = %e, "FUSE over io_uring unavailable; using /dev/fuse"),
+        }
+    }
     let notifier = session.notifier();
     let session = session.spawn()?;
 
@@ -917,6 +978,7 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
     Ok(Mounted {
         session: Some(session),
         stop_notify: tx,
+        uring: inner.uring_stats.clone(),
     })
 }
 

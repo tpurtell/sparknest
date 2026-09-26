@@ -195,6 +195,11 @@ impl Node {
     }
 
     /// Mount the filesystem at `mountpoint` (replacing any current mount).
+    /// FUSE over io_uring on this node's mount: (queues, requests served).
+    pub fn io_uring(&self) -> Option<(usize, usize)> {
+        self.mounted.lock().as_ref().map(|m| m.io_uring())
+    }
+
     pub fn mount_at(&self, mountpoint: &std::path::Path) -> anyhow::Result<()> {
         let m = nest_fuse::mount(
             self.vfs.clone(),
@@ -203,6 +208,7 @@ impl Node {
                 allow_other: self.cfg.fuse.allow_other,
                 ttl: Duration::from_millis(self.cfg.fuse.ttl_ms),
                 threads: 4,
+                io_uring: self.cfg.fuse.io_uring,
             },
         )
         .with_context(|| format!("mounting at {}", mountpoint.display()))?;

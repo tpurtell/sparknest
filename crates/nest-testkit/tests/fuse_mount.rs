@@ -394,3 +394,44 @@ async fn seal_through_an_extended_attribute() {
     .await;
     c.node(1).unmount();
 }
+
+/// With `fuse.enable_uring=1`, requests are served through the per-CPU
+/// rings rather than /dev/fuse, and behave the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn io_uring_serves_requests_when_the_kernel_offers_it() {
+    let Some((c, mp)) = cluster_with_mount(1).await else {
+        return;
+    };
+    if std::fs::read_to_string("/sys/module/fuse/parameters/enable_uring")
+        .map(|s| s.trim() != "Y")
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: fuse.enable_uring is off on this host");
+        c.node(1).unmount();
+        return;
+    }
+    let (queues, before) = c.node(1).io_uring().unwrap();
+    assert!(queues > 0, "no io_uring queues running");
+    let dir = mp.clone();
+    let n = blocking(move || {
+        let mut n = 0u64;
+        for i in 0..200 {
+            let p = dir.join(format!("u{i}"));
+            let data = vec![i as u8; 4096 + i * 1000];
+            std::fs::write(&p, &data).unwrap();
+            assert_eq!(std::fs::read(&p).unwrap(), data);
+            n += std::fs::metadata(&p).unwrap().len();
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 200);
+        n
+    })
+    .await;
+    assert!(n > 0);
+    let (_, after) = c.node(1).io_uring().unwrap();
+    assert!(
+        after > before + 800,
+        "only {} requests came through io_uring",
+        after - before
+    );
+    c.node(1).unmount();
+}
