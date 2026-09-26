@@ -69,6 +69,34 @@ fn sql(e: rusqlite::Error) -> NestError {
     NestError::Io(format!("metadata: {e}"))
 }
 
+/// Which copies the current rules require, and the first rule requiring
+/// each. Archive-store targets are not host requirements.
+pub async fn requirements(placer: &Placer) -> NestResult<HashMap<(FileId, NodeId), String>> {
+    let stores: Vec<String> = placer
+        .archive_stores()?
+        .into_iter()
+        .map(|(_, n, _)| n)
+        .collect();
+    let mut required_by = HashMap::new();
+    for (rname, spec, _) in placer.rules()? {
+        let hosts: Vec<String> = spec
+            .hosts
+            .iter()
+            .filter(|x| !stores.contains(x))
+            .cloned()
+            .collect();
+        let m = placer.manifest(&spec.selector).await?;
+        for h in placer.resolve_hosts(&hosts)? {
+            for e in &m.entries {
+                required_by
+                    .entry((e.file, h.node))
+                    .or_insert_with(|| rname.clone());
+            }
+        }
+    }
+    Ok(required_by)
+}
+
 /// Build a plan. `free` maps host names or @groups to desired free bytes.
 pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
     let status = placer.status().await?;
@@ -89,31 +117,8 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
     let name_of: HashMap<NodeId, String> = nodes.iter().map(|h| (h.node, h.name.clone())).collect();
 
     // What rules require where.
-    let mut required: HashSet<(FileId, NodeId)> = HashSet::new();
-    let mut required_by: HashMap<(FileId, NodeId), String> = HashMap::new();
-    for (rname, spec, _) in placer.rules()? {
-        let m = placer.manifest(&spec.selector).await?;
-        for h in placer.resolve_hosts(
-            &spec
-                .hosts
-                .iter()
-                .filter(|x| {
-                    !placer
-                        .archive_stores()
-                        .map(|s| s.iter().any(|(_, n, _)| n == *x))
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
-        )? {
-            for e in &m.entries {
-                required.insert((e.file, h.node));
-                required_by
-                    .entry((e.file, h.node))
-                    .or_insert_with(|| rname.clone());
-            }
-        }
-    }
+    let required_by = requirements(placer).await?;
+    let required: HashSet<(FileId, NodeId)> = required_by.keys().copied().collect();
 
     // Every live copy on every node, with sizes and copy counts.
     let (mut copies_on, mut count) = collect_copies(placer)?;

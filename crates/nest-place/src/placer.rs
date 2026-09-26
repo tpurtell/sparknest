@@ -891,6 +891,29 @@ impl Placer {
                             ..
                         } => (host, *node, copies, Some(store)),
                     };
+                    // Revalidate: a rule made since planning may now need
+                    // some of these copies here.
+                    let required = crate::plan::requirements(&me).await?;
+                    let (copies, now_required): (Vec<_>, Vec<_>) = copies
+                        .iter()
+                        .cloned()
+                        .partition(|c| !required.contains_key(&(c.file, node)));
+                    if !now_required.is_empty() {
+                        let mut j = job.lock();
+                        let p = j.hosts.entry(host.clone()).or_default();
+                        p.total_files += now_required.len() as u64;
+                        for c in now_required {
+                            let why = format!(
+                                "{}: kept, now required by rule {:?}",
+                                c.path,
+                                required[&(c.file, node)]
+                            );
+                            p.failed.push((c.file, why));
+                        }
+                    }
+                    if copies.is_empty() {
+                        continue;
+                    }
                     if let Some(store) = store {
                         let targets = me.resolve_targets(std::slice::from_ref(store)).await?;
                         let m = Manifest {

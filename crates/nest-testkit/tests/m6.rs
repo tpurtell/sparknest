@@ -435,4 +435,56 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
         .unwrap();
     let t = |h: &str| plan.hosts.iter().find(|x| x.host == h).unwrap().target;
     assert_eq!((t("n1"), t("n2")), (7, 9));
+
+    // A rule made between planning and applying is honoured: the copy stays.
+    let late = mk(b"late").await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        c.attr(1, late)
+            .is_some_and(|x| x.gen_state == GenState::Stable)
+    })
+    .await;
+    let j = p
+        .replicate(
+            Selector::parse("/late", "/hub").unwrap(),
+            vec!["n2".into()],
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(wait_job(&c, j).await.error.is_none());
+    c.converge().await;
+    let free_now = p
+        .status()
+        .await
+        .unwrap()
+        .iter()
+        .find(|s| s.name == "n1")
+        .unwrap()
+        .info
+        .as_ref()
+        .unwrap()
+        .free_bytes;
+    let plan = p.plan(&[("n1".into(), free_now + size / 2)]).await.unwrap();
+    assert_eq!(plan.steps.len(), 1, "{plan:?}");
+    p.set_rule(
+        "late",
+        &nest_place::RuleSpec {
+            selector: Selector::parse("/late", "/hub").unwrap(),
+            hosts: vec!["n1".into()],
+            auto: false,
+        },
+    )
+    .await
+    .unwrap();
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    let failed = &job.hosts["n1"].failed;
+    assert!(
+        failed.len() == 1 && failed[0].1.contains("rule \"late\""),
+        "{failed:?}"
+    );
+    c.converge().await;
+    let mut st = stores_of(&c, late);
+    st.sort();
+    assert_eq!(st, vec![1, 2]);
 }
