@@ -283,3 +283,56 @@ async fn explicit_times_survive_ownership_and_finalize() {
     blocking(move || assert_eq!(fs::metadata(&p).unwrap().modified().unwrap(), when)).await;
     c.node(1).unmount();
 }
+
+/// hf_xet's download pattern: several threads pwrite disjoint ranges of one
+/// `.incomplete` file in arbitrary order, then it is renamed into place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn parallel_random_offset_writers() {
+    let Some((c, mp)) = cluster_with_mount(1).await else {
+        return;
+    };
+    blocking(move || {
+        let tmp = mp.join("blob.incomplete");
+        let blocks = 96usize;
+        let bs = 1usize << 20;
+        let f = std::sync::Arc::new(File::create(&tmp).unwrap());
+        // A fixed shuffle of block order.
+        let mut order: Vec<usize> = (0..blocks).collect();
+        let mut x = 0x2545F4914F6CDD1Du64;
+        for i in (1..blocks).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            order.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        let order = std::sync::Arc::new(order);
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (f, order) = (f.clone(), order.clone());
+                std::thread::spawn(move || {
+                    for &b in order.iter().skip(t).step_by(8) {
+                        let data = vec![(b % 251) as u8; bs];
+                        f.write_all_at(&data, (b * bs) as u64).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        drop(f);
+        fs::rename(&tmp, mp.join("blob")).unwrap();
+        let data = fs::read(mp.join("blob")).unwrap();
+        assert_eq!(data.len(), blocks * bs);
+        for b in 0..blocks {
+            assert!(
+                data[b * bs..(b + 1) * bs]
+                    .iter()
+                    .all(|v| *v == (b % 251) as u8),
+                "block {b}"
+            );
+        }
+    })
+    .await;
+    c.node(1).unmount();
+}
