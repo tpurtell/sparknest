@@ -113,9 +113,14 @@ Optional later: raise switch ports to 200G for the benchmark pass; create
 
 ## Trial deployment conventions
 
-Trial clusters use `/srv/sparknest-test` and `/mnt/sparknest-test`, a
-distinct cluster id/secret and distinct ports, so they can coexist with a
-later real deployment. Test data is generated (synthetic files) or copied from
+Trial clusters currently run from user-owned paths, `~/sparknest-test/state`
+and `~/sparknest-test/mnt`, so they need no root (switch `scripts/cluster.env`
+to `/srv/sparknest-test` and `/mnt/sparknest-test` after the root checklist).
+They use a distinct cluster name, secret and ports (7410/7411), so they can
+coexist with a later real deployment. `scripts/deploy-cluster.sh` builds and
+pushes; `scripts/trial.sh start|stop|status|logs|wipe` runs the daemons
+detached over SSH (no systemd, since linger is off). Ports 7410/7411 on the
+10.55.0.0/24 fabric subnet pass the hosts' ufw rules. Test data is generated (synthetic files) or copied from
 existing HF caches; never move the user's real caches during trials. The
 user's real caches are adopted only in the final migration milestone, on the
 user's go.

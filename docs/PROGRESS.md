@@ -3,6 +3,25 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-26 — M3: multi-node data plane, first trial on all seven hosts
+
+- Reads route to local copy, owner, or live holder by exact generation;
+  mutations route to the owner (this node if it holds or discards the
+  content, else a reachable holder); owners fence every member or wait out
+  its read lease; leases renew by leader read barriers (ADR-015).
+- M3 tests: 7 cross-node scenarios including stale-read regression under
+  revocation (disabling fencing makes it fail) and lease-bounded fencing
+  with a partitioned holder.
+- Trial cluster deployed to raptor + 6 Sparks (native amd64 and arm64
+  builds; arm64 on ostrich via rustup), mounted at `~/sparknest-test/mnt`.
+  Cross-node create/read/mkdir work; a 1 GiB file written on raptor reads
+  byte-identical on ostrich and moa. Hard-killing three Sparks left the
+  cluster writable; restarted nodes caught up.
+- Remote read over the M3 TCP path: ~640 MB/s single stream (one 1 MiB
+  request in flight, latency-bound). M4 adds read-ahead and RDMA.
+- Next: M4, the RDMA fabric and bounded prefetcher, with benchmarks against
+  rdmasync's measured ceilings.
+
 ## 2026-09-26 — M2: FUSE frontend on one node
 
 - `nest-data::Vfs`: all filesystem semantics independent of FUSE;
