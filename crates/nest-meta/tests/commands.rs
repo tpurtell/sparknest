@@ -697,3 +697,79 @@ fn advisory_locks() {
     assert!(fx.contains(&Effect::LocksReleased { file: f.id }));
     assert!(query::locks_of(&db.c, f.id).unwrap().is_empty());
 }
+
+#[test]
+fn seal_policies() {
+    use nest_meta::SealPolicy;
+    let mut db = Db::new();
+    let hub = db.mkdir(ROOT, "hub");
+    let repo = db.mkdir(hub, "models--org--m");
+    let blobs = db.mkdir(repo, "blobs");
+    let now = db.now();
+    db.ok(Command::SetSealPolicy {
+        dir: hub,
+        policy: SealPolicy::RenameFromIncomplete,
+        now,
+    });
+    assert_eq!(
+        query::effective_seal_policy(&db.c, blobs).unwrap(),
+        SealPolicy::RenameFromIncomplete
+    );
+
+    // huggingface_hub: write x.incomplete, close, os.replace to x. The
+    // rename can land before or after the write epoch finalizes.
+    let a = db.create(blobs, "aaa.incomplete", 1);
+    rename_in(&mut db, blobs, "aaa.incomplete", "aaa");
+    assert!(
+        !db.attr(a.id).sealed,
+        "still owned: seal takes effect at finalize"
+    );
+    let now = db.now();
+    db.ok(Command::Finalize {
+        file: a.id,
+        epoch: a.epoch,
+        size: 3,
+        mtime: now,
+        now,
+    });
+    assert!(db.attr(a.id).sealed);
+    let b = db.file(blobs, "bbb.incomplete", 1, 3);
+    rename_in(&mut db, blobs, "bbb.incomplete", "bbb");
+    assert!(db.attr(b.id).sealed);
+    // Other renames and names are left alone.
+    let c = db.file(blobs, "ccc", 1, 3);
+    rename_in(&mut db, blobs, "ccc", "ccc2");
+    assert!(!db.attr(c.id).sealed);
+
+    // An explicit Off below overrides; OnFinalize seals at finalize.
+    let scratch = db.mkdir(hub, "scratch");
+    let now = db.now();
+    db.ok(Command::SetSealPolicy {
+        dir: scratch,
+        policy: SealPolicy::Off,
+        now,
+    });
+    let d = db.file(scratch, "x.incomplete", 1, 1);
+    rename_in(&mut db, scratch, "x.incomplete", "x");
+    assert!(!db.attr(d.id).sealed);
+    let weights = db.mkdir(ROOT, "weights");
+    db.ok(Command::SetSealPolicy {
+        dir: weights,
+        policy: SealPolicy::OnFinalize,
+        now,
+    });
+    let e = db.file(weights, "model.bin", 1, 10);
+    assert!(e.sealed);
+}
+
+fn rename_in(db: &mut Db, dir: FileId, from: &str, to: &str) {
+    let now = db.now();
+    db.ok(Command::Rename {
+        parent: dir,
+        name: from.into(),
+        new_parent: dir,
+        new_name: to.into(),
+        flags: RenameFlags::default(),
+        now,
+    });
+}

@@ -11,6 +11,13 @@ name = "nest"
 path = "src/main.rs"
 
 [dependencies]
-nest-types.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+toml.workspace = true
+serde.workspace = true

@@ -101,6 +101,14 @@ pub enum Command {
         now: Timestamp,
     },
 
+    /// Set a directory's automatic sealing policy (inherited by the tree
+    /// below it unless overridden).
+    SetSealPolicy {
+        dir: FileId,
+        policy: SealPolicy,
+        now: Timestamp,
+    },
+
     // ---- replicas -------------------------------------------------------
     /// A complete copy of `gen` now exists in `store`.
     PublishReplica {
@@ -166,6 +174,38 @@ pub enum Command {
         config: String,
     },
 
+    // ---- import -----------------------------------------------------------
+    /// Reserve `count` consecutive file ids (for import, where the object
+    /// must exist under its final id before the entry is committed).
+    ReserveFileIds {
+        count: u64,
+    },
+    /// Create a STABLE regular file (generation 1) whose complete content
+    /// already exists in `node`'s store under the reserved id `file`.
+    Import {
+        parent: FileId,
+        name: Vec<u8>,
+        file: FileId,
+        perm: u32,
+        size: u64,
+        mtime: Timestamp,
+        node: NodeId,
+        sealed: bool,
+        now: Timestamp,
+    },
+
+    // ---- placement rules --------------------------------------------------
+    /// Create or replace a rule. With `expect_revision`, fails with `Stale`
+    /// unless the current revision matches (0 = must not exist).
+    SetRule {
+        name: String,
+        spec: String,
+        expect_revision: Option<u64>,
+    },
+    DeleteRule {
+        name: String,
+    },
+
     /// Apply several commands in one log entry. Each sub-command succeeds or
     /// fails on its own.
     Batch(Vec<Command>),
@@ -175,6 +215,40 @@ pub enum Command {
 pub struct RenameFlags {
     pub noreplace: bool,
     pub exchange: bool,
+}
+
+/// When files in a tree become sealed automatically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SealPolicy {
+    /// Use the parent directory's policy (the default).
+    Inherit,
+    /// Never seal automatically.
+    Off,
+    /// Seal a regular file when it is renamed from `*.incomplete` to a name
+    /// without that suffix: how huggingface_hub completes a download.
+    RenameFromIncomplete,
+    /// Seal every regular file when its write epoch finalizes.
+    OnFinalize,
+}
+
+impl SealPolicy {
+    pub fn as_bits(self) -> i64 {
+        match self {
+            SealPolicy::Inherit => 0,
+            SealPolicy::Off => 1,
+            SealPolicy::RenameFromIncomplete => 2,
+            SealPolicy::OnFinalize => 3,
+        }
+    }
+    pub fn from_bits(v: i64) -> SealPolicy {
+        match v & 3 {
+            1 => SealPolicy::Off,
+            2 => SealPolicy::RenameFromIncomplete,
+            3 => SealPolicy::OnFinalize,
+            _ => SealPolicy::Inherit,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,5 +302,8 @@ pub enum Reply {
     },
     Session(SessionId),
     Store(StoreId),
+    Revision(u64),
+    /// First of a reserved block of file ids.
+    FileIds(FileId),
     Batch(Vec<Result<Reply, nest_types::NestError>>),
 }

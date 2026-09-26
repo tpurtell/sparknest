@@ -1646,6 +1646,174 @@ impl Vfs {
         }
     }
 
+    // ------------------------------------------------------------ placement
+
+    /// Pull a complete copy of `file`'s current STABLE generation into this
+    /// node's store and publish it (PROPOSAL §7 whole-file replication).
+    /// Returns the bytes copied (0 if a live copy was already here).
+    ///
+    /// Staging is never served; the copy is accepted on expected length and
+    /// completed I/O only (no checksums, ADR-008), made durable, moved into
+    /// place, then published conditionally: if the generation moved in the
+    /// meantime publication is refused and the copy deleted.
+    pub async fn replicate_here(&self, file: FileId) -> NestResult<u64> {
+        let a = self.raw_attr(file)?;
+        if a.kind != FileKind::Regular {
+            return Err(NestError::Invalid(
+                "only regular files have replicas".into(),
+            ));
+        }
+        if a.gen_state != GenState::Stable {
+            return Err(NestError::Busy("file is being written".into()));
+        }
+        let key = ObjectKey::new(file, a.generation);
+        let me_store = self.me().live_store();
+        if self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
+            return Ok(0);
+        }
+        let holders = self.holders(&a)?;
+        if holders.is_empty() {
+            return Err(NestError::Unavailable("no live copy to copy from".into()));
+        }
+        let mut last = NestError::Unavailable("no holder reachable".into());
+        for src in holders {
+            match self.copy_from(src, &a).await {
+                Ok(()) => {
+                    let r = self
+                        .propose(Command::PublishReplica {
+                            file,
+                            generation: a.generation,
+                            store: me_store,
+                        })
+                        .await;
+                    return match r {
+                        Ok(_) => Ok(a.size),
+                        Err(e) => {
+                            let _ = self.d.store().delete(key);
+                            Err(e)
+                        }
+                    };
+                }
+                Err(NestError::Stale) => return Err(NestError::Stale),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    async fn copy_from(&self, src: NodeId, a: &FileAttr) -> NestResult<()> {
+        let key = ObjectKey::new(a.id, a.generation);
+        let store = self.d.store().clone();
+        let staging = tokio::task::spawn_blocking(move || store.begin_staging(key))
+            .await
+            .expect("blocking task")
+            .map_err(io)?;
+        let staging = Arc::new(Mutex::new(Some(staging)));
+        let fab = self.fabric();
+        let chunk: u64 = fab.as_ref().map(|f| f.chunk() as u64).unwrap_or(4 << 20);
+        let window = 16usize;
+        let mut next = 0u64;
+        let mut inflight = futures::stream::FuturesUnordered::new();
+        use futures::StreamExt;
+        let fetch = |off: u64| {
+            let (fab, st) = (fab.clone(), staging.clone());
+            let (file, generation, size) = (a.id, a.generation, a.size);
+            async move {
+                let len = (size - off).min(chunk) as usize;
+                let bytes: Vec<u8> = match &fab {
+                    Some(f) => match f.read(src, file, generation, off, len).await {
+                        Ok(b) => b.as_slice().to_vec(),
+                        Err(NestError::Stale) => return Err(NestError::Stale),
+                        Err(_) => {
+                            self.tcp_read(src, file, generation, off, len as u32)
+                                .await?
+                        }
+                    },
+                    None => {
+                        self.tcp_read(src, file, generation, off, len as u32)
+                            .await?
+                    }
+                };
+                if bytes.len() != len {
+                    return Err(NestError::Io(format!(
+                        "short read at {off}: {} of {len} bytes",
+                        bytes.len()
+                    )));
+                }
+                tokio::task::spawn_blocking(move || {
+                    let g = st.lock();
+                    let f = g.as_ref().expect("staging open").file();
+                    f.write_all_at(&bytes, off)
+                })
+                .await
+                .expect("blocking task")
+                .map_err(io)
+            }
+        };
+        while next < a.size || !inflight.is_empty() {
+            while inflight.len() < window && next < a.size {
+                inflight.push(fetch(next));
+                next += chunk;
+            }
+            if let Some(r) = inflight.next().await {
+                r?;
+            }
+        }
+        let st = staging.lock().take().expect("staging open");
+        let store = self.d.store().clone();
+        let size = a.size;
+        tokio::task::spawn_blocking(move || {
+            st.file().set_len(size)?;
+            store.commit_staging(st)
+        })
+        .await
+        .expect("blocking task")
+        .map_err(io)?;
+        Ok(())
+    }
+
+    async fn tcp_read(
+        &self,
+        src: NodeId,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: u32,
+    ) -> NestResult<Vec<u8>> {
+        match self
+            .call(
+                src,
+                &DataReq::Read {
+                    file,
+                    generation,
+                    offset,
+                    len,
+                },
+            )
+            .await?
+        {
+            DataResp::Data(b) => Ok(b),
+            other => Err(NestError::Io(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    /// Remove this node's copy of `file` (refused for the last live copy).
+    pub async fn evict_here(&self, file: FileId) -> NestResult<bool> {
+        let a = self.raw_attr(file)?;
+        let me_store = self.me().live_store();
+        if !self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
+            return Ok(false);
+        }
+        self.propose(Command::RetireReplica {
+            file,
+            generation: a.generation,
+            store: me_store,
+            allow_last: false,
+        })
+        .await?;
+        Ok(true)
+    }
+
     // ------------------------------------------------------------ misc
 
     pub fn statfs(&self) -> NestResult<(nest_store::Capacity, u64)> {

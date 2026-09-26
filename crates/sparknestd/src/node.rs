@@ -52,6 +52,8 @@ pub struct Node {
     pub data: Arc<DataNode>,
     pub vfs: Arc<Vfs>,
     pub fabric: Option<Arc<nest_fabric::Fabric>>,
+    pub placer: Arc<nest_place::Placer>,
+    api_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     mounted: parking_lot::Mutex<Option<nest_fuse::Mounted>>,
 }
 
@@ -138,6 +140,25 @@ impl Node {
                 }
             }
         };
+        let mountpoint = cfg
+            .node
+            .mountpoint
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let placer =
+            nest_place::Placer::start(vfs.clone(), cfg.node.name.clone(), mountpoint.clone());
+        let api = nest_api::Api {
+            vfs: vfs.clone(),
+            placer: placer.clone(),
+            mountpoint,
+            hub: "/hub".into(),
+        };
+        let sock = cfg.api_socket();
+        let api_task = tokio::spawn(async move {
+            if let Err(e) = nest_api::serve_unix(api, sock).await {
+                tracing::error!(error = %e, "management API stopped");
+            }
+        });
         let node = Node {
             cfg,
             rpc,
@@ -145,6 +166,8 @@ impl Node {
             data,
             vfs,
             fabric,
+            placer,
+            api_task: parking_lot::Mutex::new(Some(api_task)),
             mounted: parking_lot::Mutex::new(None),
         };
         if tuning.mount
@@ -179,6 +202,9 @@ impl Node {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(t) = self.api_task.lock().take() {
+            t.abort();
+        }
         self.unmount();
         if let Some(f) = &self.fabric {
             f.shutdown();

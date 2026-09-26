@@ -308,3 +308,109 @@ pub fn locks_of(c: &Connection, file: FileId) -> rusqlite::Result<Vec<LockRow>> 
     })?;
     rows.collect()
 }
+
+/// A directory's own sealing policy (bits 8-9 of `files.flags`).
+pub fn seal_policy(c: &Connection, dir: FileId) -> rusqlite::Result<crate::SealPolicy> {
+    let flags: Option<i64> = c
+        .prepare_cached("SELECT flags FROM files WHERE id = ?1 AND kind = 2")?
+        .query_row(params![dir.0 as i64], |r| r.get(0))
+        .optional()?;
+    Ok(crate::SealPolicy::from_bits(flags.unwrap_or(0) >> 8))
+}
+
+/// The policy in force for files placed in `dir`: the nearest explicit
+/// setting on the way to the root; `Off` if none.
+pub fn effective_seal_policy(c: &Connection, dir: FileId) -> rusqlite::Result<crate::SealPolicy> {
+    let mut cur = dir;
+    for _ in 0..4096 {
+        let p = seal_policy(c, cur)?;
+        if p != crate::SealPolicy::Inherit {
+            return Ok(p);
+        }
+        match dir_parent(c, cur)? {
+            Some(parent) if parent != cur => cur = parent,
+            _ => break,
+        }
+    }
+    Ok(crate::SealPolicy::Off)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleRow {
+    pub name: String,
+    pub spec: String,
+    pub revision: u64,
+}
+
+pub fn rules(c: &Connection) -> rusqlite::Result<Vec<RuleRow>> {
+    let mut st = c.prepare_cached("SELECT name, spec, revision FROM rules ORDER BY name")?;
+    let rows = st.query_map([], |r| {
+        Ok(RuleRow {
+            name: r.get(0)?,
+            spec: r.get(1)?,
+            revision: r.get::<_, i64>(2)? as u64,
+        })
+    })?;
+    rows.collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreRow {
+    pub id: StoreId,
+    pub name: String,
+    pub class: i64,
+    pub node: Option<NodeId>,
+    pub config: String,
+}
+
+pub fn stores(c: &Connection) -> rusqlite::Result<Vec<StoreRow>> {
+    let mut st =
+        c.prepare_cached("SELECT id, name, class, node, config FROM stores ORDER BY id")?;
+    let rows = st.query_map([], |r| {
+        Ok(StoreRow {
+            id: StoreId(r.get::<_, i64>(0)? as u64),
+            name: r.get(1)?,
+            class: r.get(2)?,
+            node: r.get::<_, Option<i64>>(3)?.map(|n| NodeId(n as u64)),
+            config: r.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every name (with its parent directory) linking to `file`.
+pub fn names_of(c: &Connection, file: FileId) -> rusqlite::Result<Vec<(FileId, Vec<u8>)>> {
+    let mut st = c.prepare_cached(
+        "SELECT parent, name FROM dentries WHERE child = ?1 ORDER BY parent, name",
+    )?;
+    let rows = st.query_map(params![file.0 as i64], |r| {
+        Ok((FileId(r.get::<_, i64>(0)? as u64), r.get(1)?))
+    })?;
+    rows.collect()
+}
+
+/// One absolute path of `file` (any of its names), or None if unlinked.
+pub fn path_of(c: &Connection, file: FileId) -> rusqlite::Result<Option<Vec<u8>>> {
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut cur = file;
+    for _ in 0..4096 {
+        if cur == FileId::ROOT {
+            parts.reverse();
+            let mut out = Vec::new();
+            for p in parts {
+                out.push(b'/');
+                out.extend_from_slice(&p);
+            }
+            if out.is_empty() {
+                out.push(b'/');
+            }
+            return Ok(Some(out));
+        }
+        let Some((parent, name)) = names_of(c, cur)?.into_iter().next() else {
+            return Ok(None);
+        };
+        parts.push(name);
+        cur = parent;
+    }
+    Ok(None)
+}

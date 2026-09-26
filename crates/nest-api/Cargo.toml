@@ -1,6 +1,6 @@
 [package]
 name = "nest-api"
-description = "Management HTTP API (axum), OpenAPI, SSE"
+description = "Management HTTP API (axum) over a local Unix socket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,13 @@ license.workspace = true
 
 [dependencies]
 nest-types.workspace = true
+nest-meta.workspace = true
+nest-data.workspace = true
+nest-place.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true

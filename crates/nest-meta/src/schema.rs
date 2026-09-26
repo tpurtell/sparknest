@@ -90,6 +90,14 @@ CREATE TABLE stores (
     config TEXT    NOT NULL
 );
 
+-- Placement rules: durable intent, interpreted by nest-place. `spec` is
+-- JSON; `revision` increments on every change (optimistic concurrency).
+CREATE TABLE rules (
+    name     TEXT PRIMARY KEY,
+    spec     TEXT NOT NULL,
+    revision INTEGER NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE kv (
     k TEXT PRIMARY KEY,
     v INTEGER NOT NULL

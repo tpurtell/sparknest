@@ -1,6 +1,6 @@
 //! Deterministic application of commands to the metadata database.
 
-use crate::command::{Command, CreateReply, LockKind, RenameFlags, Reply, StoreClass};
+use crate::command::{Command, CreateReply, LockKind, RenameFlags, Reply, SealPolicy, StoreClass};
 use crate::effect::Effect;
 use crate::query::{self, ATTR_COLS, attr_from_row};
 use nest_types::{
@@ -168,6 +168,101 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
         Command::ReleaseOrphans { session, files } => {
             for f in files {
                 release_orphan(c, *f, *session, fx)?;
+            }
+            Ok(Reply::Done)
+        }
+        Command::SetSealPolicy {
+            dir: d,
+            policy,
+            now,
+        } => {
+            dir(c, *d)?;
+            c.prepare_cached(
+                "UPDATE files SET flags = (flags & ~768) | (?2 << 8), ctime = ?3 WHERE id = ?1",
+            )?
+            .execute(params![d.0 as i64, policy.as_bits(), now.0])?;
+            fx.push(Effect::AttrChanged { file: *d });
+            Ok(Reply::Done)
+        }
+        Command::ReserveFileIds { count } => {
+            if *count == 0 || *count > 1 << 20 {
+                return err(NestError::Invalid("bad id count".into()));
+            }
+            let first: i64 = c
+                .prepare_cached(
+                    "UPDATE kv SET v = v + ?1 WHERE k = 'next_file_id' RETURNING v - ?1",
+                )?
+                .query_row(params![*count as i64], |r| r.get(0))?;
+            Ok(Reply::FileIds(FileId(first as u64)))
+        }
+        Command::Import {
+            parent,
+            name,
+            file,
+            perm,
+            size,
+            mtime,
+            node,
+            sealed,
+            now,
+        } => {
+            validate_name(name)?;
+            dir(c, *parent)?;
+            let next: i64 = c
+                .prepare_cached("SELECT v FROM kv WHERE k = 'next_file_id'")?
+                .query_row([], |r| r.get(0))?;
+            if file.0 == 0 || file.0 as i64 >= next || query::getattr(c, *file)?.is_some() {
+                return err(NestError::Invalid(
+                    "import needs an unused reserved file id".into(),
+                ));
+            }
+            if query::lookup(c, *parent, name)?.is_some() {
+                return err(NestError::Exists);
+            }
+            c.prepare_cached(
+                "INSERT INTO files (id, kind, perm, size, nlink, atime, mtime, ctime, crtime, gen, gen_state, owner, epoch, sealed, flags, parent, target) \
+                 VALUES (?1, 1, ?2, ?3, 1, ?4, ?4, ?5, ?5, 1, 0, NULL, 0, ?6, 0, NULL, NULL)",
+            )?
+            .execute(params![file.0 as i64, (*perm & 0o7777) as i64, *size as i64, mtime.0, now.0, *sealed])?;
+            c.prepare_cached(
+                "INSERT INTO replicas (file, gen, store, state) VALUES (?1, 1, ?2, 1)",
+            )?
+            .execute(params![file.0 as i64, node.live_store().0 as i64])?;
+            insert_dentry(c, *parent, name, *file)?;
+            touch_dir(c, *parent, *now, fx)?;
+            fx.push(Effect::EntryChanged {
+                parent: *parent,
+                name: name.clone(),
+            });
+            Ok(Reply::Done)
+        }
+        Command::SetRule {
+            name,
+            spec,
+            expect_revision,
+        } => {
+            let cur: Option<i64> = c
+                .prepare_cached("SELECT revision FROM rules WHERE name = ?1")?
+                .query_row(params![name], |r| r.get(0))
+                .optional()?;
+            if let Some(want) = expect_revision
+                && cur.unwrap_or(0) as u64 != *want
+            {
+                return err(NestError::Stale);
+            }
+            let rev = cur.unwrap_or(0) + 1;
+            c.prepare_cached(
+                "INSERT OR REPLACE INTO rules (name, spec, revision) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![name, spec, rev])?;
+            Ok(Reply::Revision(rev as u64))
+        }
+        Command::DeleteRule { name } => {
+            let n = c
+                .prepare_cached("DELETE FROM rules WHERE name = ?1")?
+                .execute(params![name])?;
+            if n == 0 {
+                return err(NestError::NotFound);
             }
             Ok(Reply::Done)
         }
@@ -760,6 +855,15 @@ fn rename(
         }
         remove_dentry(c, parent, name)?;
         insert_dentry(c, new_parent, new_name, src)?;
+        // huggingface_hub completes a download by renaming `x.incomplete`
+        // to `x`: seal it there when the destination tree asks for that.
+        if src_attr.kind == FileKind::Regular
+            && name.ends_with(b".incomplete")
+            && !new_name.ends_with(b".incomplete")
+            && query::effective_seal_policy(c, new_parent)? == SealPolicy::RenameFromIncomplete
+        {
+            seal(c, src, true, now, fx)?;
+        }
         if src_attr.kind == FileKind::Directory && parent != new_parent {
             reparent_dir(c, src, parent, new_parent)?;
         }
@@ -924,7 +1028,19 @@ fn finalize(
 ) -> R<Reply> {
     let a = owned_with_epoch(c, file, epoch)?;
     let owner = a.owner.expect("owned file has an owner");
-    let seal = flags(c, file)? & FLAG_SEAL_PENDING != 0;
+    let mut seal = flags(c, file)? & FLAG_SEAL_PENDING != 0;
+    if !seal && !a.sealed {
+        let parents: Vec<i64> = c
+            .prepare_cached("SELECT parent FROM dentries WHERE child = ?1")?
+            .query_map(params![file.0 as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for p in parents {
+            if query::effective_seal_policy(c, FileId(p as u64))? == SealPolicy::OnFinalize {
+                seal = true;
+                break;
+            }
+        }
+    }
     c.prepare_cached(
         "UPDATE files SET size = ?2, mtime = ?3, ctime = MAX(ctime, ?4), gen_state = ?5, owner = NULL, \
          sealed = CASE WHEN ?6 THEN 1 ELSE sealed END, flags = flags & ~?7 WHERE id = ?1",

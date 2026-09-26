@@ -368,3 +368,32 @@ forces the owner to wait out its lease while serving nothing stale.
 7. **Fast paths on the FUSE thread** (local reads, readahead hits, owner
    writes): measured necessary on the Sparks, whose deep idle states make
    each thread hand-off expensive (benchmarks/M4-FIRST-MEASUREMENTS.md).
+
+## ADR-017 — Placement, import and seal policies as built (2026-09-26)
+
+1. **Seal policies on directories**, inherited: `off`, `rename_from_incomplete`
+   (seal a regular file renamed from `*.incomplete`; huggingface_hub's
+   completion step, applied at finalize if the rename lands first), and
+   `on_finalize`. Applied deterministically in apply.
+2. **Selectors → manifests.** Path selectors walk a tree and follow symlinks
+   inside the namespace, which is exactly how an HF snapshot reaches
+   repo-local blobs and the shared blob store; `hf:org/name@rev` narrows to
+   one revision (refs/ and trees/ included). Symlinks that leave the
+   namespace are reported as dangling.
+3. **Whole-file replication is pulled by the target** into staging over
+   RDMA (TCP fallback), accepted on expected length and completed I/O,
+   fsynced, moved into place, and published conditionally on the
+   generation; a generation change discards the copy.
+4. **Rules are durable, jobs are not.** Rules live in replicated metadata;
+   replicate/reconcile jobs live on the coordinating node and are
+   idempotent, so a lost job is re-run, not resumed. Eviction never removes
+   the last live copy.
+5. **Import by hard link.** Reserve ids, link each source into the store
+   under its final id, commit STABLE entries, then (with `--move`) unlink
+   sources. No data is copied and a crash never loses a source (this is the
+   "intent" ADR-013 anticipated, without a journal). `*.incomplete` and
+   `*.lock` files are skipped. Seal mode `auto` seals files under `blobs/`
+   below a rename-from-incomplete policy (refs/ and trees/ stay writable
+   because huggingface_hub rewrites them in place).
+6. **Management API** on a 0600 Unix socket; `nest` CLI uses only it.
+   Nodes register their names in the stores table at startup.

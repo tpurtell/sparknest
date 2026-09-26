@@ -200,6 +200,22 @@ impl ObjectStore {
         Ok(md.len())
     }
 
+    /// Adopt an existing file by hard-linking it into place: no data moves
+    /// and the source stays until the caller removes it (import commits the
+    /// metadata in between, so a crash never loses the source). Fails with
+    /// EXDEV across filesystems and EEXIST if the object exists.
+    pub fn link_from(&self, src: &Path, k: ObjectKey) -> io::Result<u64> {
+        let md = fs::symlink_metadata(src)?;
+        if !md.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        fs::hard_link(src, self.path(k))?;
+        Ok(md.len())
+    }
+
     /// Every object present, with its size. Unrecognized names are skipped.
     pub fn scan(&self) -> io::Result<Vec<ObjectInfo>> {
         let mut out = Vec::new();
