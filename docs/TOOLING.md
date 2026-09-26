@@ -15,3 +15,15 @@ Add a row the moment a new tool is introduced.
 | perftest (`ib_write_bw`) | all nodes | already installed on raptor; `apt`/brew on Sparks if missing | raw fabric ceilings |
 
 Homebrew (`/home/linuxbrew/.linuxbrew`) is the preferred way to add tools.
+
+## When ghcr.io downloads stall
+
+Homebrew bottles come from ghcr.io, which sometimes resets long transfers
+(seen for the 514 MB `llvm@22` bottle that brew's `rust` needs). Fetch the
+blob with resume, then place it in the cache under the name brew expects
+(the `.incomplete` file's name without that suffix):
+
+```sh
+curl -sSL --http1.1 -C - --retry 5 --retry-all-errors -H "Authorization: Bearer QQ==" \
+  -o bottle.tar.gz "https://ghcr.io/v2/homebrew/core/<name>/<version>/blobs/sha256:<digest>"
+```

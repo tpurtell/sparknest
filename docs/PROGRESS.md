@@ -13,8 +13,9 @@ what is next. Keep entries short; link to benchmarks and ADRs.
   back intact from a reboot of all seven hosts.
 - Data reserve protects metadata from a full disk (ADR-024); import adopts
   existing blobs without copying; the daemon clears dead FUSE mounts.
-- Next: arm64 formula test (Homebrew's ghcr downloads are slow on
-  ostrich), cut v0.1.0 when the user wants it published.
+- The Homebrew formula passes build, test, style and linkage natively on
+  raptor (x86_64) and ostrich (arm64).
+- Next: cut v0.1.0 when the user wants it published (repo is private).
 
 ## 2026-09-27 — M8: release tooling, migration tooling
 
