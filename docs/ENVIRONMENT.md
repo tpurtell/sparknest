@@ -57,8 +57,11 @@ one-time root checklist below.
 - `~/.cache/huggingface/hub` on raptor: classic layout (`models--*/blobs`,
   `snapshots`, `refs`, `.no_exist`, `.locks/`), plus a new-style shared-blobs
   root `hub/blobs/` with marker `.huggingface-shared-blobs` and one entry
-  `blobs/09/<sha>` + `.refs`. `huggingface_hub` versions in venvs: 1.24, 1.26,
-  1.30. `~/.cache/huggingface/xet/` exists (xet chunk cache; keep local).
+  `blobs/09/<sha>` + `.refs` (created 2026-09-25 by a client ≥ 1.32; the
+  referencing repo has since been deleted). One repo has a `trees/` dir.
+  `huggingface_hub` in venvs: 1.24, 1.26, 1.30 (predate shared blobs; upgrade
+  to ≥ 1.32 before migration). `~/.cache/huggingface/xet/` exists (chunk cache,
+  disabled by default since hf_xet 1.2; keep local).
 
 ## Toolchains
 

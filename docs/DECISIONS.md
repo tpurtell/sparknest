@@ -169,3 +169,28 @@ one Spark (arm64) and pushes binaries and sample configs to all nodes for
 trial deployments. `packaging/` holds systemd units, `fuse.conf` guidance,
 `node.toml` samples. Final release: GitHub release with per-arch tarballs and a
 formula in `../local-ai-tap` alongside `rdmasync` and `rdmapipe`.
+
+## ADR-010 — HF cache layout: shared blob store normative, legacy readable (2026-09-26)
+
+**Context.** huggingface_hub ≥ 1.32 stores Xet payloads once at
+`hub/blobs/<xx>/<xet_hash>` with a marker file and `.refs` hints, and makes
+repo `blobs/<etag>` a relative symlink. Every existing cache on raptor and the
+Sparks is the older repo-local layout (venvs run 1.24–1.30); the marker on
+raptor was created on 2026-09-25 by a newer client.
+
+**Decision.** The sparknest-managed hub targets the shared-blob layout; all
+nodes download with huggingface_hub ≥ 1.32. The resolver reads any layout by
+following symlink chains to terminal files. `nest import --adopt` preserves
+legacy layouts unchanged. Sealing triggers on rename from `*.incomplete` under
+any `blobs/` directory. `trees/<commit>.json` drives completeness.
+
+**Alternatives.** Rewriting legacy repos into the shared store (needs Xet
+hashes we cannot compute without hashing; rejected), forcing
+`HF_HUB_DISABLE_SHARED_BLOBS=1` for uniformity (loses cross-repo dedup that is
+free for us), sealing on close instead of rename (Xet writes in parallel from
+many threads, close is not a boundary).
+
+**Consequences.** The write path is designed around concurrent random-offset
+`pwrite` into one file. M5 must verify no silent fallback to repo-local
+storage on the FUSE mount. User venvs should be upgraded to ≥ 1.32 before
+migration.

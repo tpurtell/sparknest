@@ -292,15 +292,57 @@ Eviction (remove a copy) and unlink (remove a name) are different operations,
 and HF's own delete-cache tooling run through the mount deletes cluster-wide,
 by design.
 
-The HF resolver understands both cache layouts present on raptor: the classic
-`models--org--name/{refs,snapshots/<commit>/*→../../blobs/<name>}` and the new
-shared-blobs layout (`hub/blobs/<xx>/<sha>` with `.refs` sidecars, marked by
-`hub/blobs/.huggingface-shared-blobs`). A model is *ready* on a host only when
-every file of the resolved selection is sealed/stable and `LIVE` there.
-Reconciliation runs on finalize/rename events with debounce at the model level.
-The plugin also excludes HF's mutable scratch (`xet/` chunk cache, tool caches)
-from the shared tree by configuration; validated against `huggingface_hub`
-1.24–1.30 as installed in the user's venvs.
+### 7.1 Hugging Face cache layout policy
+
+**Normative layout is the huggingface_hub ≥ 1.32 shared blob store** (current
+release line is 2.x; enabled by default, opt-out `HF_HUB_DISABLE_SHARED_BLOBS=1`).
+Under `hub/`:
+
+```text
+hub/blobs/.huggingface-shared-blobs        marker; hf never adopts an unmarked blobs/ dir
+hub/blobs/<xx>/<xet_hash>                  one payload per Xet file, shared across repos
+hub/blobs/<xx>/<xet_hash>.refs             append-only hint listing repo blobs that reference it
+hub/models--org--name/blobs/<etag>         relative symlink -> ../../blobs/<xx>/<xet_hash>  (Xet files)
+hub/models--org--name/blobs/<etag>         regular file (small non-Xet files, git-sha etags)
+hub/models--org--name/snapshots/<commit>/<path> -> ../../blobs/<etag>
+hub/models--org--name/{refs/<branch>, trees/<commit>.json, .no_exist/}
+hub/.locks/models--org--name/<etag>.lock   filelock (fcntl) used during downloads
+```
+
+Reading is layout-agnostic: the resolver follows any symlink chain inside the
+hub to a terminal regular file and builds the dependency manifest on terminal
+`file_id`s, so legacy repo-local blobs (every existing cache on raptor and the
+Sparks), the shared store, and no-symlink copies all resolve. `trees/<commit>.json`
+(path, size, hash per file at that commit) is the preferred source for the
+intended selection and completeness check; the Hub API is the fallback.
+
+Import adopts legacy caches **as they are**. sparknest never rewrites a
+repo-local blob into the shared store: that would require the Xet hash, which
+only the downloader knows (ADR-008, no hashing). Legacy content is still
+deduplicated for placement and accounting by shared terminal identity within a
+repo, and across hosts by path+size adoption. New downloads land in the shared
+store because all nodes run huggingface_hub ≥ 1.32 against the mount.
+
+Download mechanics that shape the FUSE/write design (from `file_download.py`):
+`hf_xet` writes **directly into `<blob>.incomplete` with parallel random-offset
+writes from several threads**; this is the dominant write workload and the
+owner-routed write path must sustain multi-GB/s of concurrent `pwrite` to one
+file on the download host. Completion is `os.replace(incomplete, blob)`, then
+for Xet files `publish_blob_to_shared_store` moves the blob into
+`hub/blobs/<xx>/<hash>` (another rename), appends and fsyncs `.refs`, and
+creates the repo symlink. **Seal rule:** a regular file under any `blobs/`
+directory that is renamed from a `*.incomplete` name is sealed at that rename.
+Subsequent renames are metadata-only, which is exactly why objects are stored
+by identity (ADR-005). `.refs` and `refs/<branch>` stay ordinary mutable files.
+
+huggingface_hub probes capabilities with `os.symlink`, `os.link`, `os.replace`
+and **silently falls back to repo-local storage on any failure**; M5 must
+prove, on a trial mount, that a real download ends in the shared store. A model
+is *ready* on a host only when every file of the resolved selection is sealed
+and `LIVE` there. Reconciliation runs on seal/rename events with debounce at the
+model level. `hf cache rm` / `prune` through the mount delete cluster-wide by
+design (eviction is the API operation for local space). HF's mutable scratch
+(`xet/` chunk cache, tool caches) stays on local disk by configuration.
 
 Whole-file replication: reserve capacity → read grant on the stable generation
 → copy to `staging/` → verify expected `(file_id, gen, size)` and completion →
