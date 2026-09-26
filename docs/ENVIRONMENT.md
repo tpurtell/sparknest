@@ -34,8 +34,8 @@ one-time root checklist below.
   = 10.55.1.N, N = 1..6 (ostrich, dodo, emu, kiwi, rhea, moa in IP order:
   .1 ostrich, .2 dodo, .3 emu, .4 kiwi, .5 rhea, .6 moa). The `f1` functions
   are DOWN.
-- Switch is currently set to **100G per Spark rail** to keep fans quiet. The
-  user can raise it to 200G on request for a benchmark pass. A single Spark
+- Switch set to **200G per Spark rail** on 2026-09-27 for the benchmark pass
+  (benchmarks/M8-200G.md); it was 100G before to keep the fans quiet. A single Spark
   rail is PCIe-capped near 116 Gb/s regardless; dual rail is required for
   ~195 Gb/s.
 - Measured reference (rdmasync benchmarks, 2026-08, 200G): Spark dual-rail raw
