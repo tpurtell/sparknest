@@ -467,7 +467,14 @@ impl Filesystem for Fs {
     ) {
         // Local copies and readahead hits complete right here: every hand-off
         // to another thread can cost a deep-idle wake on the Sparks.
-        match self.vfs.try_read_now(fh.0, offset, size) {
+        let fast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.vfs.try_read_now(fh.0, offset, size)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::error!("fast read path panicked; using the async path");
+            None
+        });
+        match fast {
             Some(Ok(b)) => return reply.data(&b),
             Some(Err(e)) => return reply.error(errno(&e)),
             None => {}
@@ -494,7 +501,14 @@ impl Filesystem for Fs {
         reply: ReplyWrite,
     ) {
         // The owner writing its own open epoch completes right here.
-        match self.vfs.try_write_now(fh.0, offset, data) {
+        let fast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.vfs.try_write_now(fh.0, offset, data)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::error!("fast write path panicked; using the async path");
+            None
+        });
+        match fast {
             Some(Ok(n)) => return reply.written(n),
             Some(Err(e)) => return reply.error(errno(&e)),
             None => {}

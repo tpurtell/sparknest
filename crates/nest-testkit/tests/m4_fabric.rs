@@ -199,3 +199,50 @@ async fn owned_file_reads_see_latest_writes_within_a_generation() {
     v2.release(rfh, None).await;
     v1.release(fh, None).await;
 }
+
+/// The FUSE fast path runs on threads outside the tokio runtime: a
+/// readahead hit there must be able to keep the pipeline going.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn fast_path_readahead_from_a_non_runtime_thread() {
+    let Some(c) = fabric_cluster(2).await else {
+        return;
+    };
+    let v1 = &c.node(1).vfs;
+    let size = 48u64 << 20;
+    let (a, fh, _) = v1
+        .create(FileId::ROOT, b"f", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    for off in (0..size).step_by(1 << 20) {
+        v1.write(fh, off, vec![(off >> 20) as u8; 1 << 20])
+            .await
+            .unwrap();
+    }
+    v1.release(fh, None).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        c.attr(2, a.id)
+            .is_some_and(|x| x.gen_state == GenState::Stable)
+    })
+    .await;
+    let v2 = c.node(2).vfs.clone();
+    let (rfh, _) = v2.open(a.id, 0).await.unwrap();
+    // Prime readahead from the runtime, as the async path does.
+    assert_eq!(v2.read(rfh, 0, 1 << 20).await.unwrap()[0], 0);
+    let rt = tokio::runtime::Handle::current();
+    let total = std::thread::spawn(move || {
+        let mut pos = 1u64 << 20;
+        while pos < size {
+            let b = match v2.try_read_now(rfh, pos, 1 << 20) {
+                Some(r) => r.unwrap(),
+                None => rt.block_on(v2.read(rfh, pos, 1 << 20)).unwrap(),
+            };
+            assert_eq!(b[0], (pos >> 20) as u8, "at {pos}");
+            pos += b.len() as u64;
+        }
+        pos
+    })
+    .join()
+    .unwrap();
+    assert_eq!(total, size);
+    c.node(2).vfs.release(rfh, None).await;
+}

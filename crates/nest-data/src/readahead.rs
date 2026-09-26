@@ -32,6 +32,9 @@ pub(crate) struct Readahead {
     next: u64,
     eof: Option<u64>,
     chunks: BTreeMap<u64, Chunk>,
+    /// Captured at creation: fetches may be started from a FUSE thread that
+    /// is not inside the runtime (fast path).
+    rt: tokio::runtime::Handle,
 }
 
 impl Readahead {
@@ -55,6 +58,7 @@ impl Readahead {
             next: 0,
             eof: size,
             chunks: BTreeMap::new(),
+            rt: tokio::runtime::Handle::current(),
         }
     }
 
@@ -75,9 +79,10 @@ impl Readahead {
         );
         self.chunks.insert(
             start,
-            Chunk::Pending(tokio::spawn(async move {
-                f.read(source, file, generation, start, len).await
-            })),
+            Chunk::Pending(
+                self.rt
+                    .spawn(async move { f.read(source, file, generation, start, len).await }),
+            ),
         );
     }
 
