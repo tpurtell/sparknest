@@ -342,3 +342,29 @@ write-through-holder, truncating ownership, readers never regress to stale
 bytes during revocation (disabling fencing makes this fail), unlink with a
 remote open handle, owner partition fails closed, and a partitioned holder
 forces the owner to wait out its lease while serving nothing stale.
+
+## ADR-016 — RDMA fabric design as built (2026-09-26)
+
+1. **C shim, not bindgen.** `crates/nest-fabric/csrc/nf_shim.c` wraps the
+   inline verbs calls behind our own tiny ABI and is compiled against each
+   host's installed headers (rdma-core 50 and 61 both work).
+2. **Rails are RoCE v2 GIDs** whose IPv4 is configured on an UP netdevice;
+   a link pairs rails by subnet, one RC QP per pair, so raptor's single port
+   uses both subnets against a Spark's two functions.
+3. **Pull protocol.** The reader SENDs a 64-byte request naming a landing
+   slot (remote-writable registered memory); the server reads through the
+   data service (`ReadSource`, where generation fencing lives) into a
+   registered staging slot and answers with RDMA WRITE_WITH_IMM
+   (imm = slot << 23 | len) or a small error SEND. TCP only sets links up.
+4. **Bounded memory.** Per-device landing and staging pools (defaults 128
+   and 64 × 4 MiB), per-lane windows sized so both directions fit the
+   peer's receive ring. Readahead holds chunks in landing slots and only
+   fetches speculatively while a quarter of the pool is spare.
+5. **Readahead only for STABLE generations.** A file being written by its
+   owner is read with exact, uncached ranges.
+6. **Failure.** A failed completion puts the lane's QP into the error state
+   (the NIC stops touching its buffers) and fails only its waiters; the
+   next read reconnects the link; reads fall back to TCP meanwhile.
+7. **Fast paths on the FUSE thread** (local reads, readahead hits, owner
+   writes): measured necessary on the Sparks, whose deep idle states make
+   each thread hand-off expensive (benchmarks/M4-FIRST-MEASUREMENTS.md).

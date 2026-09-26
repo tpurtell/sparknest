@@ -3,6 +3,23 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-26 — M4 in progress: RDMA fabric live on the trial cluster
+
+- `nest-fabric`: C shim over libibverbs, rail discovery, pull protocol with
+  WRITE_WITH_IMM, bounded pools, per-device pollers (ADR-016). Loopback
+  20.3 GB/s (raptor), 14.1 GB/s (ostrich).
+- Remote reads use RDMA with sequential readahead (stable generations only)
+  and fall back to TCP. Fast paths on the FUSE thread after finding that
+  Spark deep idle states cost ~0.5 ms per FUSE request.
+- Seal from any mount: `user.sparknest.sealed` xattr.
+- Numbers in `benchmarks/M4-FIRST-MEASUREMENTS.md`: warm sealed remote
+  reads 22 GB/s from page cache; raptor reads Spark-owned files at 4.5 GB/s;
+  Spark single streams through the daemon are latency-bound (1.4–2 GB/s).
+- Blocked on root for the rest of M4: system unit (passthrough +
+  readahead), optional deep-idle experiment, 200G switch setting.
+- Next: M5 (placement, replication engine, HF plugin, CLI) while the root
+  steps are pending; then return to M4 tuning with the new levers.
+
 ## 2026-09-26 — M3: multi-node data plane, first trial on all seven hosts
 
 - Reads route to local copy, owner, or live holder by exact generation;
