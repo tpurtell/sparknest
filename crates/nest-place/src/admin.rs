@@ -53,6 +53,20 @@ pub(crate) enum AdminReq {
     Evict {
         files: Vec<FileId>,
     },
+    /// Run on the leader: change Raft membership.
+    Membership(MembershipChange),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MembershipChange {
+    /// Add (or re-add) a node, as voter or learner.
+    Add {
+        node: NodeId,
+        addr: String,
+        voter: bool,
+    },
+    /// Remove a node entirely (it stops voting and receiving the log).
+    Remove { node: NodeId },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -196,6 +210,19 @@ impl Handler for AdminService {
                     None => AdminResp::Err(format!("no job {job}")),
                 },
                 AdminReq::Evict { files } => a.evict(files).await,
+                AdminReq::Membership(change) => {
+                    let meta = a.vfs.data().meta().clone();
+                    let r = match change {
+                        MembershipChange::Add { node, addr, voter } => {
+                            meta.add_node(node, addr, voter).await
+                        }
+                        MembershipChange::Remove { node } => meta.remove_node(node).await,
+                    };
+                    match r {
+                        Ok(()) => AdminResp::Started,
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    }
+                }
             };
             nest_rpc::encode(&resp)
                 .map(Bytes::from)

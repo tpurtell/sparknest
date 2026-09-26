@@ -111,6 +111,9 @@ pub fn router(api: Api) -> Router {
         .route("/v1/jobs", get(jobs))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/import", post(import))
+        .route("/v1/cluster", get(cluster))
+        .route("/v1/cluster/remove", post(cluster_remove))
+        .route("/v1/cluster/add", post(cluster_add))
         .with_state(api)
 }
 
@@ -411,4 +414,49 @@ async fn import(State(api): State<Api>, Json(r): Json<ImportReq>) -> R<serde_jso
         seal: r.seal.unwrap_or(SealMode::Auto),
     };
     Ok(Json(json!({ "job": api.placer.import(opts) })))
+}
+
+async fn cluster(State(api): State<Api>) -> R<serde_json::Value> {
+    Ok(Json(api.placer.membership()?))
+}
+
+#[derive(Deserialize)]
+struct RemoveReq {
+    host: String,
+}
+
+async fn cluster_remove(State(api): State<Api>, Json(r): Json<RemoveReq>) -> R<serde_json::Value> {
+    let h = api
+        .placer
+        .resolve_hosts(&[r.host.clone()])?
+        .pop()
+        .ok_or(bad("unknown host"))?;
+    if h.node == api.vfs.data().id() {
+        return Err(bad(
+            "refusing to remove the node serving this request; ask another node",
+        ));
+    }
+    api.placer
+        .change_membership(nest_place::admin::MembershipChange::Remove { node: h.node })
+        .await?;
+    Ok(Json(json!({ "removed": h.name })))
+}
+
+#[derive(Deserialize)]
+struct AddReq {
+    id: u64,
+    addr: String,
+    #[serde(default = "yes")]
+    voter: bool,
+}
+
+async fn cluster_add(State(api): State<Api>, Json(r): Json<AddReq>) -> R<serde_json::Value> {
+    api.placer
+        .change_membership(nest_place::admin::MembershipChange::Add {
+            node: nest_types::NodeId(r.id),
+            addr: r.addr.clone(),
+            voter: r.voter,
+        })
+        .await?;
+    Ok(Json(json!({ "added": r.id, "voter": r.voter })))
 }

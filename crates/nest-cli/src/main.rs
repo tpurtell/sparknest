@@ -74,6 +74,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RuleCmd,
     },
+    /// Cluster membership.
+    Cluster {
+        #[command(subcommand)]
+        cmd: ClusterCmd,
+    },
     /// Converge rules (all, or one by name).
     Reconcile {
         name: Option<String>,
@@ -99,6 +104,22 @@ enum Cmd {
         seal: String,
         #[arg(long)]
         wait: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterCmd {
+    /// Show members, voters and the leader.
+    Ls,
+    /// Remove a node from the cluster (e.g. before re-imaging it).
+    Remove { host: String },
+    /// Add (or re-add) a node by id and control address (ip:port).
+    Add {
+        id: u64,
+        addr: String,
+        /// Join as a non-voting learner.
+        #[arg(long)]
+        learner: bool,
     },
 }
 
@@ -492,6 +513,40 @@ async fn main() -> Result<()> {
             RuleCmd::Rm { name } => {
                 c.call(Method::DELETE, &format!("/v1/rules/{}", enc(name)), None)
                     .await?
+            }
+        },
+        Cmd::Cluster { cmd } => match cmd {
+            ClusterCmd::Ls => {
+                let v = c.get("/v1/cluster").await?;
+                if !cli.json {
+                    println!("leader: node{}   term: {}", v["leader"], v["term"]);
+                    for n in v["nodes"].as_array().into_iter().flatten() {
+                        println!(
+                            "  {:>3} {:<9} {:<22} {}",
+                            n["id"],
+                            n["name"].as_str().unwrap_or(""),
+                            n["addr"].as_str().unwrap_or(""),
+                            if n["voter"].as_bool() == Some(true) {
+                                "voter"
+                            } else {
+                                "learner"
+                            }
+                        );
+                    }
+                    return Ok(());
+                }
+                v
+            }
+            ClusterCmd::Remove { host } => {
+                c.post("/v1/cluster/remove", json!({ "host": host }))
+                    .await?
+            }
+            ClusterCmd::Add { id, addr, learner } => {
+                c.post(
+                    "/v1/cluster/add",
+                    json!({ "id": id, "addr": addr, "voter": !learner }),
+                )
+                .await?
             }
         },
         Cmd::Reconcile { name, wait } => {

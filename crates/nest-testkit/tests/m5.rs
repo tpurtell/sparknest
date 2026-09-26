@@ -275,3 +275,42 @@ async fn automatic_rules_follow_new_content() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn remove_and_readd_a_member() {
+    use nest_place::admin::MembershipChange;
+    let c = ready(3).await;
+    let p = &c.node(1).placer;
+    let voters = |c: &TestCluster| -> usize {
+        c.node(1).placer.membership().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["voter"] == true)
+            .count()
+    };
+    assert_eq!(voters(&c), 3);
+    p.change_membership(MembershipChange::Remove { node: NodeId(3) })
+        .await
+        .unwrap();
+    c.eventually("two voters", Duration::from_secs(5), |c| voters(c) == 2)
+        .await;
+    // The cluster keeps working without it.
+    c.node(2)
+        .vfs
+        .mkdir(FileId::ROOT, b"after-remove", 0o755)
+        .await
+        .unwrap();
+    let addr = c.node(3).rpc.local_addr().to_string();
+    p.change_membership(MembershipChange::Add {
+        node: NodeId(3),
+        addr,
+        voter: true,
+    })
+    .await
+    .unwrap();
+    c.eventually("three voters", Duration::from_secs(5), |c| voters(c) == 3)
+        .await;
+    c.converge().await;
+    assert!(c.lookup(3, FileId::ROOT, "after-remove").is_some());
+}

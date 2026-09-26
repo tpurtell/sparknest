@@ -75,12 +75,7 @@ async fn auto_reconcile(p: std::sync::Weak<Placer>) {
         };
         dirty.notified().await;
         // Debounce: wait until no change for the quiet period.
-        loop {
-            match tokio::time::timeout(AUTO_DEBOUNCE, dirty.notified()).await {
-                Ok(()) => continue,
-                Err(_) => break,
-            }
-        }
+        while tokio::time::timeout(AUTO_DEBOUNCE, dirty.notified()).await.is_ok() {}
         let Some(p) = p.upgrade() else { return };
         if p.vfs.data().meta().leader() != Some(p.vfs.data().id()) {
             continue;
@@ -471,6 +466,50 @@ impl Placer {
             }
         }
         Ok(out)
+    }
+
+    // ------------------------------------------------------------ membership
+
+    /// Voters, learners and addresses as this node sees them.
+    pub fn membership(&self) -> NestResult<serde_json::Value> {
+        let m = self.vfs.data().meta().raft().metrics().borrow().clone();
+        let names: HashMap<NodeId, String> = self
+            .nodes()?
+            .into_iter()
+            .map(|h| (h.node, h.name))
+            .collect();
+        let mc = m.membership_config.membership();
+        let voters: std::collections::BTreeSet<u64> = mc.voter_ids().collect();
+        let nodes: Vec<serde_json::Value> = mc
+            .nodes()
+            .map(|(id, n)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": names.get(&NodeId(*id)).cloned().unwrap_or_default(),
+                    "addr": n.addr,
+                    "voter": voters.contains(id),
+                })
+            })
+            .collect();
+        Ok(
+            serde_json::json!({ "leader": m.current_leader, "term": m.current_term, "nodes": nodes }),
+        )
+    }
+
+    /// Apply a membership change on the leader.
+    pub async fn change_membership(&self, change: admin::MembershipChange) -> NestResult<()> {
+        let leader = self.vfs.data().meta().leader().ok_or(NestError::NoQuorum)?;
+        match admin::call(
+            self.rpc(),
+            leader,
+            &AdminReq::Membership(change),
+            Duration::from_secs(60),
+        )
+        .await?
+        {
+            AdminResp::Started => Ok(()),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
     }
 
     // ------------------------------------------------------------ rules
