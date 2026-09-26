@@ -812,18 +812,22 @@ name = "nest-raft"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
  "nest-meta",
+ "nest-rpc",
  "nest-types",
  "openraft",
  "parking_lot",
+ "postcard",
+ "rand 0.9.5",
  "rusqlite",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

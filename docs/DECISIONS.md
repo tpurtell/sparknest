@@ -237,3 +237,21 @@ language for types that already derive serde. The traffic is modest
 
 **Consequences.** No cross-language clients for the control plane, which is
 fine: the CLI and web use the HTTP management API.
+
+## ADR-002a — openraft 0.9.25 pinned (2026-09-26)
+
+**Decision.** Pin `openraft = "=0.9.25"` with `storage-v2` and `serde`.
+
+**Why.** 0.9.x is the maintained stable line (0.9.25 released 2026-07-28);
+0.10 has published 35 alphas with breaking changes roughly weekly. The 0.9
+v2 storage traits give everything we need: a direct `RaftStateMachine::apply`
+(our synchronous effect hook), SQLite-backed `RaftLogStorage`, file-backed
+snapshot data (`tokio::fs::File`, built with `VACUUM INTO`, installed with
+the SQLite restore API), `get_read_log_id` for read barriers, and
+learner/joint-consensus membership changes. All of it is exercised by
+`crates/nest-raft/tests/cluster.rs`: forwarding with read-your-writes, leader
+failover and rejoin, minority refusal, snapshot catch-up of a wiped node,
+and exactly-once application of retried requests.
+
+**Consequences.** Everything openraft-specific lives in `nest-raft`; moving
+to 0.10 later is a one-crate change.
