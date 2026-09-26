@@ -1,0 +1,32 @@
+# systemd *system* unit for sparknestd, instance = cluster name.
+# Runs as the owning user with exactly one extra capability: CAP_SYS_ADMIN,
+# which the kernel requires to register FUSE passthrough backing files
+# (sealed files then read at native NVMe speed). Without it the daemon still
+# works and serves sealed files through the page cache.
+#
+# scripts/deploy-cluster.sh stages a rendered copy at
+# ~/.config/sparknest/sparknestd@<cluster>.service on every host. Install:
+#   sudo cp ~/.config/sparknest/sparknestd@trial.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sparknestd@trial
+[Unit]
+Description=sparknest node daemon (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+ExecStart=@BIN_DIR@/sparknestd --config @STATE_DIR@/node.toml
+ExecStopPost=-/usr/bin/fusermount3 -uz @MOUNT@
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=no
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+Environment=RUST_LOG=info,openraft=warn
+
+[Install]
+WantedBy=multi-user.target

@@ -15,5 +15,7 @@
 
 mod local;
 mod session;
+pub mod vfs;
 
 pub use local::{DataNode, ReconcileReport};
+pub use vfs::{OpenMode, Vfs, VfsConfig};

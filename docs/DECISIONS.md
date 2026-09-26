@@ -282,3 +282,29 @@ to 0.10 later is a one-crate change.
 4. **Caught-up gate.** A started node serves no object until it has passed
    a leader read barrier, so an invalidation committed while it was down is
    applied (fenced) before any read could use the stale copy.
+
+## ADR-014 — FUSE frontend shape and kernel realities (2026-09-26)
+
+1. **A FUSE-independent `Vfs`** (nest-data) holds all filesystem semantics;
+   `nest-fuse` only translates requests, dispatching each onto tokio and
+   replying from there. Cross-node behaviour is tested against `Vfs`
+   without mounts; kernel behaviour is tested with real mounts.
+2. **Kernel cache invalidation** comes from applied effects via a tap and
+   runs on a dedicated thread, never on the apply path or a request path
+   (`inval_entry` can wait on a directory lock an in-flight request holds).
+3. **Passthrough needs `CAP_SYS_ADMIN`** (measured on kernel 7.0: backing
+   registration fails with EPERM for an unprivileged daemon even though
+   `FUSE_PASSTHROUGH` negotiates). The daemon falls back to page-cache mode
+   automatically. Production runs the system unit `sparknestd@.service` as
+   the user with that single ambient capability.
+4. **flock release on close is asynchronous.** This kernel delivers the
+   flock unlock with the RELEASE request after `close()` returns, so another
+   descriptor may briefly still see the lock. Blocking lockers and polling
+   lockers (huggingface's filelock) are unaffected.
+5. **Ownership lingers 250 ms** after the last writer closes before the
+   generation is finalized, so close/reopen/append patterns do not churn
+   generations. Explicit time changes on an owned file are applied to the
+   working object so they survive finalize.
+6. **Not supported:** extended attributes (ENODATA/ENOTSUP), device nodes,
+   FIFOs and sockets (EPERM), chown (accepted and ignored; ADR-007),
+   ioctls (ENOTTY).

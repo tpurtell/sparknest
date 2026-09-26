@@ -31,6 +31,11 @@ pub fn fast_tuning() -> Tuning {
         snapshot_every: 100_000,
         propose_deadline: Duration::from_secs(5),
         connect_timeout: Duration::from_millis(300),
+        vfs: nest_data::VfsConfig {
+            finalize_linger: Duration::from_millis(50),
+            catch_up_wait: Duration::from_secs(5),
+        },
+        mount: false,
     }
 }
 
@@ -109,7 +114,10 @@ impl TestCluster {
                     .collect(),
             },
             fabric: FabricSection::default(),
-            fuse: FuseSection::default(),
+            fuse: FuseSection {
+                allow_other: false,
+                ttl_ms: 1000,
+            },
         }
     }
 
@@ -120,6 +128,18 @@ impl TestCluster {
             .unwrap();
         self.addrs.insert(id, node.rpc.local_addr());
         self.nodes.insert(id, node);
+    }
+
+    /// Mount node `id` at a fresh directory and return its path. Returns
+    /// `None` when FUSE is unavailable here (no /dev/fuse).
+    pub fn mount(&self, id: u64) -> Option<PathBuf> {
+        if !std::path::Path::new("/dev/fuse").exists() {
+            return None;
+        }
+        let mp = self.dir.path().join(format!("mnt{id}"));
+        std::fs::create_dir_all(&mp).unwrap();
+        self.nodes[&id].mount_at(&mp).unwrap();
+        Some(mp)
     }
 
     pub fn node(&self, id: u64) -> &Node {

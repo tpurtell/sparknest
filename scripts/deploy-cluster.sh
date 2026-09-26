@@ -66,6 +66,13 @@ CFG
   sed -e "s#@BIN_DIR@#${SPARKNEST_BIN_DIR/#\~/%h}#g" -e "s#@STATE_DIR@#$SPARKNEST_STATE_DIR#g" -e "s#@MOUNT@#$SPARKNEST_MOUNT#g" \
     packaging/systemd/sparknestd.service | ssh "$name" "cat > ~/.config/systemd/user/sparknestd-$SPARKNEST_CLUSTER.service"
   ssh "$name" "systemctl --user daemon-reload"
+  # Stage the system unit (passthrough needs CAP_SYS_ADMIN; see ENVIRONMENT.md).
+  home=$(ssh "$name" 'echo $HOME')
+  user=$(ssh "$name" 'id -un'); group=$(ssh "$name" 'id -gn')
+  sed -e "s#@BIN_DIR@#${SPARKNEST_BIN_DIR/#\~/$home}#g" -e "s#@STATE_DIR@#$SPARKNEST_STATE_DIR#g" \
+      -e "s#@MOUNT@#$SPARKNEST_MOUNT#g" -e "s#@USER@#$user#g" -e "s#@GROUP@#$group#g" \
+    packaging/systemd/sparknestd@.service \
+    | ssh "$name" "mkdir -p ~/.config/sparknest && cat > ~/.config/sparknest/sparknestd@$SPARKNEST_CLUSTER.service"
   if [ "$restart" = 1 ]; then
     ssh "$name" "systemctl --user restart sparknestd-$SPARKNEST_CLUSTER.service"
   fi

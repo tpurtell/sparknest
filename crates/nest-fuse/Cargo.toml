@@ -1,6 +1,6 @@
 [package]
 name = "nest-fuse"
-description = "FUSE frontend built on fuser"
+description = "FUSE frontend for sparknest built on fuser"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,11 @@ license.workspace = true
 
 [dependencies]
 nest-types.workspace = true
+nest-meta.workspace = true
+nest-data.workspace = true
 fuser.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+libc.workspace = true
+nix.workspace = true

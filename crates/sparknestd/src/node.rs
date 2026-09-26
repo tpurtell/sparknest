@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::Context;
-use nest_data::DataNode;
+use nest_data::{DataNode, Vfs, VfsConfig};
 use nest_raft::{MetaNode, MetaNodeConfig};
 use nest_rpc::{Rpc, RpcConfig};
 use nest_store::ObjectStore;
@@ -18,6 +18,9 @@ pub struct Tuning {
     pub snapshot_every: u64,
     pub propose_deadline: Duration,
     pub connect_timeout: Duration,
+    pub vfs: VfsConfig,
+    /// Mount the filesystem if the config names a mountpoint.
+    pub mount: bool,
 }
 
 impl Default for Tuning {
@@ -29,6 +32,8 @@ impl Default for Tuning {
             snapshot_every: 50_000,
             propose_deadline: Duration::from_secs(15),
             connect_timeout: Duration::from_secs(2),
+            vfs: VfsConfig::default(),
+            mount: true,
         }
     }
 }
@@ -39,6 +44,8 @@ pub struct Node {
     pub rpc: Rpc,
     pub meta: Arc<MetaNode>,
     pub data: Arc<DataNode>,
+    pub vfs: Arc<Vfs>,
+    mounted: parking_lot::Mutex<Option<nest_fuse::Mounted>>,
 }
 
 impl Node {
@@ -98,15 +105,48 @@ impl Node {
         }
         let report = data.attach(meta.clone()).await?;
         tracing::info!(?report, "local store reconciled");
-        Ok(Node {
+        let vfs = Vfs::new(data.clone(), tuning.vfs.clone());
+        let node = Node {
             cfg,
             rpc,
             meta,
             data,
-        })
+            vfs,
+            mounted: parking_lot::Mutex::new(None),
+        };
+        if tuning.mount
+            && let Some(mp) = node.cfg.node.mountpoint.clone()
+        {
+            node.mount_at(&mp)?;
+        }
+        Ok(node)
+    }
+
+    /// Mount the filesystem at `mountpoint` (replacing any current mount).
+    pub fn mount_at(&self, mountpoint: &std::path::Path) -> anyhow::Result<()> {
+        let m = nest_fuse::mount(
+            self.vfs.clone(),
+            &nest_fuse::MountConfig {
+                mountpoint: mountpoint.to_path_buf(),
+                allow_other: self.cfg.fuse.allow_other,
+                ttl: Duration::from_millis(self.cfg.fuse.ttl_ms),
+                threads: 4,
+            },
+        )
+        .with_context(|| format!("mounting at {}", mountpoint.display()))?;
+        tracing::info!(mountpoint = %mountpoint.display(), "mounted");
+        *self.mounted.lock() = Some(m);
+        Ok(())
+    }
+
+    pub fn unmount(&self) {
+        if let Some(m) = self.mounted.lock().take() {
+            m.unmount();
+        }
     }
 
     pub async fn shutdown(&self) {
+        self.unmount();
         self.data.shutdown();
         self.meta.shutdown().await;
         self.rpc.shutdown();

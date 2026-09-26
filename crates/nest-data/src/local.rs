@@ -24,6 +24,9 @@ enum ObjOp {
     },
 }
 
+/// An observer of applied effects.
+pub type EffectTap = Arc<dyn Fn(&Effect) + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct State {
     pub(crate) session: Option<SessionId>,
@@ -61,6 +64,11 @@ pub struct DataNode {
     pub(crate) st: Mutex<State>,
     ready_notify: Notify,
     pub(crate) release_notify: Notify,
+    /// Woken whenever locks are released anywhere in the cluster.
+    pub(crate) lock_notify: Notify,
+    /// Observers of applied effects (the FUSE frontend's cache
+    /// invalidation). Called on the apply path: must not block.
+    taps: Mutex<Vec<EffectTap>>,
     pub(crate) stopping: watch::Sender<bool>,
     deletions: AtomicU64,
     /// Set once this node has passed a leader read barrier after start:
@@ -103,6 +111,8 @@ impl DataNode {
             st: Mutex::new(State::default()),
             ready_notify: Notify::new(),
             release_notify: Notify::new(),
+            lock_notify: Notify::new(),
+            taps: Mutex::new(Vec::new()),
             stopping,
             deletions: AtomicU64::new(0),
             caught_up: std::sync::atomic::AtomicBool::new(false),
@@ -154,6 +164,18 @@ impl DataNode {
         live && self.store.exists(key)
     }
 
+    /// Wait (bounded) until the node has caught up with the cluster.
+    pub async fn wait_caught_up(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.caught_up() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
     /// Whether this node has confirmed its metadata is current since start.
     pub fn caught_up(&self) -> bool {
         self.caught_up.load(Ordering::SeqCst)
@@ -190,8 +212,12 @@ impl DataNode {
     fn on_event(&self, ev: &SmEvent) {
         match ev {
             SmEvent::Applied { effects, .. } => {
+                let taps = self.taps.lock().clone();
                 for e in effects {
                     self.on_effect(e);
+                    for t in &taps {
+                        t(e);
+                    }
                 }
             }
             SmEvent::Resync { .. } => {
@@ -267,6 +293,7 @@ impl DataNode {
                     }
                 }
             }
+            Effect::LocksReleased { .. } => self.lock_notify.notify_waiters(),
             Effect::FileDeleted { file } => {
                 let mut st = self.st.lock();
                 st.orphans_held.remove(file);
@@ -317,6 +344,12 @@ impl DataNode {
                 }
             }
         }
+    }
+
+    /// Observe every applied effect. The callback runs on the apply path and
+    /// must only enqueue work.
+    pub fn add_tap(&self, tap: EffectTap) {
+        self.taps.lock().push(tap);
     }
 
     /// A local handle to `file` was opened (FUSE open/create).

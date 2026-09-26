@@ -800,6 +800,7 @@ name = "nest-data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "nest-meta",
  "nest-raft",
  "nest-rpc",
@@ -824,7 +825,14 @@ name = "nest-fuse"
 version = "0.1.0"
 dependencies = [
  "fuser",
+ "libc",
+ "nest-data",
+ "nest-meta",
  "nest-types",
+ "nix",
+ "parking_lot",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -905,6 +913,7 @@ name = "nest-testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "nest-data",
  "nest-meta",
  "nest-raft",
@@ -1516,12 +1525,14 @@ dependencies = [
  "anyhow",
  "clap",
  "nest-data",
+ "nest-fuse",
  "nest-meta",
  "nest-raft",
  "nest-rpc",
  "nest-store",
  "nest-types",
  "openraft",
+ "parking_lot",
  "serde",
  "tokio",
  "toml",

@@ -97,6 +97,17 @@ sudo chown tj:tj /mnt/sparknest /mnt/sparknest-test /srv/sparknest /srv/sparknes
 sudo loginctl enable-linger tj
 ```
 
+For native-speed reads of sealed files (FUSE passthrough), the daemon needs
+`CAP_SYS_ADMIN`. Once the deploy script has staged the unit, on every node:
+
+```bash
+sudo cp ~/.config/sparknest/sparknestd@trial.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now sparknestd@trial
+```
+
+(Use this instead of the user unit; do not run both.) Without it everything
+works, and sealed files are served through the page cache instead.
+
 Optional later: raise switch ports to 200G for the benchmark pass; create
 `/mnt/models/sparknest` on the NAS share; reformat `/mnt/scratch` after drain.
 

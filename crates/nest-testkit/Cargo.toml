@@ -19,3 +19,6 @@ tempfile.workspace = true
 anyhow.workspace = true
 tracing-subscriber.workspace = true
 rusqlite.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
