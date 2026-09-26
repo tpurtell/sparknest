@@ -1,6 +1,6 @@
 [package]
 name = "nest-store"
-description = "Local object store, intents journal, staging, deletion, import/adopt"
+description = "Local object store: objects by (file id, generation), staging, deletion, adoption"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,10 @@ license.workspace = true
 
 [dependencies]
 nest-types.workspace = true
+nix.workspace = true
+libc.workspace = true
+rand.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
