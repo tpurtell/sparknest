@@ -829,8 +829,17 @@ async fn main() -> Result<()> {
                     .await?
             }
             BackupCmd::Meta { store } => {
-                c.post("/v1/backups/meta", json!({ "store": store }))
-                    .await?
+                let v = c
+                    .post("/v1/backups/meta", json!({ "store": store }))
+                    .await?;
+                if !cli.json {
+                    println!(
+                        "metadata snapshot {}",
+                        v["snapshot"].as_str().unwrap_or("?")
+                    );
+                    return Ok(());
+                }
+                v
             }
         },
         Cmd::Store { cmd } => match cmd {
@@ -976,11 +985,107 @@ async fn main() -> Result<()> {
             if *wait { wait_job(&c, id).await? } else { v }
         }
     };
-    if !cli.json && out["job"]["finished"].as_bool() == Some(true) {
-        // Progress was already shown on stderr; a failure would have bailed.
-        println!("done");
-        return Ok(());
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print_human(&out);
     }
-    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+fn job_line(j: &Value) -> String {
+    let state = if j["finished"].as_bool() != Some(true) {
+        "running".to_string()
+    } else if let Some(e) = j["error"].as_str() {
+        format!("failed: {e}")
+    } else {
+        "done".to_string()
+    };
+    let mut line = format!(
+        "{:>6}  {:<8} {}",
+        j["id"],
+        state,
+        j["what"].as_str().unwrap_or("")
+    );
+    for (h, p) in j["hosts"].as_object().into_iter().flatten() {
+        line += &format!(
+            "\n          {h}: {}/{} files, {}/{}",
+            p["done_files"],
+            p["total_files"],
+            human(p["done_bytes"].as_u64().unwrap_or(0)),
+            human(p["total_bytes"].as_u64().unwrap_or(0))
+        );
+        for f in p["failed"].as_array().into_iter().flatten() {
+            line += &format!("\n            not done: {}", f[1].as_str().unwrap_or(""));
+        }
+    }
+    line
+}
+
+/// Plain-text rendering for responses without a dedicated view.
+fn print_human(v: &Value) {
+    let obj = v.as_object();
+    let only = |k: &str| obj.is_some_and(|o| o.len() == 1 && o.contains_key(k));
+    // A job that was waited for: its progress already went to stderr.
+    if v["job"]["finished"].as_bool() == Some(true) {
+        println!("done");
+    } else if v["job"].is_object() {
+        println!("{}", job_line(&v["job"]));
+    } else if let Some(id) = v["job"].as_u64().filter(|_| only("job")) {
+        println!("started job {id}; follow it with: nest jobs {id} --wait");
+    } else if let Some(jobs) = v["jobs"].as_array().filter(|_| only("jobs")) {
+        if jobs.is_empty() {
+            println!("no jobs");
+        }
+        for j in jobs {
+            match j.as_u64() {
+                Some(id) => println!("started job {id}; follow it with: nest jobs {id} --wait"),
+                None => println!("{}", job_line(j)),
+            }
+        }
+    } else if let Some(hosts) = v["hosts"].as_array().filter(|_| only("hosts")) {
+        for h in hosts {
+            let refused = h["refused"].as_array().map(|a| a.len()).unwrap_or(0);
+            print!(
+                "{}: removed {}",
+                h["host"].as_str().unwrap_or("?"),
+                h["removed"]
+            );
+            if refused > 0 {
+                print!(", kept {refused}");
+            }
+            println!();
+            for r in h["refused"].as_array().into_iter().flatten() {
+                println!("  kept: {}", r[1].as_str().unwrap_or(""));
+            }
+        }
+    } else if let Some(o) = obj {
+        for (k, x) in o {
+            match x {
+                Value::String(s) => println!("{k}: {s}"),
+                Value::Array(a) if a.iter().all(|e| !e.is_object() && !e.is_array()) => {
+                    let items: Vec<String> = a
+                        .iter()
+                        .map(|e| {
+                            e.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| e.to_string())
+                        })
+                        .collect();
+                    println!(
+                        "{k}: {}",
+                        if items.is_empty() {
+                            "none".into()
+                        } else {
+                            items.join(", ")
+                        }
+                    );
+                }
+                Value::Array(_) | Value::Object(_) => println!("{k}: {x}"),
+                _ => println!("{k}: {x}"),
+            }
+        }
+    } else {
+        println!("{v}");
+    }
 }

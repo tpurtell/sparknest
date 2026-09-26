@@ -159,19 +159,20 @@ impl Node {
         let sock = cfg.api_socket();
         let web_addr = cfg.node.api_listen;
         let api_task = tokio::spawn(async move {
-            let unix = nest_api::serve_unix(api.clone(), sock);
-            let tcp = async {
-                match web_addr {
-                    Some(addr) => nest_api::serve_tcp(api, addr).await,
-                    None => std::future::pending().await,
+            let api_unix = api.clone();
+            let unix = async move {
+                if let Err(e) = nest_api::serve_unix(api_unix, sock.clone()).await {
+                    tracing::error!(error = %e, socket = %sock.display(), "management socket stopped");
                 }
             };
-            let (a, b) = tokio::join!(unix, tcp);
-            for r in [a, b] {
-                if let Err(e) = r {
-                    tracing::error!(error = %e, "management API stopped");
+            let tcp = async move {
+                if let Some(addr) = web_addr
+                    && let Err(e) = nest_api::serve_tcp(api, addr).await
+                {
+                    tracing::error!(error = %e, %addr, "web UI listener stopped");
                 }
-            }
+            };
+            tokio::join!(unix, tcp);
         });
         let node = Node {
             cfg,

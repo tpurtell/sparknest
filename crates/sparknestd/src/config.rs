@@ -121,6 +121,14 @@ impl Config {
         if self.node.id.0 == 0 {
             bail!("node.id must be non-zero");
         }
+        // sockaddr_un holds 108 bytes including the terminating NUL.
+        let sock = self.api_socket();
+        if sock.as_os_str().len() >= 108 {
+            bail!(
+                "node.state_dir is too long for the management socket {} (Unix socket paths are limited to 107 bytes)",
+                sock.display()
+            );
+        }
         Ok(())
     }
 
