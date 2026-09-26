@@ -1,0 +1,21 @@
+[package]
+name = "nest-rpc"
+description = "Authenticated, multiplexed request/response RPC between sparknest nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nest-types.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+serde.workspace = true
+postcard.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

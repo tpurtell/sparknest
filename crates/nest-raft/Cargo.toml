@@ -9,3 +9,16 @@ license.workspace = true
 [dependencies]
 nest-types.workspace = true
 nest-meta.workspace = true
+openraft.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -220,3 +220,20 @@ migration.
    refused.
 5. **Readdir offsets are per-entry cookies** assigned at insertion, so
    concurrent inserts and removals never skip or repeat entries.
+
+## ADR-012 — Control-plane RPC: small framed protocol instead of gRPC (2026-09-26)
+
+**Decision.** `nest-rpc`: one TCP connection per peer pair and direction,
+length-prefixed frames with request id and service number, many concurrent
+requests per connection, mutual HMAC-SHA256 challenge-response over the
+cluster secret at connect. Payloads are postcard-encoded serde types shared
+across crates. A reachability filter lets tests partition nodes. Supersedes
+the "tonic/gRPC for Raft" line in ADR-006; the management API stays HTTP.
+
+**Why.** tonic needs `protoc` on every build host and a second schema
+language for types that already derive serde. The traffic is modest
+(Raft, write forwarding, data-service control); bulk bytes go over
+`nest-fabric`.
+
+**Consequences.** No cross-language clients for the control plane, which is
+fine: the CLI and web use the HTTP management API.
