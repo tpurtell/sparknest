@@ -3,6 +3,18 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-26 — M6: archive stores on real storage
+
+- Archive stores hold replicas behind gateways, guarded by a marker file
+  (ADR-019): offload, reads through gateways, recall, invalidation.
+- Trial stores on raptor's `/mnt/scratch` (ntfs3, one gateway) and the NAS
+  share (SMB, seven gateways) both healthy; a 35 GiB model offloaded to
+  scratch, read from moa through raptor, and recalled to ostrich in 9 s.
+- Automatic rules (`--auto`) and `nest cluster` membership commands landed
+  (M5 leftovers).
+- Not yet: retained versioned backups and metadata snapshots to an archive.
+- Next: M7 web UI.
+
 ## 2026-09-26 — M5: placement, import and the CLI on the trial cluster
 
 - Directory seal policies (HF rename-from-incomplete, on-finalize); rules;
