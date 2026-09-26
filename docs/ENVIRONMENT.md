@@ -106,7 +106,21 @@ sudo systemctl daemon-reload && sudo systemctl enable --now sparknestd@trial
 ```
 
 (Use this instead of the user unit; do not run both.) Without it everything
-works, and sealed files are served through the page cache instead.
+works, and sealed files are served through the page cache instead. The
+system unit also raises the mount's kernel readahead from 128 KiB to 16 MiB,
+which cold reads of sealed files need.
+
+Other root-level performance levers, measured or suspected on the Sparks
+(record results in `benchmarks/` before adopting any):
+
+- **CPU idle states.** Spark cores idle in ACPI LPI states with 231–433 µs
+  exit latency (raptor: ≤100 µs). Every FUSE request wakes a thread, so
+  single-stream daemon-mediated I/O is latency-bound (~0.5 ms/request).
+  `sudo cpupower idle-set -D 100` (disable states slower than 100 µs) is the
+  obvious experiment; it costs idle power.
+- **FUSE over io_uring.** Compiled in on all kernels but disabled
+  (`/sys/module/fuse/parameters/enable_uring` = N). Not yet supported by
+  `fuser`; a later optimization.
 
 Optional later: raise switch ports to 200G for the benchmark pass; create
 `/mnt/models/sparknest` on the NAS share; reformat `/mnt/scratch` after drain.

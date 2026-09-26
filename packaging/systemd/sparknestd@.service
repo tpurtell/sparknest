@@ -18,6 +18,9 @@ Type=simple
 User=@USER@
 Group=@GROUP@
 ExecStart=@BIN_DIR@/sparknestd --config @STATE_DIR@/node.toml
+# Raise kernel readahead for the FUSE mount (default 128 KiB caps cold
+# reads of sealed files); '+' runs this one step with full privileges.
+ExecStartPost=+/bin/sh -c 'for i in $(seq 120); do d=$(mountpoint -d @MOUNT@ 2>/dev/null) && echo 16384 > /sys/class/bdi/$d/read_ahead_kb && exit 0; sleep 1; done; exit 0'
 ExecStopPost=-/usr/bin/fusermount3 -uz @MOUNT@
 AmbientCapabilities=CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_SYS_ADMIN
