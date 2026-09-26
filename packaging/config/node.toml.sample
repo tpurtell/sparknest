@@ -1,0 +1,33 @@
+# sparknest node configuration (trial cluster sample).
+# Copy to <state_dir>/node.toml and set [node] for the host.
+
+[node]
+id = 1
+name = "raptor"
+state_dir = "/srv/sparknest-test"
+mountpoint = "/mnt/sparknest-test"
+listen = "10.55.0.22:7410"
+api_listen = "10.55.0.22:7411"
+
+[cluster]
+name = "trial"
+secret_file = "/srv/sparknest-test/cluster.secret"
+# Bootstrap membership. Control traffic uses rail-0 addresses; the fabric
+# discovers both RoCE rails on its own.
+members = [
+  { id = 1, name = "raptor",  addr = "10.55.0.22:7410" },
+  { id = 2, name = "ostrich", addr = "10.55.0.1:7410" },
+  { id = 3, name = "dodo",    addr = "10.55.0.2:7410" },
+  { id = 4, name = "emu",     addr = "10.55.0.3:7410" },
+  { id = 5, name = "kiwi",    addr = "10.55.0.4:7410" },
+  { id = 6, name = "rhea",    addr = "10.55.0.5:7410" },
+  { id = 7, name = "moa",     addr = "10.55.0.6:7410" },
+]
+
+[fabric]
+mode = "auto"      # auto | rdma | tcp
+devices = []       # optional filter, e.g. ["mlx5_0"]
+
+[fuse]
+allow_other = true # needs user_allow_other in /etc/fuse.conf
+ttl_ms = 1000

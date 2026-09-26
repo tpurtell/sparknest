@@ -1,0 +1,23 @@
+# systemd *user* unit for sparknestd. Installed by scripts/deploy-cluster.sh as
+# ~/.config/systemd/user/sparknestd-<cluster>.service.
+# Requires: `loginctl enable-linger <user>` so it runs without a login session,
+# and `user_allow_other` in /etc/fuse.conf when fuse.allow_other = true.
+[Unit]
+Description=sparknest node daemon (%N)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@BIN_DIR@/sparknestd --config @STATE_DIR@/node.toml
+# Unmount if the daemon dies so the mountpoint does not hang callers.
+ExecStopPost=-/usr/bin/fusermount3 -uz @MOUNT@
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+# RDMA needs to pin registered memory.
+LimitMEMLOCK=infinity
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

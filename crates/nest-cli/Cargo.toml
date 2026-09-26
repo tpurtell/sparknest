@@ -1,0 +1,16 @@
+[package]
+name = "nest-cli"
+description = "sparknest command line tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nest"
+path = "src/main.rs"
+
+[dependencies]
+nest-types.workspace = true
+anyhow.workspace = true
+clap.workspace = true

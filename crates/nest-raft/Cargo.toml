@@ -1,0 +1,11 @@
+[package]
+name = "nest-raft"
+description = "openraft integration: SQLite log store, state machine, network, snapshots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nest-types.workspace = true
+nest-meta.workspace = true

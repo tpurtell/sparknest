@@ -1,0 +1,10 @@
+[package]
+name = "nest-fabric"
+description = "Transport trait with RDMA (libibverbs) and TCP implementations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nest-types.workspace = true

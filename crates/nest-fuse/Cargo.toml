@@ -1,0 +1,10 @@
+[package]
+name = "nest-fuse"
+description = "FUSE frontend built on fuser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nest-types.workspace = true
