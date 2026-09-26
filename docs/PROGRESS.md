@@ -3,6 +3,22 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-26 — M5: placement, import and the CLI on the trial cluster
+
+- Directory seal policies (HF rename-from-incomplete, on-finalize); rules;
+  selectors and manifests (path trees following symlinks; `hf:org/name@rev`);
+  target-pulled whole-file replication over RDMA; eviction with last-copy
+  protection; hard-link import; management API on a Unix socket; `nest`
+  CLI (ADR-017).
+- On-disk format versioning after a trial upgrade crash (ADR-018).
+- Real model (`benchmarks/M5-REAL-MODEL.md`): 35 GiB imported in ~1 s,
+  replicated at 4.2 GB/s (93% of rdmasync), loaded at 9.6 GB/s cold and
+  85 GB/s warm on a node with a copy, 5 GB/s cold from a node without one.
+- Still open in M5: automatic reconcile on finalize, `nest cluster`
+  membership commands.
+- Next: M6 stores/backup/archive, M7 web UI, then the M4 root-level tuning
+  pass once the system unit is installed.
+
 ## 2026-09-26 — M4 in progress: RDMA fabric live on the trial cluster
 
 - `nest-fabric`: C shim over libibverbs, rail discovery, pull protocol with
