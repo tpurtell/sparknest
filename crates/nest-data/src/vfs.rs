@@ -1929,6 +1929,24 @@ impl Vfs {
         self.evict_from(file, self.me().live_store()).await
     }
 
+    /// Remove `store`'s copy of exactly `generation` (a plan step): fails
+    /// with `NotFound` if the file moved on since it was planned.
+    pub async fn evict_generation(
+        &self,
+        file: FileId,
+        generation: Generation,
+        store: nest_types::StoreId,
+    ) -> NestResult<()> {
+        self.propose(Command::RetireReplica {
+            file,
+            generation,
+            store,
+            allow_last: false,
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// Remove `store`'s copy of `file` (refused for the last live copy).
     pub async fn evict_from(&self, file: FileId, store: nest_types::StoreId) -> NestResult<bool> {
         let a = self.raw_attr(file)?;

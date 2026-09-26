@@ -76,6 +76,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RuleCmd,
     },
+    /// Plan (and apply) reaching free-space targets:
+    /// nest plan --free raptor=800GiB --free @sparks=400GiB
+    Plan {
+        #[command(subcommand)]
+        cmd: Option<PlanCmd>,
+        /// HOST_OR_@GROUP=SIZE (repeatable)
+        #[arg(long)]
+        free: Vec<String>,
+    },
+    /// Host groups (@name).
+    Group {
+        #[command(subcommand)]
+        cmd: GroupCmd,
+    },
     /// Retained backups and metadata snapshots.
     Backup {
         #[command(subcommand)]
@@ -127,6 +141,49 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum PlanCmd {
+    /// Execute a proposed plan.
+    Apply {
+        id: u64,
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupCmd {
+    /// Define a host group, used as @name wherever hosts are accepted.
+    Set {
+        name: String,
+        #[arg(value_delimiter = ',', required = true)]
+        members: Vec<String>,
+    },
+    Ls,
+    Rm {
+        name: String,
+    },
+}
+
+/// Parse "500GiB", "1.5T", "200G", "1048576".
+fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: f64 = num.parse().with_context(|| format!("bad size {s:?}"))?;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => bail!("unknown size unit {other:?}"),
+    };
+    Ok((n * mult) as u64)
 }
 
 #[derive(Subcommand, Debug)]
@@ -599,6 +656,106 @@ async fn main() -> Result<()> {
             }
             RuleCmd::Rm { name } => {
                 c.call(Method::DELETE, &format!("/v1/rules/{}", enc(name)), None)
+                    .await?
+            }
+        },
+        Cmd::Plan {
+            cmd: Some(PlanCmd::Apply { id, wait }),
+            ..
+        } => {
+            let v = c.post(&format!("/v1/plans/{id}/apply"), json!({})).await?;
+            let jid = v["job"].as_u64().unwrap_or(0);
+            if *wait { wait_job(&c, jid).await? } else { v }
+        }
+        Cmd::Plan { cmd: None, free } => {
+            if free.is_empty() {
+                bail!("give at least one --free HOST=SIZE");
+            }
+            let mut pairs = Vec::new();
+            for f in free {
+                let (h, sz) = f
+                    .split_once('=')
+                    .with_context(|| format!("expected HOST=SIZE, got {f:?}"))?;
+                pairs.push(json!([h, parse_size(sz)?]));
+            }
+            let v = c.post("/v1/plans", json!({ "free": pairs })).await?;
+            if !cli.json {
+                println!(
+                    "plan {}{}",
+                    v["id"],
+                    if v["feasible"].as_bool() == Some(true) {
+                        ""
+                    } else {
+                        "  (does not fully reach the targets)"
+                    }
+                );
+                for h in v["hosts"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {:<9} free {} -> {} (target {})",
+                        h["host"].as_str().unwrap_or(""),
+                        human(h["free_now"].as_u64().unwrap_or(0)),
+                        human(h["projected_free"].as_u64().unwrap_or(0)),
+                        human(h["target"].as_u64().unwrap_or(0))
+                    );
+                }
+                for st in v["steps"].as_array().into_iter().flatten() {
+                    let n = st["copies"].as_array().map(|a| a.len()).unwrap_or(0);
+                    match st["kind"].as_str() {
+                        Some("evict") => println!(
+                            "  evict {n} redundant copies ({}) from {}",
+                            human(st["bytes"].as_u64().unwrap_or(0)),
+                            st["host"].as_str().unwrap_or("")
+                        ),
+                        _ => println!(
+                            "  offload {n} files ({}) from {} to {}",
+                            human(st["bytes"].as_u64().unwrap_or(0)),
+                            st["host"].as_str().unwrap_or(""),
+                            st["store"].as_str().unwrap_or("")
+                        ),
+                    }
+                }
+                for b in v["blocked"].as_array().into_iter().flatten() {
+                    println!("  blocked: {}", b.as_str().unwrap_or(""));
+                }
+                if v["steps"].as_array().is_some_and(|s| !s.is_empty()) {
+                    println!("apply with: nest plan apply {}", v["id"]);
+                }
+                return Ok(());
+            }
+            v
+        }
+        Cmd::Group { cmd } => match cmd {
+            GroupCmd::Set { name, members } => {
+                c.call(
+                    Method::PUT,
+                    &format!("/v1/groups/{}", enc(name)),
+                    Some(json!({ "members": members })),
+                )
+                .await?
+            }
+            GroupCmd::Ls => {
+                let v = c.get("/v1/groups").await?;
+                if !cli.json {
+                    for g in v["groups"].as_array().into_iter().flatten() {
+                        println!(
+                            "@{:<12} {}",
+                            g["name"].as_str().unwrap_or(""),
+                            g["members"]
+                                .as_array()
+                                .map(|a| a
+                                    .iter()
+                                    .filter_map(|x| x.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(","))
+                                .unwrap_or_default()
+                        );
+                    }
+                    return Ok(());
+                }
+                v
+            }
+            GroupCmd::Rm { name } => {
+                c.call(Method::DELETE, &format!("/v1/groups/{}", enc(name)), None)
                     .await?
             }
         },

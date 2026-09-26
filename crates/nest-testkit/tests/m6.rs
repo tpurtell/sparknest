@@ -310,3 +310,121 @@ async fn backups_survive_edits_restore_and_export_offline() {
         std::path::PathBuf::from("../blobs/abc123")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
+    let c = ready(3).await;
+    let p = &c.node(1).placer;
+    let nas = c.state_dir(2).join("nas-plan");
+    std::fs::create_dir_all(&nas).unwrap();
+    p.add_store("nas", nas.to_str().unwrap(), &["n2".into()])
+        .await
+        .unwrap();
+    p.set_group("both", vec!["n1".into(), "n2".into()])
+        .await
+        .unwrap();
+
+    let v1 = &c.node(1).vfs;
+    let size = 32u64 << 20;
+    let mk = |name: &'static [u8]| {
+        let v1 = v1.clone();
+        async move {
+            let (a, fh, _) = v1
+                .create(FileId::ROOT, name, 0o644, oflags::WRONLY)
+                .await
+                .unwrap();
+            v1.write(fh, 0, vec![1u8; size as usize]).await.unwrap();
+            v1.release(fh, None).await;
+            a.id
+        }
+    };
+    let redundant = mk(b"redundant").await;
+    let only = mk(b"only").await;
+    let pinned = mk(b"pinned").await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        [redundant, only, pinned].iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    // `redundant` also lives on n2; `pinned` is required on n1 by a rule.
+    let j = p
+        .replicate(
+            Selector::parse("/redundant", "/hub").unwrap(),
+            vec!["n2".into()],
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(wait_job(&c, j).await.error.is_none());
+    p.set_rule(
+        "pin",
+        &nest_place::RuleSpec {
+            selector: Selector::parse("/pinned", "/hub").unwrap(),
+            hosts: vec!["@both".into()],
+            auto: false,
+        },
+    )
+    .await
+    .unwrap();
+    c.converge().await;
+
+    let free_now = p
+        .status()
+        .await
+        .unwrap()
+        .iter()
+        .find(|s| s.name == "n1")
+        .unwrap()
+        .info
+        .as_ref()
+        .unwrap()
+        .free_bytes;
+    let plan = p
+        .plan(&[("n1".into(), free_now + 2 * size - (1 << 20))])
+        .await
+        .unwrap();
+    assert!(plan.feasible, "{plan:?}");
+    let kinds: Vec<(&str, Vec<FileId>)> = plan
+        .steps
+        .iter()
+        .map(|s| match s {
+            nest_place::plan::Step::Evict { copies, .. } => {
+                ("evict", copies.iter().map(|c| c.file).collect())
+            }
+            nest_place::plan::Step::Offload { copies, .. } => {
+                ("offload", copies.iter().map(|c| c.file).collect())
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![("evict", vec![redundant]), ("offload", vec![only])],
+        "{plan:?}"
+    );
+
+    let j = p.apply_plan(plan.id).await.unwrap();
+    let job = wait_job(&c, j).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    let nas_id = p.archive_stores().unwrap()[0].0.0;
+    assert_eq!(stores_of(&c, redundant), vec![2]);
+    assert_eq!(stores_of(&c, only), vec![nas_id]);
+    assert!(
+        stores_of(&c, pinned).contains(&1),
+        "rule-required copy kept"
+    );
+
+    // A target that only removing the pinned file could meet is reported.
+    let plan = p
+        .plan(&[("n1".into(), free_now + 100 * size)])
+        .await
+        .unwrap();
+    assert!(!plan.feasible);
+    assert!(
+        plan.blocked[0].contains("rule \"pin\""),
+        "{:?}",
+        plan.blocked
+    );
+}

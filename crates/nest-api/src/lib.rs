@@ -133,6 +133,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/import", post(import))
         .route("/v1/stores", get(stores).post(add_store))
         .route("/v1/offload", post(offload))
+        .route("/v1/plans", post(make_plan))
+        .route("/v1/plans/{id}/apply", post(apply_plan))
+        .route("/v1/groups", get(groups))
+        .route("/v1/groups/{name}", put(set_group).delete(delete_group))
         .route("/v1/backups", get(backups).post(backup_create))
         .route("/v1/backups/{id}/restore", post(backup_restore))
         .route("/v1/backups/{id}", axum::routing::delete(backup_delete))
@@ -695,4 +699,49 @@ async fn meta_snapshot(State(api): State<Api>, Json(r): Json<MetaReq>) -> R<serd
     Ok(Json(
         json!({ "snapshot": api.placer.meta_snapshot(&r.store).await? }),
     ))
+}
+
+#[derive(Deserialize)]
+struct PlanReq {
+    /// (host or @group, desired free bytes)
+    free: Vec<(String, u64)>,
+}
+
+async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_json::Value> {
+    Ok(Json(
+        serde_json::to_value(api.placer.plan(&r.free).await?).unwrap_or_default(),
+    ))
+}
+
+async fn apply_plan(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json::Value> {
+    Ok(Json(json!({ "job": api.placer.apply_plan(id).await? })))
+}
+
+async fn groups(State(api): State<Api>) -> R<serde_json::Value> {
+    let g: Vec<_> = api
+        .placer
+        .groups()?
+        .into_iter()
+        .map(|(n, m)| json!({ "name": n, "members": m }))
+        .collect();
+    Ok(Json(json!({ "groups": g })))
+}
+
+#[derive(Deserialize)]
+struct GroupReq {
+    members: Vec<String>,
+}
+
+async fn set_group(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Json(r): Json<GroupReq>,
+) -> R<serde_json::Value> {
+    api.placer.set_group(&name, r.members).await?;
+    Ok(Json(json!({ "group": name })))
+}
+
+async fn delete_group(State(api): State<Api>, Path(name): Path<String>) -> R<serde_json::Value> {
+    api.placer.delete_group(&name).await?;
+    Ok(Json(json!({ "deleted": name })))
 }

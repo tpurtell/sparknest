@@ -99,6 +99,11 @@ pub(crate) enum AdminReq {
     MetaSnapshot {
         store: StoreId,
     },
+    /// Evict exact generations (plan steps); moved files are refused.
+    EvictExact {
+        files: Vec<(FileId, nest_types::Generation)>,
+        store: StoreId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -315,6 +320,17 @@ impl Handler for AdminService {
                     None => AdminResp::Err(format!("no job {job}")),
                 },
                 AdminReq::Evict { files, store } => a.evict(files, store).await,
+                AdminReq::EvictExact { files, store } => {
+                    let mut removed = 0;
+                    let mut refused = Vec::new();
+                    for (f, g) in files {
+                        match a.vfs.evict_generation(f, g, store).await {
+                            Ok(()) => removed += 1,
+                            Err(e) => refused.push((f, e.to_string())),
+                        }
+                    }
+                    AdminResp::Evicted { removed, refused }
+                }
                 AdminReq::BackupCreate {
                     job,
                     name,

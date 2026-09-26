@@ -237,6 +237,19 @@ fn format_is_pinned() {
             "RecordBackup",
         ),
         (Command::DeleteBackup { id: 0 }, "DeleteBackup"),
+        (
+            Command::SetGroup {
+                name: String::new(),
+                members: vec![],
+            },
+            "SetGroup",
+        ),
+        (
+            Command::DeleteGroup {
+                name: String::new(),
+            },
+            "DeleteGroup",
+        ),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");

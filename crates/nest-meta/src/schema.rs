@@ -5,12 +5,13 @@ use std::path::Path;
 
 /// Bumped whenever the schema changes. Snapshots carry the version so a node
 /// never installs a snapshot it cannot read.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Migrations from version N to N+1, applied in order at open.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        r#"
 -- Retained, versioned backups of selections (ADR-021). The manifest and
 -- objects live in the archive store; this row is the catalog entry.
 CREATE TABLE IF NOT EXISTS backups (
@@ -23,7 +24,18 @@ CREATE TABLE IF NOT EXISTS backups (
     bytes    INTEGER NOT NULL
 );
 "#,
-)];
+    ),
+    (
+        2,
+        r#"
+-- Named host groups ("@sparks"): members is a JSON array of host names.
+CREATE TABLE IF NOT EXISTS groups (
+    name    TEXT PRIMARY KEY,
+    members TEXT NOT NULL
+) WITHOUT ROWID;
+"#,
+    ),
+];
 
 const SCHEMA: &str = r#"
 CREATE TABLE files (

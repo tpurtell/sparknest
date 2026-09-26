@@ -3,6 +3,20 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-27 — Backups, web UI, groups and free-space plans
+
+- M6 finished: versioned backups and restore into archive stores, periodic
+  metadata snapshots, and `sparknestd export` for offline recovery
+  (ADR-021).
+- M7: every daemon serves the web UI and the JSON API (ADR-020); views for
+  nodes, models, files, rules and jobs.
+- Host groups (`nest group set sparks ostrich,dodo,...`, then `@sparks`
+  anywhere a host list is taken) and free-space plans
+  (`nest plan --free raptor=800GiB`, `nest plan apply ID`), ADR-022.
+- Next: M8 hardening and soak, release packaging for GitHub and the
+  `local-ai-tap` formula, migration playbook; the M4 root-level tuning pass
+  and the 200G benchmark need the user.
+
 ## 2026-09-26 — M6: archive stores on real storage
 
 - Archive stores hold replicas behind gateways, guarded by a marker file

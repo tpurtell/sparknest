@@ -78,6 +78,7 @@ pub struct Placer {
     admin: Arc<admin::Admin>,
     jobs: Mutex<HashMap<u64, Arc<Mutex<ClusterJob>>>>,
     imports: Mutex<HashMap<u64, Arc<Mutex<crate::import::ImportProgress>>>>,
+    plans: Mutex<HashMap<u64, crate::plan::Plan>>,
     next_job: AtomicU64,
     dirty: Arc<tokio::sync::Notify>,
 }
@@ -155,6 +156,7 @@ impl Placer {
             admin,
             jobs: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
+            plans: Mutex::new(HashMap::new()),
             next_job: AtomicU64::new(rand::random::<u32>() as u64),
             dirty: Arc::new(tokio::sync::Notify::new()),
         });
@@ -193,6 +195,10 @@ impl Placer {
             }
         });
         p
+    }
+
+    pub fn vfs(&self) -> &Arc<Vfs> {
+        &self.vfs
     }
 
     fn rpc(&self) -> &nest_rpc::Rpc {
@@ -236,10 +242,28 @@ impl Placer {
         Ok(out)
     }
 
+    /// Expand "@all" and "@group" names (groups may name hosts or stores).
+    pub fn expand_names(&self, names: &[String]) -> NestResult<Vec<String>> {
+        let groups = query::groups(&self.conn()?).map_err(sql)?;
+        let mut out = Vec::new();
+        for n in names {
+            match n.strip_prefix('@') {
+                Some("all") => out.push(n.clone()),
+                Some(g) => match groups.iter().find(|(name, _)| name == g) {
+                    Some((_, members)) => out.extend(members.iter().cloned()),
+                    None => return Err(NestError::Invalid(format!("unknown group {n:?}"))),
+                },
+                None => out.push(n.clone()),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn resolve_hosts(&self, hosts: &[String]) -> NestResult<Vec<HostRef>> {
+        let hosts = self.expand_names(hosts)?;
         let all = self.nodes()?;
         let mut out: Vec<HostRef> = Vec::new();
-        for h in hosts {
+        for h in &hosts {
             if h == "@all" {
                 out.extend(all.iter().cloned());
                 continue;
@@ -255,6 +279,32 @@ impl Placer {
         out.sort_by_key(|h| h.node);
         out.dedup_by_key(|h| h.node);
         Ok(out)
+    }
+
+    pub fn groups(&self) -> NestResult<Vec<(String, Vec<String>)>> {
+        query::groups(&self.conn()?).map_err(sql)
+    }
+
+    pub async fn set_group(&self, name: &str, members: Vec<String>) -> NestResult<()> {
+        self.validate_targets(&members)?;
+        self.vfs
+            .data()
+            .meta()
+            .propose(Command::SetGroup {
+                name: name.into(),
+                members,
+            })
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn delete_group(&self, name: &str) -> NestResult<()> {
+        self.vfs
+            .data()
+            .meta()
+            .propose(Command::DeleteGroup { name: name.into() })
+            .await
+            .map(|_| ())
     }
 
     /// Archive stores: (id, name, config).
@@ -273,6 +323,7 @@ impl Placer {
 
     /// Check that every name is a node, "@all", or an archive store.
     pub fn validate_targets(&self, names: &[String]) -> NestResult<()> {
+        let names = &self.expand_names(names)?;
         let nodes = self.nodes()?;
         let stores = self.archive_stores()?;
         for n in names {
@@ -291,6 +342,7 @@ impl Placer {
     /// Resolve names to targets. Archive stores are worked by their first
     /// gateway that reports the store healthy.
     pub async fn resolve_targets(&self, names: &[String]) -> NestResult<Vec<Target>> {
+        let names = &self.expand_names(names)?;
         self.validate_targets(names)?;
         let stores = self.archive_stores()?;
         let node_names: Vec<String> = names
@@ -504,6 +556,7 @@ impl Placer {
             );
             t
         } else {
+            let hosts = &self.expand_names(hosts)?;
             self.validate_targets(hosts)?;
             let stores = self.archive_stores()?;
             let mut t: Vec<Target> = self
@@ -795,6 +848,96 @@ impl Placer {
             .await?;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------ plans
+
+    /// Propose a plan to reach `free` bytes free on each named host/@group.
+    pub async fn plan(&self, free: &[(String, u64)]) -> NestResult<crate::plan::Plan> {
+        let p = crate::plan::make(self, free).await?;
+        self.plans.lock().insert(p.id, p.clone());
+        Ok(p)
+    }
+
+    /// Execute a proposed plan: offloads (copy into the archive, then evict
+    /// exactly the planned generations) and evictions.
+    pub async fn apply_plan(self: &Arc<Self>, id: u64) -> NestResult<u64> {
+        let plan = self
+            .plans
+            .lock()
+            .get(&id)
+            .cloned()
+            .ok_or(NestError::NotFound)?;
+        let jid = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let job = Arc::new(Mutex::new(ClusterJob {
+            id: jid,
+            what: format!("apply plan {id}"),
+            ..Default::default()
+        }));
+        self.jobs.lock().insert(jid, job.clone());
+        let me = self.clone();
+        tokio::spawn(async move {
+            let r: NestResult<()> = async {
+                for step in &plan.steps {
+                    let (host, node, copies, store) = match step {
+                        crate::plan::Step::Evict {
+                            host, node, copies, ..
+                        } => (host, *node, copies, None),
+                        crate::plan::Step::Offload {
+                            host,
+                            node,
+                            copies,
+                            store,
+                            ..
+                        } => (host, *node, copies, Some(store)),
+                    };
+                    if let Some(store) = store {
+                        let targets = me.resolve_targets(std::slice::from_ref(store)).await?;
+                        let m = Manifest {
+                            entries: copies
+                                .iter()
+                                .map(|c| crate::selector::Entry {
+                                    file: c.file,
+                                    generation: c.generation,
+                                    size: c.size,
+                                    stable: true,
+                                    path: c.path.clone(),
+                                })
+                                .collect(),
+                            dangling: vec![],
+                        };
+                        me.run_replicate(&job, m, targets, 8).await?;
+                    }
+                    let files = copies.iter().map(|c| (c.file, c.generation)).collect();
+                    match admin::call(
+                        me.rpc(),
+                        node,
+                        &AdminReq::EvictExact {
+                            files,
+                            store: node.live_store(),
+                        },
+                        Duration::from_secs(600),
+                    )
+                    .await?
+                    {
+                        AdminResp::Evicted { removed, refused } => {
+                            let mut j = job.lock();
+                            let p = j.hosts.entry(host.clone()).or_default();
+                            p.done_files += removed;
+                            p.total_files += copies.len() as u64;
+                            p.failed.extend(refused);
+                        }
+                        other => return Err(NestError::Io(format!("unexpected {other:?}"))),
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            let mut j = job.lock();
+            j.finished = true;
+            j.error = r.err().map(|e| e.to_string());
+        });
+        Ok(jid)
     }
 
     // ------------------------------------------------------------ backups

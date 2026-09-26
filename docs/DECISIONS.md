@@ -478,3 +478,23 @@ Rules (create, apply, delete), Jobs (live progress).
    --out DIR [--path P] [--link]` rebuilds any subtree as a plain directory
    tree from a snapshot and any object directories (live stores, archive
    roots, backup areas), with no cluster running.
+
+## ADR-022 — Host groups and free-space plans (2026-09-27)
+
+1. **Groups** are named host sets kept in replicated metadata (`groups`
+   table, schema v3). Anywhere a host list is accepted (rules, replicate,
+   plans) `@name` expands to the group's members, resolved when used, so
+   editing a group re-targets every rule that names it on the next
+   reconcile.
+2. **A plan** is computed, shown and then applied; nothing moves while
+   planning. Input is a desired free-space floor per host (or per group
+   member). For each host short of its floor the planner, largest copies
+   first:
+   - evicts copies that exist elsewhere and that no rule requires here;
+   - then offloads sole copies to the healthiest archive store with room
+     (copy there, then evict here);
+   - never removes a last copy or a rule-required copy. A shortfall that
+     only those could cover is reported as blocked, naming the rules.
+3. **Apply** re-checks nothing it doesn't have to: evictions name exact
+   generations, so a file rewritten since planning keeps its new copy.
+   Plans are held in memory on the node that made them and expire with it.

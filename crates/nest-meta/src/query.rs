@@ -443,3 +443,19 @@ pub fn backups(c: &Connection) -> rusqlite::Result<Vec<BackupRow>> {
     })?;
     rows.collect()
 }
+
+/// Host groups: name -> member host names.
+pub fn groups(c: &Connection) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
+    let mut st = c.prepare_cached("SELECT name, members FROM groups ORDER BY name")?;
+    let rows = st.query_map([], |r| {
+        let members: String = r.get(1)?;
+        let list = members
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .split(',')
+            .map(|m| m.trim().trim_matches('"').to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
+        Ok((r.get(0)?, list))
+    })?;
+    rows.collect()
+}

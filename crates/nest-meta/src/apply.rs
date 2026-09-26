@@ -254,6 +254,33 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
                 )?;
             Ok(Reply::Backup(id as u64))
         }
+        Command::SetGroup { name, members } => {
+            if name.is_empty() || name.contains(',') || name.starts_with('@') {
+                return err(NestError::Invalid(
+                    "group names are plain words (used as @name)".into(),
+                ));
+            }
+            let json = format!(
+                "[{}]",
+                members
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            c.prepare_cached("INSERT OR REPLACE INTO groups (name, members) VALUES (?1, ?2)")?
+                .execute(params![name, json])?;
+            Ok(Reply::Done)
+        }
+        Command::DeleteGroup { name } => {
+            let n = c
+                .prepare_cached("DELETE FROM groups WHERE name = ?1")?
+                .execute(params![name])?;
+            if n == 0 {
+                return err(NestError::NotFound);
+            }
+            Ok(Reply::Done)
+        }
         Command::DeleteBackup { id } => {
             let n = c
                 .prepare_cached("DELETE FROM backups WHERE id = ?1")?

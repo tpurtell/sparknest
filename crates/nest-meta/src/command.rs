@@ -230,6 +230,14 @@ pub enum Command {
     DeleteBackup {
         id: u64,
     },
+    /// Define (or redefine) a host group; `members` are host names.
+    SetGroup {
+        name: String,
+        members: Vec<String>,
+    },
+    DeleteGroup {
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
