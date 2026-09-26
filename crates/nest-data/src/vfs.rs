@@ -1061,6 +1061,34 @@ impl Vfs {
         }
     }
 
+    /// Where this node reads `a` for itself: its live store, or a local
+    /// archive copy only when no other node holds a live one. A live copy
+    /// over the fabric (5–15 GB/s) beats an archive disk (a SATA SSD or a
+    /// NAS share); the archive stays the fallback when those holders fail.
+    fn own_read_source(&self, a: &FileAttr) -> Option<Arc<nest_store::ObjectStore>> {
+        let src = self.local_source(a)?;
+        if Arc::ptr_eq(&src, self.d.store()) || !self.live_elsewhere(a) {
+            Some(src)
+        } else {
+            None
+        }
+    }
+
+    /// Whether another node holds a live (non-archive) copy of `a`'s generation.
+    fn live_elsewhere(&self, a: &FileAttr) -> bool {
+        let me = self.me();
+        self.q(|c| query::replicas(c, a.id))
+            .map(|rs| {
+                rs.iter().any(|r| {
+                    r.generation == a.generation
+                        && r.state == nest_types::ReplicaState::Live
+                        && !crate::is_archive(r.store)
+                        && NodeId(r.store.0) != me
+                })
+            })
+            .unwrap_or(false)
+    }
+
     fn servable_object(&self, file: FileId, generation: Generation) -> NestResult<std::fs::File> {
         let a = self.raw_attr(file)?;
         if a.generation != generation {
@@ -1280,7 +1308,7 @@ impl Vfs {
             }
             let a = self.raw_attr(h.file)?;
             let key = ObjectKey::new(h.file, a.generation);
-            if let Some(src) = self.local_source(&a) {
+            if let Some(src) = self.own_read_source(&a) {
                 let _t = self.track(h.file);
                 let f = {
                     let mut r = h.reader.lock();
@@ -1379,6 +1407,15 @@ impl Vfs {
                     Err(e) => last = e,
                 }
             }
+            // Every live holder failed: a local archive copy still serves.
+            if !matches!(last, NestError::Stale)
+                && let Some(src) = self.local_source(&a)
+            {
+                let f = src.open_read(key).map_err(io)?;
+                return tokio::task::spawn_blocking(move || pread(&f, offset, size))
+                    .await
+                    .expect("blocking task");
+            }
         }
         Err(last)
     }
@@ -1449,7 +1486,7 @@ impl Vfs {
         let h = self.handle(fh).ok()?;
         let a = self.raw_attr(h.file).ok()?;
         let key = ObjectKey::new(h.file, a.generation);
-        if let Some(src) = self.local_source(&a) {
+        if let Some(src) = self.own_read_source(&a) {
             let _t = self.track(h.file);
             let f = {
                 let mut r = h.reader.lock();
@@ -1853,12 +1890,17 @@ impl Vfs {
         dest.reserve_room(a.size).map_err(io)?;
         let holders = self.holders(a)?;
         let mut sources: Vec<Option<NodeId>> = Vec::new();
-        if let Some(local) = self.local_source(a)
-            && !Arc::ptr_eq(&local, dest)
-        {
+        let local = self.local_source(a).filter(|l| !Arc::ptr_eq(l, dest));
+        // A local live copy goes first; a local archive copy only after the
+        // live holders (see `own_read_source`).
+        let local_first = self.own_read_source(a).is_some();
+        if local.is_some() && local_first {
             sources.push(None);
         }
         sources.extend(holders.into_iter().map(Some));
+        if local.is_some() && !local_first {
+            sources.push(None);
+        }
         if sources.is_empty() {
             return Err(NestError::Unavailable("no live copy to copy from".into()));
         }

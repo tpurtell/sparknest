@@ -492,3 +492,71 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
     st.sort();
     assert_eq!(st, vec![1, 2]);
 }
+
+/// A gateway reading for itself prefers a live copy on another node over
+/// its local archive copy (fabric beats an archive disk), and falls back to
+/// the archive when no live holder answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn gateway_prefers_live_copies_over_its_archive() {
+    let mut c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    let scratch = c.state_dir(1).join("scratch-disk");
+    std::fs::create_dir_all(&scratch).unwrap();
+    p.add_store("scratch", scratch.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    let v2 = c.node(2).vfs.clone();
+    let (a, fh, _) = v2
+        .create(FileId::ROOT, b"m.bin", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    v2.write(fh, 0, vec![9u8; 1 << 20]).await.unwrap();
+    v2.release(fh, None).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        c.attr(1, a.id)
+            .is_some_and(|x| x.gen_state == GenState::Stable)
+    })
+    .await;
+    let sel = Selector::parse("/m.bin", "/hub").unwrap();
+    let j = p.replicate(sel, vec!["scratch".into()], 2).await.unwrap();
+    assert!(wait_job(&c, j).await.error.is_none());
+    c.converge().await;
+
+    // Make the archive copy distinguishable: same size, different bytes.
+    let name = format!("{:016x}.{:x}", a.id.0, a.generation.0);
+    let obj = walk(&scratch)
+        .into_iter()
+        .find(|p| p.file_name().unwrap() == name.as_str())
+        .unwrap();
+    std::fs::write(&obj, vec![7u8; 1 << 20]).unwrap();
+
+    let read_on_n1 = |c: &TestCluster| {
+        let v1 = c.node(1).vfs.clone();
+        async move {
+            let (h, _) = v1.open(a.id, 0).await.unwrap();
+            let b = v1.read(h, 0, 4096).await.unwrap();
+            v1.release(h, None).await;
+            b[0]
+        }
+    };
+    assert_eq!(read_on_n1(&c).await, 9, "the live copy on n2 is preferred");
+    c.stop(2).await;
+    assert_eq!(
+        read_on_n1(&c).await,
+        7,
+        "the archive serves when no live holder answers"
+    );
+}
+
+fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(d).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
