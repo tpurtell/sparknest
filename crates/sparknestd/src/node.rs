@@ -67,6 +67,7 @@ impl Node {
         bootstrap: bool,
     ) -> anyhow::Result<Node> {
         let id = cfg.node.id;
+        let secret_for_web = secret.clone();
         std::fs::create_dir_all(&cfg.node.state_dir)
             .with_context(|| format!("creating {}", cfg.node.state_dir.display()))?;
         let rpc = Rpc::bind(RpcConfig {
@@ -152,11 +153,24 @@ impl Node {
             placer: placer.clone(),
             mountpoint,
             hub: "/hub".into(),
+            web_token: nest_api::web_token(&secret_for_web),
+            web_addr: cfg.node.api_listen,
         };
         let sock = cfg.api_socket();
+        let web_addr = cfg.node.api_listen;
         let api_task = tokio::spawn(async move {
-            if let Err(e) = nest_api::serve_unix(api, sock).await {
-                tracing::error!(error = %e, "management API stopped");
+            let unix = nest_api::serve_unix(api.clone(), sock);
+            let tcp = async {
+                match web_addr {
+                    Some(addr) => nest_api::serve_tcp(api, addr).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let (a, b) = tokio::join!(unix, tcp);
+            for r in [a, b] {
+                if let Err(e) = r {
+                    tracing::error!(error = %e, "management API stopped");
+                }
             }
         });
         let node = Node {

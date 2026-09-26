@@ -30,6 +30,8 @@ struct Cli {
 enum Cmd {
     /// Cluster, node and store overview.
     Status,
+    /// Print a link to this node's web UI (with its access token).
+    Ui,
     /// List a directory (or one file) with where each file's copies live.
     Ls { path: String },
     /// Seal (or unseal) files: enforced immutability; enables passthrough.
@@ -367,6 +369,25 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             v
+        }
+        Cmd::Ui => {
+            let v = c.get("/v1/web").await?;
+            let Some(addr) = v["addr"].as_str() else {
+                bail!("this node has no api_listen configured")
+            };
+            let (host, port) = addr.rsplit_once(':').unwrap_or((addr, "7411"));
+            let host = if host == "0.0.0.0" || host == "[::]" {
+                std::fs::read_to_string("/proc/sys/kernel/hostname")
+                    .map(|h| h.trim().to_string())
+                    .unwrap_or_else(|_| "localhost".into())
+            } else {
+                host.to_string()
+            };
+            println!(
+                "http://{host}:{port}/#token={}",
+                v["token"].as_str().unwrap_or("")
+            );
+            return Ok(());
         }
         Cmd::Ls { path } => {
             let v = c

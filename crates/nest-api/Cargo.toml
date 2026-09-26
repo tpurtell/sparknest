@@ -18,3 +18,5 @@ serde_json.workspace = true
 tracing.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
+hmac.workspace = true
+sha2.workspace = true

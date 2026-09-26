@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sparknest</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #64707d; --line: #e3e6ea;
+  --accent: #2f6fdf; --accent-weak: #e8f0fd; --ok: #1f9d55; --ok-weak: #e3f5ea;
+  --warn: #c27c0e; --warn-weak: #fbf1df; --bad: #cf3b36; --bad-weak: #fbe6e5;
+  --none: #c9ced4; --shadow: 0 1px 2px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --panel: #171b21; --text: #e6e9ed; --muted: #8b95a1; --line: #262c34;
+    --accent: #6ea0ff; --accent-weak: #1a2640; --ok: #3ccf7a; --ok-weak: #13301f;
+    --warn: #e2a33b; --warn-weak: #33260f; --bad: #ff6b66; --bad-weak: #3a1716;
+    --none: #3a414b; --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --panel: #171b21; --text: #e6e9ed; --muted: #8b95a1; --line: #262c34;
+  --accent: #6ea0ff; --accent-weak: #1a2640; --ok: #3ccf7a; --ok-weak: #13301f;
+  --warn: #e2a33b; --warn-weak: #33260f; --bad: #ff6b66; --bad-weak: #3a1716;
+  --none: #3a414b; --shadow: none;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+  background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+header h1 span { color: var(--accent); }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button { background: none; border: 0; color: var(--muted); padding: 6px 10px; border-radius: 6px; cursor: pointer; font: inherit; }
+nav button.active { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
+.pills { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+h2 { font-size: 15px; margin: 22px 0 10px; }
+h2:first-child { margin-top: 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; box-shadow: var(--shadow); }
+.card h3 { margin: 0 0 6px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.bar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; margin: 8px 0 4px; border: 1px solid var(--line); }
+.bar > div { height: 100%; background: var(--accent); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+.tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; background: var(--panel); position: sticky; top: 0; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.cell { display: inline-flex; align-items: center; justify-content: center; min-width: 54px; padding: 2px 8px; border-radius: 6px;
+  font-size: 12px; cursor: pointer; border: 1px solid transparent; user-select: none; }
+.cell.ready { background: var(--ok-weak); color: var(--ok); }
+.cell.partial { background: var(--warn-weak); color: var(--warn); }
+.cell.none { color: var(--muted); border-color: var(--line); }
+.cell:hover { outline: 2px solid var(--accent-weak); }
+.badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--accent-weak); color: var(--accent); margin-right: 3px; }
+.badge.store { background: var(--warn-weak); color: var(--warn); }
+.badge.writing { background: var(--bad-weak); color: var(--bad); }
+a, .link { color: var(--accent); cursor: pointer; text-decoration: none; }
+button.btn { font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--text); cursor: pointer; }
+button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.btn.danger { color: var(--bad); }
+button.btn:disabled { opacity: .5; cursor: default; }
+input, select { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.crumbs { margin-bottom: 10px; }
+.crumbs a { margin-right: 2px; }
+.toast { position: fixed; bottom: 18px; right: 18px; background: var(--panel); border: 1px solid var(--line);
+  border-left: 4px solid var(--accent); padding: 10px 14px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.15); max-width: 420px; z-index: 20; }
+.toast.err { border-left-color: var(--bad); }
+.modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex; align-items: center; justify-content: center; z-index: 30; padding: 16px; }
+.modal { background: var(--panel); border-radius: 12px; padding: 18px; width: min(460px, 100%); border: 1px solid var(--line); }
+.modal h3 { margin: 0 0 10px; font-size: 15px; }
+.checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; margin: 10px 0 14px; }
+.checks label { display: flex; gap: 6px; align-items: center; }
+.empty { padding: 28px; text-align: center; color: var(--muted); }
+.login { max-width: 420px; margin: 80px auto; }
+.jobbar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; border: 1px solid var(--line); width: 160px; display: inline-block; vertical-align: middle; }
+.jobbar > div { height: 100%; background: var(--ok); }
+@media (max-width: 640px) { main { padding: 12px; } header { padding: 10px 12px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>●</span> sparknest</h1>
+  <nav id="nav"></nav>
+  <div class="pills" id="pills"></div>
+</header>
+<main id="main"></main>
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const human = b => { if (b == null) return ""; const u = ["B","KiB","MiB","GiB","TiB"]; let i = 0, v = b; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return i ? v.toFixed(1) + " " + u[i] : b + " B"; };
+
+let token = "";
+try {
+  const m = location.hash.match(/token=([0-9a-f]+)/);
+  if (m) { token = m[1]; sessionStorage.setItem("nest-token", token); history.replaceState(null, "", location.pathname + location.search); }
+  else token = sessionStorage.getItem("nest-token") || "";
+} catch (e) {}
+
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined });
+  const v = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(v.error || r.statusText);
+  return v;
+}
+const get = p => api("GET", p);
+const post = (p, b) => api("POST", p, b);
+
+function toast(msg, err) {
+  const t = document.createElement("div");
+  t.className = "toast" + (err ? " err" : "");
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), err ? 7000 : 3500);
+}
+
+function modal(title, bodyHtml, actions) {
+  return new Promise(resolve => {
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    bg.innerHTML = `<div class="modal"><h3>${esc(title)}</h3><div>${bodyHtml}</div><div class="row" style="justify-content:flex-end;margin-top:12px"></div></div>`;
+    const row = bg.querySelector(".row");
+    for (const [label, cls, value] of [["Cancel", "", null], ...actions]) {
+      const b = document.createElement("button");
+      b.className = "btn " + cls; b.textContent = label;
+      b.onclick = () => { const v = typeof value === "function" ? value(bg) : value; bg.remove(); resolve(v); };
+      row.appendChild(b);
+    }
+    bg.onclick = e => { if (e.target === bg) { bg.remove(); resolve(null); } };
+    document.body.appendChild(bg);
+  });
+}
+
+// ---------------------------------------------------------------- state
+const views = ["Overview", "Models", "Files", "Rules", "Jobs"];
+let view = (() => { const v = new URLSearchParams(location.search).get("view"); return views.includes(v) ? v : "Overview"; })();
+let status = null, stores = [];
+let filesPath = new URLSearchParams(location.search).get("path") || "/";
+let timer = null;
+
+function targets() {
+  const t = (status?.nodes || []).map(n => ({ name: n.name, kind: "node" }));
+  for (const s of stores) t.push({ name: s.name, kind: "store" });
+  return t;
+}
+
+function renderNav() {
+  $("#nav").innerHTML = views.map(v => `<button class="${v === view ? "active" : ""}" data-v="${v}">${v}</button>`).join("");
+  $("#nav").onclick = e => { const v = e.target.dataset.v; if (v) { view = v; renderNav(); render(); } };
+}
+
+async function refreshStatus() {
+  try {
+    [status, stores] = await Promise.all([get("/v1/status"), get("/v1/stores").then(v => v.stores)]);
+    const serving = status.nodes.filter(n => n.info?.serving).length;
+    $("#pills").innerHTML = `<span class="pill">leader ${esc(status.nodes.find(n => n.node === status.leader)?.name || "none")}</span>` +
+      `<span class="pill">${serving}/${status.nodes.length} serving</span><span class="pill">${status.entries} entries</span>`;
+  } catch (e) {
+    if (/token/.test(e.message)) return login();
+    $("#pills").innerHTML = `<span class="pill" style="color:var(--bad)">${esc(e.message)}</span>`;
+  }
+}
+
+function login() {
+  clearInterval(timer);
+  $("#nav").innerHTML = ""; $("#pills").innerHTML = "";
+  $("#main").innerHTML = `<div class="card login"><h3>Connect</h3><p class="muted">Run <code>nest ui</code> on any node for a link with the token, or paste the token here.</p>
+    <div class="row"><input id="tok" placeholder="token" style="flex:1"><button class="btn primary" id="go">Open</button></div></div>`;
+  $("#go").onclick = () => { token = $("#tok").value.trim(); try { sessionStorage.setItem("nest-token", token); } catch (e) {} start(); };
+}
+
+// ---------------------------------------------------------------- views
+async function render() {
+  const main = $("#main");
+  try {
+    if (view === "Overview") main.innerHTML = overview();
+    else if (view === "Models") main.innerHTML = await models();
+    else if (view === "Files") main.innerHTML = await files();
+    else if (view === "Rules") main.innerHTML = await rules();
+    else if (view === "Jobs") main.innerHTML = await jobs();
+    bind();
+  } catch (e) { main.innerHTML = `<div class="card"><b>Error:</b> ${esc(e.message)}</div>`; }
+}
+
+function overview() {
+  if (!status) return `<div class="empty">Loading…</div>`;
+  const nodes = status.nodes.map(n => {
+    const i = n.info;
+    if (!i) return `<div class="card"><h3><span class="dot bad"></span>${esc(n.name)}</h3><div class="muted small">${esc(n.error || "unreachable")}</div></div>`;
+    const used = i.total_bytes - i.free_bytes, pct = i.total_bytes ? 100 * used / i.total_bytes : 0;
+    return `<div class="card"><h3><span class="dot ${i.serving ? "ok" : "bad"}"></span>${esc(n.name)}
+      ${n.node === status.leader ? `<span class="badge">leader</span>` : ""}</h3>
+      <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
+      <div class="small muted">${human(i.free_bytes)} free of ${human(i.total_bytes)}</div>
+      <div class="small">${i.objects} objects · ${human(i.object_bytes)} stored</div>
+      <div class="small muted">${(i.rails || []).map(esc).join(" · ") || "TCP only"}</div></div>`;
+  }).join("");
+  const st = stores.map(s => {
+    const gw = s.gateways.map(([g, h]) => `<div class="small"><span class="dot ${h.healthy ? "ok" : "bad"}"></span> ${esc(g)}
+      ${h.healthy ? `<span class="muted">${human(h.free_bytes)} free</span>` : `<span class="muted">${esc(h.error || "unhealthy")}</span>`}</div>`).join("");
+    const h = s.gateways.find(([, h]) => h.healthy)?.[1];
+    return `<div class="card"><h3>${esc(s.name)}</h3><div class="small muted">${esc(s.path)}</div>
+      ${h ? `<div class="small">${h.objects} objects · ${human(h.object_bytes)}</div>` : ""}${gw}</div>`;
+  }).join("");
+  return `<h2>Nodes</h2><div class="grid">${nodes}</div><h2>Archive stores</h2>${st ? `<div class="grid">${st}</div>` : `<div class="empty">No archive stores. <code>nest store add NAME PATH --gateways …</code></div>`}`;
+}
+
+async function models() {
+  const v = await get("/v1/hf");
+  if (!v.repos.length) return `<div class="empty">No Hugging Face repos under ${esc(v.hub)}.</div>`;
+  const cols = targets();
+  const head = `<tr><th>Repo</th><th class="num">Size</th><th class="num">Revs</th>${cols.map(c => `<th>${esc(c.name)}${c.kind === "store" ? " ⧉" : ""}</th>`).join("")}<th></th></tr>`;
+  const rows = v.repos.map(r => {
+    if (r.error) return `<tr><td>${esc(r.repo)}</td><td colspan="${cols.length + 3}" class="muted">${esc(r.error)}</td></tr>`;
+    const byHost = Object.fromEntries(r.hosts.map(h => [h.host, h]));
+    const cells = cols.map(c => {
+      const h = byHost[c.name];
+      if (!h) return `<td></td>`;
+      const cls = h.ready ? "ready" : h.missing_files < h.files ? "partial" : "none";
+      const label = h.ready ? "✓" : cls === "partial" ? Math.floor(100 * (h.bytes - h.missing_bytes) / Math.max(h.bytes, 1)) + "%" : "—";
+      return `<td><span class="cell ${cls}" data-act="cell" data-sel="${esc(r.selector)}" data-host="${esc(c.name)}" data-kind="${c.kind}" data-ready="${h.ready}"
+        title="${esc(c.name)}: ${h.ready ? "complete" : `missing ${h.missing_files} files (${human(h.missing_bytes)})`}">${label}</span></td>`;
+    }).join("");
+    return `<tr><td>${esc(r.repo)} ${r.kind === "dataset" ? `<span class="badge">dataset</span>` : ""}${r.writing ? `<span class="badge writing">${r.writing} writing</span>` : ""}</td>
+      <td class="num">${human(r.bytes)}</td><td class="num">${r.revisions}</td>${cells}
+      <td><button class="btn" data-act="everywhere" data-sel="${esc(r.selector)}">All nodes</button>
+      ${stores.length ? `<button class="btn" data-act="offload" data-sel="${esc(r.selector)}">Offload…</button>` : ""}</td></tr>`;
+  }).join("");
+  return `<h2>Hugging Face repos <span class="muted small">(click a cell to copy there or remove from there)</span></h2><div class="tablewrap"><table>${head}${rows}</table></div>`;
+}
+
+async function files() {
+  const v = await get("/v1/ls?path=" + encodeURIComponent(filesPath));
+  const parts = filesPath.split("/").filter(Boolean);
+  let acc = "";
+  const crumbs = [`<a data-act="cd" data-path="/">/</a>`, ...parts.map(p => { acc += "/" + p; return `<a data-act="cd" data-path="${esc(acc)}">${esc(p)}</a>`; })].join(" / ");
+  const rows = v.entries.map(e => {
+    const full = (filesPath === "/" ? "" : filesPath) + "/" + e.name;
+    const name = e.kind === "directory" ? `<a data-act="cd" data-path="${esc(full)}">${esc(e.name)}/</a>`
+      : e.kind === "symlink" ? `${esc(e.name)} <span class="muted">→ ${esc(e.target)}</span>` : esc(e.name);
+    const where = e.kind === "regular" ? (e.writing_on ? `<span class="badge writing">writing on ${esc(e.writing_on)}</span>` :
+      e.hosts.map(h => `<span class="badge ${stores.some(s => s.name === h) ? "store" : ""}">${esc(h)}</span>`).join("")) : "";
+    const actions = e.kind === "symlink" ? "" :
+      `<button class="btn" data-act="copy" data-sel="${esc(full)}">Copy to…</button>` +
+      (e.kind === "regular" ? ` <button class="btn" data-act="seal" data-path="${esc(full)}" data-sealed="${e.sealed}">${e.sealed ? "Unseal" : "Seal"}</button>` : "");
+    return `<tr><td>${name}</td><td class="num">${e.kind === "regular" ? human(e.size) : ""}</td><td>${e.sealed ? "🔒" : ""}</td><td>${where}</td><td>${actions}</td></tr>`;
+  }).join("");
+  return `<div class="crumbs">${crumbs}</div><div class="tablewrap"><table><tr><th>Name</th><th class="num">Size</th><th></th><th>Copies</th><th></th></tr>${rows || `<tr><td colspan="5" class="empty">Empty</td></tr>`}</table></div>`;
+}
+
+async function rules() {
+  const v = await get("/v1/rules");
+  const rows = v.rules.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.selector)}</td><td>${r.hosts.map(h => `<span class="badge">${esc(h)}</span>`).join("")}</td>
+    <td>${r.auto ? "auto" : ""}</td><td><button class="btn" data-act="reconcile" data-name="${esc(r.name)}">Apply</button>
+    <button class="btn danger" data-act="delrule" data-name="${esc(r.name)}">Delete</button></td></tr>`).join("");
+  const checks = targets().map(t => `<label><input type="checkbox" name="h" value="${esc(t.name)}">${esc(t.name)}</label>`).join("");
+  return `<h2>Rules</h2><div class="tablewrap"><table><tr><th>Name</th><th>Selection</th><th>Where</th><th></th><th></th></tr>
+    ${rows || `<tr><td colspan="5" class="empty">No rules yet</td></tr>`}</table></div>
+    <h2>New rule</h2><div class="card"><div class="row"><input id="rname" placeholder="name"><input id="rsel" placeholder="hf:org/name or /path" style="flex:1;min-width:220px">
+    <label class="row"><input type="checkbox" id="rauto"> automatic</label></div>
+    <div class="checks" id="rhosts"><label><input type="checkbox" name="h" value="@all"><b>@all</b></label>${checks}</div>
+    <button class="btn primary" data-act="addrule">Save rule</button></div>`;
+}
+
+async function jobs() {
+  const v = await get("/v1/jobs");
+  const list = v.jobs.slice().reverse();
+  if (!list.length) return `<div class="empty">No jobs on this node yet.</div>`;
+  return `<h2>Jobs on this node</h2><div class="tablewrap"><table><tr><th>Job</th><th>State</th><th>Progress</th></tr>` + list.map(j => {
+    const hosts = Object.entries(j.hosts || {}).map(([h, p]) => {
+      const pct = p.total_bytes ? 100 * p.done_bytes / p.total_bytes : (p.finished ? 100 : 0);
+      return `<div class="small">${esc(h)} <span class="jobbar"><div style="width:${pct.toFixed(0)}%"></div></span>
+        ${p.done_files}/${p.total_files} files · ${human(p.done_bytes)} / ${human(p.total_bytes)}${p.failed.length ? ` · <span style="color:var(--bad)">${p.failed.length} failed</span>` : ""}</div>`;
+    }).join("");
+    const state = !j.finished ? "running" : j.error ? `<span style="color:var(--bad)">${esc(j.error)}</span>` : "done";
+    return `<tr><td>${esc(j.what)}</td><td>${state}</td><td>${hosts}</td></tr>`;
+  }).join("") + `</table></div>`;
+}
+
+// ---------------------------------------------------------------- actions
+function pickHosts(title, kinds) {
+  const opts = targets().filter(t => kinds.includes(t.kind)).map(t => `<label><input type="checkbox" value="${esc(t.name)}">${esc(t.name)}</label>`).join("");
+  return modal(title, `<div class="checks">${opts}</div>`, [["Start", "primary", bg => [...bg.querySelectorAll("input:checked")].map(i => i.value)]]);
+}
+
+async function startJob(path, body, what) {
+  try { await post(path, body); toast(what + " started"); view = "Jobs"; renderNav(); render(); }
+  catch (e) { toast(e.message, true); }
+}
+
+function bind() {
+  $("#main").onclick = async e => {
+    const el = e.target.closest("[data-act]");
+    if (!el) return;
+    const d = el.dataset;
+    if (d.act === "cd") { filesPath = d.path; render(); }
+    else if (d.act === "cell") {
+      if (d.ready === "true") {
+        const ok = await modal(`Remove ${d.sel} from ${d.host}?`, `<p class="muted">The last complete copy is never removed.</p>`, [["Remove", "danger", true]]);
+        if (!ok) return;
+        try { const v = await post("/v1/evict", { selector: d.sel, hosts: [d.host] }); const r = v.hosts[0];
+          toast(`${d.host}: removed ${r.removed}${r.refused.length ? `, kept ${r.refused.length} (last copies)` : ""}`); render(); }
+        catch (err) { toast(err.message, true); }
+      } else {
+        const ok = await modal(`Copy ${d.sel} to ${d.host}?`, `<p class="muted">Whole files are copied over RDMA; nothing is removed elsewhere.</p>`, [["Copy", "primary", true]]);
+        if (ok) startJob("/v1/replicate", { selector: d.sel, hosts: [d.host] }, "Copy to " + d.host);
+      }
+    }
+    else if (d.act === "everywhere") startJob("/v1/replicate", { selector: d.sel, hosts: ["@all"] }, "Copy to all nodes");
+    else if (d.act === "offload") {
+      const opts = stores.map(s => `<option>${esc(s.name)}</option>`).join("");
+      const store = await modal(`Offload ${d.sel}`, `<p class="muted">Copy into the archive, then remove the live copies. Reads stream through a gateway; copy back any time.</p><select id="ostore">${opts}</select>`,
+        [["Offload", "primary", bg => bg.querySelector("#ostore").value]]);
+      if (store) startJob("/v1/offload", { selector: d.sel, store }, "Offload to " + store);
+    }
+    else if (d.act === "copy") {
+      const hosts = await pickHosts(`Copy ${d.sel} to…`, ["node", "store"]);
+      if (hosts && hosts.length) startJob("/v1/replicate", { selector: d.sel, hosts }, "Copy");
+    }
+    else if (d.act === "seal") {
+      try { await post("/v1/seal", { path: d.path, sealed: d.sealed !== "true" }); render(); } catch (err) { toast(err.message, true); }
+    }
+    else if (d.act === "reconcile") { try { await post("/v1/reconcile", { name: d.name }); toast("Applying " + d.name); } catch (err) { toast(err.message, true); } }
+    else if (d.act === "delrule") {
+      if (await modal(`Delete rule ${d.name}?`, `<p class="muted">Existing copies stay where they are.</p>`, [["Delete", "danger", true]])) {
+        try { await api("DELETE", "/v1/rules/" + encodeURIComponent(d.name)); render(); } catch (err) { toast(err.message, true); }
+      }
+    }
+    else if (d.act === "addrule") {
+      const hosts = [...document.querySelectorAll("#rhosts input:checked")].map(i => i.value);
+      try { await api("PUT", "/v1/rules/" + encodeURIComponent($("#rname").value.trim()), { selector: $("#rsel").value.trim(), hosts, auto: $("#rauto").checked });
+        toast("Rule saved"); render(); } catch (err) { toast(err.message, true); }
+    }
+  };
+}
+
+async function start() {
+  renderNav();
+  await refreshStatus();
+  if (!status) return;
+  render();
+  clearInterval(timer);
+  timer = setInterval(async () => {
+    await refreshStatus();
+    if (view === "Overview" || view === "Jobs") render();
+  }, 3000);
+}
+start();
+</script>
+</body>
+</html>

@@ -27,7 +27,27 @@ pub struct Api {
     pub placer: Arc<Placer>,
     pub mountpoint: Option<String>,
     pub hub: String,
+    /// Bearer token for the network listener (and the web UI).
+    pub web_token: String,
+    /// Network listener address, if any (for `nest ui`).
+    pub web_addr: Option<std::net::SocketAddr>,
 }
+
+/// The web/API bearer token: HMAC of a fixed label under the cluster secret,
+/// so every node accepts the same token and it never equals the secret.
+pub fn web_token(secret: &[u8]) -> String {
+    use hmac::Mac;
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("any key length");
+    m.update(b"sparknest-web-v1");
+    m.finalize()
+        .into_bytes()
+        .iter()
+        .take(20)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+const INDEX_HTML: &str = include_str!("../web/index.html");
 
 struct ApiError(StatusCode, String);
 
@@ -113,10 +133,46 @@ pub fn router(api: Api) -> Router {
         .route("/v1/import", post(import))
         .route("/v1/stores", get(stores).post(add_store))
         .route("/v1/offload", post(offload))
+        .route("/v1/hf", get(hf_repos))
+        .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/remove", post(cluster_remove))
         .route("/v1/cluster/add", post(cluster_add))
         .with_state(api)
+}
+
+/// Serve the web UI and the token-protected API on a TCP listener.
+pub async fn serve_tcp(api: Api, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    use axum::middleware::{self, Next};
+    let token = api.web_token.clone();
+    let protected = router(api).layer(middleware::from_fn(
+        move |req: axum::extract::Request, next: Next| {
+            let token = token.clone();
+            async move {
+                let ok = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.strip_prefix("Bearer ").is_some_and(|t| t == token));
+                if ok {
+                    next.run(req).await
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": "missing or wrong token" })),
+                    )
+                        .into_response()
+                }
+            }
+        },
+    ));
+    let app = Router::new()
+        .route("/", get(|| async { axum::response::Html(INDEX_HTML) }))
+        .merge(protected);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "web UI and API listening");
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 /// Serve on a Unix socket until the task is dropped.
@@ -165,12 +221,19 @@ async fn ls(State(api): State<Api>, Query(q): Query<PathQ>) -> R<serde_json::Val
     let path = api.ns(&q.path);
     let c = api.conn()?;
     let (id, _) = selector::resolve_path(&c, &path)?;
-    let names: HashMap<u64, String> = api
+    // Store ids to names: nodes' live stores and archive stores.
+    let mut names: HashMap<u64, String> = api
         .placer
         .nodes()?
         .into_iter()
         .map(|h| (h.node.0, h.name))
         .collect();
+    names.extend(
+        api.placer
+            .archive_stores()?
+            .into_iter()
+            .map(|(id, name, _)| (id.0, name)),
+    );
     let host = |n: u64| names.get(&n).cloned().unwrap_or_else(|| format!("node{n}"));
     let entry = |name: String, a: nest_types::FileAttr| -> Result<LsEntry, ApiError> {
         let hosts = query::replicas(&c, a.id)
@@ -495,5 +558,74 @@ async fn offload(State(api): State<Api>, Json(r): Json<OffloadReq>) -> R<serde_j
     let sel = api.selector(&r.selector)?;
     Ok(Json(
         json!({ "job": api.placer.offload(sel, r.store, r.parallel).await? }),
+    ))
+}
+
+/// Every Hugging Face repo in the hub with where it is complete.
+async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
+    let hub = api.hub.clone();
+    let c = api.conn()?;
+    let (hub_id, _) = match selector::resolve_path(&c, &hub) {
+        Ok(x) => x,
+        Err(_) => return Ok(Json(json!({ "hub": hub, "repos": [] }))),
+    };
+    let mut repos = Vec::new();
+    let mut after = 0;
+    loop {
+        let batch = query::readdir(&c, hub_id, after, 1024).map_err(|e| bad(e.to_string()))?;
+        if batch.is_empty() {
+            break;
+        }
+        for (cookie, e) in batch {
+            after = cookie;
+            let name = String::from_utf8_lossy(&e.name).into_owned();
+            let (kind, rest) = if let Some(r) = name.strip_prefix("models--") {
+                ("model", r)
+            } else if let Some(r) = name.strip_prefix("datasets--") {
+                ("dataset", r)
+            } else {
+                continue;
+            };
+            repos.push((kind, rest.replacen("--", "/", 1), name));
+        }
+    }
+    drop(c);
+    let mut out = Vec::new();
+    for (kind, repo, dir) in repos {
+        let sel = Selector::Hf {
+            hub: hub.clone(),
+            repo: repo.clone(),
+            revision: None,
+            repo_type: kind.to_string(),
+        };
+        let revisions = {
+            let c = api.conn()?;
+            selector::resolve_path(&c, &format!("{hub}/{dir}/snapshots"))
+                .ok()
+                .and_then(|(id, _)| query::readdir(&c, id, 0, 1000).ok())
+                .map(|v| v.len())
+                .unwrap_or(0)
+        };
+        match api.placer.readiness(&sel, &[]).await {
+            Ok((m, ready)) => out.push(json!({
+                "repo": repo,
+                "kind": kind,
+                "selector": sel.describe(),
+                "files": m.entries.len(),
+                "bytes": m.bytes(),
+                "writing": m.entries.iter().filter(|e| !e.stable).count(),
+                "revisions": revisions,
+                "hosts": ready,
+            })),
+            Err(e) => out.push(json!({ "repo": repo, "kind": kind, "error": e.to_string() })),
+        }
+    }
+    Ok(Json(json!({ "hub": hub, "repos": out })))
+}
+
+/// For `nest ui` (Unix socket only): where the web UI is and its token.
+async fn web_info(State(api): State<Api>) -> R<serde_json::Value> {
+    Ok(Json(
+        json!({ "addr": api.web_addr, "token": api.web_token }),
     ))
 }

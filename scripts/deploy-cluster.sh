@@ -57,7 +57,7 @@ name = "$name"
 state_dir = "$state"
 mountpoint = "$mnt"
 listen = "$ip:$SPARKNEST_PORT"
-api_listen = "$ip:$SPARKNEST_API_PORT"
+api_listen = "0.0.0.0:$SPARKNEST_API_PORT"
 
 [cluster]
 name = "$SPARKNEST_CLUSTER"

@@ -435,3 +435,22 @@ Everything else follows from existing rules:
 
 Backups as retained, versioned snapshots (separate from replicas) and
 metadata snapshots to an archive remain to be built.
+
+## ADR-020 — Web UI: one static page served by every daemon (2026-09-26)
+
+**Decision.** The web UI is a single self-contained HTML/JS/CSS page
+(`crates/nest-api/web/index.html`, embedded with `include_str!`), served at
+`/` on each daemon's `api_listen` address. The same API routes are served
+there behind a bearer token (HMAC of a fixed label under the cluster
+secret, identical on every node); `nest ui` prints a link carrying it. The
+page talks only to the API, like the CLI.
+
+**Why not a Vite/TypeScript SPA (ADR-006's plan).** No npm build in the
+release pipeline, nothing to deploy separately, and every node can serve
+it. The page is small enough that a framework adds more than it saves; if
+it grows, the API contract does not change.
+
+**Views.** Overview (nodes, stores), Models (per-repo readiness matrix
+across nodes and archive stores; clicking a cell copies there or removes
+from there), Files (browse with copy locations, seal toggle, copy-to),
+Rules (create, apply, delete), Jobs (live progress).
