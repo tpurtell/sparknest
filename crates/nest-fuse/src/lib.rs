@@ -843,6 +843,17 @@ enum Inval {
 /// Mount `vfs` and start serving. Must be called from within a tokio
 /// runtime (requests are dispatched onto it).
 pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
+    // A daemon that died without unmounting leaves a dead mount behind
+    // ("Transport endpoint is not connected"); clear it so we can mount.
+    if let Err(e) = std::fs::metadata(&cfg.mountpoint)
+        && e.raw_os_error() == Some(libc::ENOTCONN)
+    {
+        tracing::warn!(mountpoint = %cfg.mountpoint.display(), "clearing a dead FUSE mount left by a previous daemon");
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&cfg.mountpoint)
+            .status();
+    }
     let inner = Arc::new(Inner {
         vfs: vfs.clone(),
         ttl: cfg.ttl,
