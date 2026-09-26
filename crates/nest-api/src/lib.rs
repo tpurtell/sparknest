@@ -428,7 +428,7 @@ struct RemoveReq {
 async fn cluster_remove(State(api): State<Api>, Json(r): Json<RemoveReq>) -> R<serde_json::Value> {
     let h = api
         .placer
-        .resolve_hosts(&[r.host.clone()])?
+        .resolve_hosts(std::slice::from_ref(&r.host))?
         .pop()
         .ok_or(bad("unknown host"))?;
     if h.node == api.vfs.data().id() {
