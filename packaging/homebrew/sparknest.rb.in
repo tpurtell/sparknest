@@ -1,0 +1,89 @@
+# Template: scripts/release.sh renders it with the version and the source
+# tarball's SHA-256. The rendered copy goes to Formula/sparknest.rb in
+# tpurtell/local-ai-tap; bottles are then added by that tap's release process.
+class Sparknest < Formula
+  desc "RDMA distributed filesystem with explicit placement, built for model caches"
+  homepage "https://github.com/tpurtell/sparknest"
+  url "@URL@"
+  sha256 "@SHA256@"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  depends_on "rust" => :build
+  depends_on :linux
+  depends_on "tpurtell/local-ai/rdma-core"
+
+  conflicts_with "nest", because: "both install a `nest` executable"
+
+  def install
+    # One target directory so the daemon and the CLI share compiled crates.
+    ENV["CARGO_TARGET_DIR"] = buildpath/"target"
+    system "cargo", "install", *std_cargo_args(path: "crates/sparknestd")
+    system "cargo", "install", *std_cargo_args(path: "crates/nest-cli")
+    pkgshare.install "packaging/config", "packaging/systemd"
+    inreplace pkgshare.glob("systemd/*.service"), "@BIN_DIR@", opt_bin
+    doc.install "README.md", "docs/INSTALL.md"
+  end
+
+  def caveats
+    <<~EOS
+      Mounting needs the system FUSE 3 package (fusermount3), e.g.
+        sudo apt install fuse3
+      Cluster setup, configuration and service units:
+        #{doc}/INSTALL.md
+        #{pkgshare}
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/nest --version")
+    assert_match version.to_s, shell_output("#{bin}/sparknestd --version")
+
+    # A one-node cluster over TCP without a mount: import, offload to an
+    # archive store, snapshot the metadata, then rebuild the tree offline.
+    port = free_port
+    (testpath/"state").mkpath
+    (testpath/"archive").mkpath
+    (testpath/"secret").write("0123456789abcdef0123456789abcdef")
+    (testpath/"node.toml").write <<~TOML
+      [node]
+      id = 1
+      name = "solo"
+      state_dir = "#{testpath}/state"
+      listen = "127.0.0.1:#{port}"
+
+      [cluster]
+      name = "test"
+      secret_file = "#{testpath}/secret"
+      members = [{ id = 1, name = "solo", addr = "127.0.0.1:#{port}" }]
+
+      [fabric]
+      mode = "tcp"
+    TOML
+    system bin/"sparknestd", "--config", testpath/"node.toml", "--check"
+    (testpath/"src/models/demo").mkpath
+    (testpath/"src/models/demo/config.json").write "hello sparknest\n"
+
+    sock = testpath/"state/api.sock"
+    pid = spawn bin/"sparknestd", "--config", testpath/"node.toml", "--bootstrap",
+                [:out, :err] => (testpath/"daemon.log").to_s
+    begin
+      60.times do
+        break if sock.exist? && quiet_system(bin/"nest", "--socket", sock, "status")
+
+        sleep 0.5
+      end
+      nest = [bin/"nest", "--socket", sock]
+      system(*nest, "import", "--wait", testpath/"src/models", "/models")
+      assert_match "config.json", shell_output("#{nest.join(" ")} ls /models/demo")
+      system(*nest, "store", "add", "archive", testpath/"archive", "--gateways", "solo")
+      system(*nest, "offload", "/models", "--store", "archive", "--wait")
+      system(*nest, "backup", "meta", "--store", "archive")
+    ensure
+      Process.kill("INT", pid)
+      Process.wait(pid)
+    end
+    snapshot = Dir[testpath/"archive/meta/*.sqlite"].first
+    system bin/"sparknestd", "export", "--meta", snapshot, "--objects", testpath/"archive", "--out", testpath/"out"
+    assert_equal "hello sparknest\n", (testpath/"out/models/demo/config.json").read
+  end
+end

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build sparknest for the host architecture.
-#   scripts/build.sh            release build of daemon + CLI (+ web if present)
+#   scripts/build.sh            release build of daemon + CLI (web UI is embedded)
 #   scripts/build.sh --debug    debug build
 #   scripts/build.sh --check    fmt check, clippy -D warnings, tests
 # Output: dist/<arch>/{sparknestd,nest}
@@ -33,8 +33,4 @@ out="dist/$arch"
 mkdir -p "$out"
 install -m 0755 "target/$mode/sparknestd" "target/$mode/nest" "$out/"
 
-if [ -f web/package.json ] && command -v npm >/dev/null; then
-  (cd web && npm ci --silent && npm run build --silent)
-  rm -rf "$out/web" && cp -r web/dist "$out/web"
-fi
 echo "built $mode binaries in $out"

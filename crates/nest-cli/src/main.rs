@@ -273,9 +273,10 @@ fn find_socket(cli: &Cli) -> Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let candidates: Vec<PathBuf> = match &cli.config {
         Some(c) => vec![c.clone()],
+        // A real deployment wins over the trial layouts.
         None => vec![
-            PathBuf::from(format!("{home}/sparknest-test/state/node.toml")),
             PathBuf::from("/srv/sparknest/node.toml"),
+            PathBuf::from(format!("{home}/sparknest-test/state/node.toml")),
             PathBuf::from("/srv/sparknest-test/node.toml"),
         ],
     };
