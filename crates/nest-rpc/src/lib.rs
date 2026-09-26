@@ -25,6 +25,7 @@ pub mod service {
     pub const META: u8 = 2;
     pub const DATA: u8 = 3;
     pub const ADMIN: u8 = 4;
+    pub const FABRIC: u8 = 5;
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

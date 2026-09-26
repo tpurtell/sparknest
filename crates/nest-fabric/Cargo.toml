@@ -1,10 +1,28 @@
 [package]
 name = "nest-fabric"
-description = "Transport trait with RDMA (libibverbs) and TCP implementations"
+description = "RDMA fabric: libibverbs shim, rail discovery, registered pools, read protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+links = "nf_shim"
 
 [dependencies]
 nest-types.workspace = true
+nest-rpc.workspace = true
+libc.workspace = true
+nix = { workspace = true, features = ["net"] }
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+futures.workspace = true
+bytes.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

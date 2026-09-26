@@ -1,0 +1,780 @@
+//! The fabric engine: per-device resources, per-peer links, the read
+//! protocol, and completion handling.
+//!
+//! Read protocol (all on RC queue pairs; TCP only sets links up):
+//! ```text
+//! client                                            server
+//!   acquire landing slot (remote-writable pool)
+//!   SEND ReadReq{slot, file, gen, off, len, addr, rkey}  ->
+//!                                        acquire staging slot
+//!                                        source.read_into(staging) (checks generation)
+//!                 <- RDMA WRITE_WITH_IMM(staging -> addr), imm = slot<<23 | len
+//!                 <- or SEND ReadErr{slot, code}
+//!   complete the waiter for (device, slot)
+//! ```
+//! Each lane's receive ring absorbs requests, error replies and
+//! write-with-imm notifications; a per-lane window keeps a node's requests
+//! plus its responses within the peer's ring.
+
+use crate::pool::{Pool, Slot};
+use crate::rail::Rail;
+use crate::sys::{self, nf_wc};
+use crate::verbs::{Context, Cq, Qp, QpInfo, Region};
+use futures::future::BoxFuture;
+use nest_types::{FileId, Generation, NestError, NodeId};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::sync::{Semaphore, oneshot};
+
+#[derive(Clone, Debug)]
+pub struct FabricConfig {
+    /// Largest single read; also the slot size of both pools.
+    pub chunk: usize,
+    /// Landing slots per device (registered for remote write).
+    pub client_slots: u32,
+    /// Staging slots per device.
+    pub server_slots: u32,
+    /// Outstanding requests per lane (per direction).
+    pub window: u32,
+    /// Optional device/netdev/address filter.
+    pub devices: Vec<String>,
+}
+
+impl Default for FabricConfig {
+    fn default() -> Self {
+        FabricConfig {
+            chunk: 4 << 20,
+            client_slots: 128,
+            server_slots: 64,
+            window: 32,
+            devices: Vec::new(),
+        }
+    }
+}
+
+/// Supplies file bytes for requests this node serves. Implemented by the
+/// data service so generation fencing and serving rules stay in one place.
+pub trait ReadSource: Send + Sync + 'static {
+    fn read_into(
+        &self,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: usize,
+        buf: Slot,
+    ) -> BoxFuture<'static, (Slot, Result<usize, NestError>)>;
+}
+
+/// A completed read: the bytes live in a landing slot until dropped.
+pub struct ReadBuf {
+    slot: Slot,
+    len: usize,
+}
+
+impl ReadBuf {
+    pub fn as_slice(&self) -> &[u8] {
+        self.slot.as_slice(self.len)
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+// ---------------------------------------------------------------- wire
+
+const MSG_SIZE: usize = 64;
+const RING_SLOT: usize = 128;
+const KIND_READ: u8 = 1;
+const KIND_ERR: u8 = 2;
+
+const IMM_LEN_BITS: u32 = 23;
+
+fn err_code(e: &NestError) -> u8 {
+    match e {
+        NestError::Stale => 1,
+        NestError::Unavailable(_) => 2,
+        NestError::NotFound => 3,
+        _ => 4,
+    }
+}
+
+fn err_from(code: u8) -> NestError {
+    match code {
+        1 => NestError::Stale,
+        2 => NestError::Unavailable("peer cannot serve that range".into()),
+        3 => NestError::NotFound,
+        _ => NestError::Io("remote read failed".into()),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReadReq {
+    slot: u32,
+    file: u64,
+    generation: u64,
+    offset: u64,
+    len: u32,
+    addr: u64,
+    rkey: u32,
+}
+
+impl ReadReq {
+    fn encode(&self, out: &mut [u8; MSG_SIZE]) {
+        out[0] = KIND_READ;
+        out[4..8].copy_from_slice(&self.slot.to_le_bytes());
+        out[8..16].copy_from_slice(&self.file.to_le_bytes());
+        out[16..24].copy_from_slice(&self.generation.to_le_bytes());
+        out[24..32].copy_from_slice(&self.offset.to_le_bytes());
+        out[32..36].copy_from_slice(&self.len.to_le_bytes());
+        out[36..40].copy_from_slice(&self.rkey.to_le_bytes());
+        out[40..48].copy_from_slice(&self.addr.to_le_bytes());
+    }
+    fn decode(b: &[u8]) -> ReadReq {
+        let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        ReadReq {
+            slot: u32_at(4),
+            file: u64_at(8),
+            generation: u64_at(16),
+            offset: u64_at(24),
+            len: u32_at(32),
+            rkey: u32_at(36),
+            addr: u64_at(40),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- wr ids
+
+const WR_RING: u64 = 1;
+const WR_SEND: u64 = 2;
+const WR_WRITE: u64 = 3;
+
+fn wr(kind: u64, lane: u32, idx: u32) -> u64 {
+    (kind << 56) | ((lane as u64) << 32) | idx as u64
+}
+
+fn wr_parts(id: u64) -> (u64, u32, u32) {
+    (id >> 56, ((id >> 32) & 0xff_ffff) as u32, id as u32)
+}
+
+// ---------------------------------------------------------------- devices
+
+struct Device {
+    id: u32,
+    ctx: Arc<Context>,
+    cq: Arc<Cq>,
+    landing: Arc<Pool>,
+    staging: Arc<Pool>,
+    mtu: u32,
+}
+
+/// One queue pair to one peer on one rail pair.
+struct Lane {
+    id: u32,
+    dev: Arc<Device>,
+    qp: Qp,
+    local: Rail,
+    ring: Region,
+    /// Our outstanding requests on this lane.
+    window: Semaphore,
+    peer: NodeId,
+    dead: AtomicBool,
+}
+
+/// A client waiting for a read: (lane used, completion).
+type Waiter = (u32, oneshot::Sender<Result<usize, NestError>>);
+
+struct Link {
+    lanes: Vec<Arc<Lane>>,
+    next: AtomicU32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LaneOffer {
+    rail: Rail,
+    qp: QpInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum FabricReq {
+    /// Here are my rails with a fresh QP on each; pair by subnet.
+    Connect { lanes: Vec<LaneOffer> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum FabricResp {
+    /// For each paired offer (by index): the peer's QP.
+    Accepted {
+        pairs: Vec<(u32, QpInfo)>,
+    },
+    Refused(String),
+}
+
+pub struct Fabric {
+    cfg: FabricConfig,
+    rails: Vec<Rail>,
+    devices: Vec<Arc<Device>>,
+    rpc: nest_rpc::Rpc,
+    lanes: Mutex<HashMap<u32, Arc<Lane>>>,
+    next_lane: AtomicU32,
+    links: Mutex<HashMap<NodeId, Arc<Link>>>,
+    connecting: Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Waiters by (device, landing slot), with the lane the request used.
+    pending: Mutex<HashMap<(u32, u32), Waiter>>,
+    /// Staging slots held until their write-with-imm completes.
+    in_flight: Mutex<HashMap<u64, Slot>>,
+    source: Mutex<Option<Weak<dyn ReadSource>>>,
+    rt: tokio::runtime::Handle,
+    stop: Arc<AtomicBool>,
+    pub stats: Stats,
+}
+
+#[derive(Default)]
+pub struct Stats {
+    pub reads: AtomicU64,
+    pub read_bytes: AtomicU64,
+    pub served: AtomicU64,
+    pub served_bytes: AtomicU64,
+    pub errors: AtomicU64,
+}
+
+impl Fabric {
+    /// Open every discovered rail's device and start its poller. Returns
+    /// `None` when this node has no usable RoCE rail.
+    pub fn start(
+        me: NodeId,
+        cfg: FabricConfig,
+        rpc: nest_rpc::Rpc,
+    ) -> std::io::Result<Option<Arc<Fabric>>> {
+        let rails = crate::rail::discover(&cfg.devices);
+        if rails.is_empty() {
+            return Ok(None);
+        }
+        assert!(cfg.chunk < (1 << IMM_LEN_BITS) && cfg.client_slots < (1 << (32 - IMM_LEN_BITS)));
+        let mut devices: Vec<Arc<Device>> = Vec::new();
+        for r in &rails {
+            if devices.iter().any(|d| d.ctx.name == r.ibdev) {
+                continue;
+            }
+            let ctx = Context::open(&r.ibdev)?;
+            let (_, mtu) = ctx.port(r.port)?;
+            let cq = Cq::new(&ctx, 16384, true)?;
+            let landing = Pool::new(&ctx, cfg.client_slots, cfg.chunk, true)?;
+            let staging = Pool::new(&ctx, cfg.server_slots, cfg.chunk, false)?;
+            devices.push(Arc::new(Device {
+                id: devices.len() as u32,
+                ctx,
+                cq,
+                landing,
+                staging,
+                mtu,
+            }));
+        }
+        let _ = me;
+        let fabric = Arc::new(Fabric {
+            cfg,
+            rails,
+            devices,
+            rpc: rpc.clone(),
+            lanes: Mutex::new(HashMap::new()),
+            next_lane: AtomicU32::new(1),
+            links: Mutex::new(HashMap::new()),
+            connecting: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            source: Mutex::new(None),
+            rt: tokio::runtime::Handle::current(),
+            stop: Arc::new(AtomicBool::new(false)),
+            stats: Stats::default(),
+        });
+        for d in &fabric.devices {
+            let (weak, dev, stop) = (Arc::downgrade(&fabric), d.clone(), fabric.stop.clone());
+            std::thread::Builder::new()
+                .name(format!("nf-poll-{}", d.ctx.name))
+                .spawn(move || poller(weak, dev, stop))?;
+        }
+        let weak = Arc::downgrade(&fabric);
+        rpc.register(
+            nest_rpc::service::FABRIC,
+            Arc::new(move |peer: NodeId, body: bytes::Bytes| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let f = weak.upgrade().ok_or("fabric stopped")?;
+                    let req: FabricReq = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
+                    let resp = f.accept(peer, req);
+                    nest_rpc::encode(&resp)
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| e.to_string())
+                }) as BoxFuture<'static, Result<bytes::Bytes, String>>
+            }),
+        );
+        tracing::info!(rails = ?fabric.rails.iter().map(|r| format!("{}/{}", r.ibdev, r.addr)).collect::<Vec<_>>(), "RDMA fabric up");
+        Ok(Some(fabric))
+    }
+
+    pub fn rails(&self) -> &[Rail] {
+        &self.rails
+    }
+
+    pub fn set_source(&self, source: Weak<dyn ReadSource>) {
+        *self.source.lock() = Some(source);
+    }
+
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for l in self.lanes.lock().values() {
+            l.qp.set_error();
+        }
+    }
+
+    pub fn chunk(&self) -> usize {
+        self.cfg.chunk
+    }
+
+    // ------------------------------------------------------------ lanes
+
+    fn new_lane(&self, rail: &Rail, peer: NodeId) -> std::io::Result<Arc<Lane>> {
+        let dev = self
+            .devices
+            .iter()
+            .find(|d| d.ctx.name == rail.ibdev)
+            .expect("rail device opened")
+            .clone();
+        let depth = self.cfg.window * 2 + 8;
+        let qp = Qp::new(&dev.ctx, &dev.cq, &dev.cq, depth * 2, depth, rail.port)?;
+        let ring = Region::new(&dev.ctx, depth as usize * RING_SLOT, false)?;
+        let id = self.next_lane.fetch_add(1, Ordering::Relaxed);
+        let lane = Arc::new(Lane {
+            id,
+            dev,
+            qp,
+            local: rail.clone(),
+            ring,
+            window: Semaphore::new(self.cfg.window as usize),
+            peer,
+            dead: AtomicBool::new(false),
+        });
+        for i in 0..depth {
+            self.post_ring(&lane, i)?;
+        }
+        self.lanes.lock().insert(id, lane.clone());
+        Ok(lane)
+    }
+
+    fn post_ring(&self, lane: &Lane, i: u32) -> std::io::Result<()> {
+        // SAFETY: ring slot i lies in the lane's registered ring and is not
+        // in use until this receive completes.
+        unsafe {
+            lane.qp.post_recv(
+                wr(WR_RING, lane.id, i),
+                lane.ring.ptr_at(i as usize * RING_SLOT),
+                RING_SLOT as u32,
+                lane.ring.lkey(),
+            )
+        }
+    }
+
+    fn qp_info(&self, lane: &Lane, psn: u32) -> QpInfo {
+        QpInfo {
+            qpn: lane.qp.num(),
+            psn,
+            gid: lane.local.gid,
+            mtu: lane.dev.mtu,
+        }
+    }
+
+    /// Server side of link setup: pair offered rails with ours by subnet.
+    fn accept(&self, peer: NodeId, req: FabricReq) -> FabricResp {
+        let FabricReq::Connect { lanes } = req;
+        let mut pairs = Vec::new();
+        let mut made = Vec::new();
+        for (i, offer) in lanes.iter().enumerate() {
+            let Some(rail) = self.rails.iter().find(|r| r.same_subnet(&offer.rail)) else {
+                continue;
+            };
+            if made.iter().any(|(r, _): &(Rail, Arc<Lane>)| r == rail) {
+                continue;
+            }
+            let lane = match self.new_lane(rail, peer) {
+                Ok(l) => l,
+                Err(e) => return FabricResp::Refused(e.to_string()),
+            };
+            let psn = rand::random::<u32>() & 0xff_ffff;
+            let mtu = lane.dev.mtu.min(offer.qp.mtu);
+            if let Err(e) = lane.qp.connect(rail.gid_index, psn, &offer.qp, mtu) {
+                return FabricResp::Refused(e.to_string());
+            }
+            pairs.push((i as u32, self.qp_info(&lane, psn)));
+            made.push((rail.clone(), lane));
+        }
+        if made.is_empty() {
+            return FabricResp::Refused("no rail shares a subnet".into());
+        }
+        let link = Arc::new(Link {
+            lanes: made.into_iter().map(|(_, l)| l).collect(),
+            next: AtomicU32::new(0),
+        });
+        if let Some(old) = self.links.lock().insert(peer, link) {
+            self.retire(&old);
+        }
+        tracing::info!(%peer, lanes = pairs.len(), "RDMA link accepted");
+        FabricResp::Accepted { pairs }
+    }
+
+    fn retire(&self, link: &Link) {
+        for l in &link.lanes {
+            l.dead.store(true, Ordering::SeqCst);
+            l.qp.set_error();
+        }
+    }
+
+    async fn link(&self, peer: NodeId) -> Result<Arc<Link>, NestError> {
+        if let Some(l) = self.links.lock().get(&peer).cloned()
+            && l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst))
+        {
+            return Ok(l);
+        }
+        let gate = self.connecting.lock().entry(peer).or_default().clone();
+        let _g = gate.lock().await;
+        if let Some(l) = self.links.lock().get(&peer).cloned()
+            && l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst))
+        {
+            return Ok(l);
+        }
+        let mut offers = Vec::new();
+        let mut lanes = Vec::new();
+        let mut psns = Vec::new();
+        for r in &self.rails {
+            let lane = self
+                .new_lane(r, peer)
+                .map_err(|e| NestError::Io(e.to_string()))?;
+            let psn = rand::random::<u32>() & 0xff_ffff;
+            offers.push(LaneOffer {
+                rail: r.clone(),
+                qp: self.qp_info(&lane, psn),
+            });
+            lanes.push(lane);
+            psns.push(psn);
+        }
+        let body = nest_rpc::encode(&FabricReq::Connect { lanes: offers })
+            .map_err(|e| NestError::Io(e.to_string()))?;
+        let resp = self
+            .rpc
+            .call(
+                peer,
+                nest_rpc::service::FABRIC,
+                body.into(),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|e| NestError::Unavailable(e.to_string()))?;
+        let resp: FabricResp = nest_rpc::decode(&resp).map_err(|e| NestError::Io(e.to_string()))?;
+        let pairs = match resp {
+            FabricResp::Accepted { pairs } => pairs,
+            FabricResp::Refused(why) => {
+                for l in &lanes {
+                    self.lanes.lock().remove(&l.id);
+                }
+                return Err(NestError::Unavailable(format!(
+                    "peer refused RDMA link: {why}"
+                )));
+            }
+        };
+        let mut used = Vec::new();
+        for (i, remote) in pairs {
+            let lane = lanes[i as usize].clone();
+            let mtu = lane.dev.mtu.min(remote.mtu);
+            lane.qp
+                .connect(lane.local.gid_index, psns[i as usize], &remote, mtu)
+                .map_err(|e| NestError::Io(e.to_string()))?;
+            used.push(lane);
+        }
+        for l in &lanes {
+            if !used.iter().any(|u| u.id == l.id) {
+                self.lanes.lock().remove(&l.id);
+            }
+        }
+        tracing::info!(%peer, lanes = used.len(), "RDMA link established");
+        let link = Arc::new(Link {
+            lanes: used,
+            next: AtomicU32::new(0),
+        });
+        if let Some(old) = self.links.lock().insert(peer, link.clone()) {
+            self.retire(&old);
+        }
+        Ok(link)
+    }
+
+    // ------------------------------------------------------------ client
+
+    /// Read `len` bytes (≤ chunk) of exactly `generation` from `peer`.
+    pub async fn read(
+        &self,
+        peer: NodeId,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: usize,
+    ) -> Result<ReadBuf, NestError> {
+        assert!(len <= self.cfg.chunk);
+        let link = self.link(peer).await?;
+        let lane = link.lanes
+            [link.next.fetch_add(1, Ordering::Relaxed) as usize % link.lanes.len()]
+        .clone();
+        let slot = lane.dev.landing.acquire().await;
+        let _permit = lane
+            .window
+            .acquire()
+            .await
+            .map_err(|_| NestError::Unavailable("lane closed".into()))?;
+        if lane.dead.load(Ordering::SeqCst) {
+            return Err(NestError::Unavailable("RDMA link failed".into()));
+        }
+        let (tx, rx) = oneshot::channel();
+        let key = (lane.dev.id, slot.index());
+        self.pending.lock().insert(key, (lane.id, tx));
+        let mut msg = [0u8; MSG_SIZE];
+        ReadReq {
+            slot: slot.index(),
+            file: file.0,
+            generation: generation.0,
+            offset,
+            len: len as u32,
+            addr: slot.addr(),
+            rkey: slot.rkey(),
+        }
+        .encode(&mut msg);
+        // SAFETY: inline send copies the message at post time.
+        let posted = unsafe {
+            lane.qp.post_send(
+                wr(WR_SEND, lane.id, 0),
+                msg.as_mut_ptr(),
+                MSG_SIZE as u32,
+                0,
+                true,
+            )
+        };
+        if let Err(e) = posted {
+            self.pending.lock().remove(&key);
+            self.fail_lane(&lane);
+            return Err(NestError::Unavailable(e.to_string()));
+        }
+        let r = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(NestError::Unavailable("RDMA link failed".into())),
+            Err(_) => {
+                self.pending.lock().remove(&key);
+                // The slot may still be written later: never reuse it on
+                // this lane. Retiring the link fences the NIC.
+                self.fail_lane(&lane);
+                std::mem::forget(slot);
+                return Err(NestError::Unavailable("RDMA read timed out".into()));
+            }
+        };
+        match r {
+            Ok(n) => {
+                self.stats.reads.fetch_add(1, Ordering::Relaxed);
+                self.stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(ReadBuf { slot, len: n })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Take a lane out of service: the QP enters the error state (so the
+    /// NIC stops touching its buffers) and requests sent on it fail.
+    fn fail_lane(&self, lane: &Lane) {
+        if !lane.dead.swap(true, Ordering::SeqCst) {
+            tracing::warn!(peer = %lane.peer, rail = %lane.local.addr, "RDMA lane failed");
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            lane.qp.set_error();
+            let mut p = self.pending.lock();
+            let keys: Vec<_> = p
+                .iter()
+                .filter(|(_, (l, _))| *l == lane.id)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in keys {
+                if let Some((_, tx)) = p.remove(&k) {
+                    let _ = tx.send(Err(NestError::Unavailable("RDMA link failed".into())));
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ completions
+
+    fn on_completion(self: &Arc<Self>, dev: &Arc<Device>, wc: &nf_wc) {
+        let (kind, lane_id, idx) = wr_parts(wc.wr_id);
+        let lane = self.lanes.lock().get(&lane_id).cloned();
+        if wc.status != 0 {
+            if let Some(l) = &lane {
+                if !l.dead.load(Ordering::SeqCst) {
+                    tracing::warn!(status = wc.status, kind, peer = %l.peer, "RDMA completion error");
+                }
+                self.fail_lane(l);
+            }
+            if kind == WR_WRITE {
+                self.in_flight.lock().remove(&wc.wr_id);
+            }
+            return;
+        }
+        match (kind, wc.opcode) {
+            (WR_RING, sys::NF_OP_RECV_IMM) => {
+                let slot = wc.imm >> IMM_LEN_BITS;
+                let len = (wc.imm & ((1 << IMM_LEN_BITS) - 1)) as usize;
+                if let Some((_, tx)) = self.pending.lock().remove(&(dev.id, slot)) {
+                    let _ = tx.send(Ok(len));
+                }
+                if let Some(l) = lane {
+                    let _ = self.post_ring(&l, idx);
+                }
+            }
+            (WR_RING, sys::NF_OP_RECV) => {
+                let Some(l) = lane else { return };
+                // SAFETY: the receive completed; the ring slot is ours until
+                // we repost it below.
+                let msg = unsafe { l.ring.slice(idx as usize * RING_SLOT, wc.byte_len as usize) }
+                    .to_vec();
+                let _ = self.post_ring(&l, idx);
+                match msg.first().copied() {
+                    Some(KIND_READ) if msg.len() >= 48 => self.serve(l, ReadReq::decode(&msg)),
+                    Some(KIND_ERR) if msg.len() >= 8 => {
+                        let slot = u32::from_le_bytes(msg[4..8].try_into().unwrap());
+                        if let Some((_, tx)) = self.pending.lock().remove(&(dev.id, slot)) {
+                            let _ = tx.send(Err(err_from(msg[1])));
+                        }
+                    }
+                    _ => tracing::warn!(peer = %l.peer, "unrecognized fabric message"),
+                }
+            }
+            (WR_WRITE, _) => {
+                self.in_flight.lock().remove(&wc.wr_id);
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------ server
+
+    fn serve(self: &Arc<Self>, lane: Arc<Lane>, req: ReadReq) {
+        let me = self.clone();
+        self.rt.spawn(async move {
+            let source = me.source.lock().as_ref().and_then(|w| w.upgrade());
+            let len = (req.len as usize).min(me.cfg.chunk);
+            let result = match source {
+                None => Err(NestError::Unavailable("not serving yet".into())),
+                Some(src) => {
+                    let slot = lane.dev.staging.acquire().await;
+                    let (slot, r) = src
+                        .read_into(
+                            FileId(req.file),
+                            Generation(req.generation),
+                            req.offset,
+                            len,
+                            slot,
+                        )
+                        .await;
+                    r.map(|n| (slot, n))
+                }
+            };
+            match result {
+                Ok((slot, n)) => {
+                    let id = wr(WR_WRITE, lane.id, slot.index());
+                    let (ptr, lkey) = (slot.ptr(), slot.lkey());
+                    me.in_flight.lock().insert(id, slot);
+                    let imm = (req.slot << IMM_LEN_BITS) | n as u32;
+                    // SAFETY: the staging slot stays alive in `in_flight`
+                    // until this write completes; the remote range is the
+                    // landing slot the client named for this request.
+                    let r = unsafe {
+                        lane.qp
+                            .post_write_imm(id, ptr, n as u32, lkey, req.addr, req.rkey, imm)
+                    };
+                    if r.is_err() {
+                        me.in_flight.lock().remove(&id);
+                        me.fail_lane(&lane);
+                    } else {
+                        me.stats.served.fetch_add(1, Ordering::Relaxed);
+                        me.stats.served_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    let mut msg = [0u8; MSG_SIZE];
+                    msg[0] = KIND_ERR;
+                    msg[1] = err_code(&e);
+                    msg[4..8].copy_from_slice(&req.slot.to_le_bytes());
+                    // SAFETY: inline send copies the message at post time.
+                    if unsafe {
+                        lane.qp
+                            .post_send(wr(WR_SEND, lane.id, 0), msg.as_mut_ptr(), 8, 0, true)
+                    }
+                    .is_err()
+                    {
+                        me.fail_lane(&lane);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Completion loop for one device: spin briefly, then sleep on the
+/// completion channel.
+fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
+    let mut wcs = [nf_wc::default(); 32];
+    let fd = dev.cq.fd();
+    let mut idle_spins = 0u32;
+    let mut armed = false;
+    while !stop.load(Ordering::Relaxed) {
+        let n = match dev.cq.poll(&mut wcs) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "polling CQ failed");
+                return;
+            }
+        };
+        if n > 0 {
+            idle_spins = 0;
+            let Some(f) = weak.upgrade() else { return };
+            for wc in &wcs[..n] {
+                f.on_completion(&dev, wc);
+            }
+            continue;
+        }
+        idle_spins += 1;
+        if idle_spins < 2000 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if !armed {
+            // Arm, then poll once more before sleeping: a completion that
+            // arrived between the last poll and arming raises no event.
+            if dev.cq.arm().is_err() {
+                return;
+            }
+            armed = true;
+            continue;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: valid pollfd for the duration of the call.
+        let r = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if r > 0 {
+            let _ = dev.cq.take_event();
+            armed = false;
+        }
+        idle_spins = 0;
+    }
+}

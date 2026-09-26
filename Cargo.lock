@@ -822,7 +822,20 @@ dependencies = [
 name = "nest-fabric"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "cc",
+ "futures",
+ "libc",
+ "nest-rpc",
  "nest-types",
+ "nix",
+ "parking_lot",
+ "rand 0.9.5",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
