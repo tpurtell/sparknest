@@ -52,6 +52,12 @@ fn auto() -> SealMode {
 pub struct ImportProgress {
     pub files: u64,
     pub bytes: u64,
+    /// Blobs the namespace already had: this node's file became a copy of
+    /// them (hard link, nothing copied).
+    #[serde(default)]
+    pub adopted: u64,
+    #[serde(default)]
+    pub adopted_bytes: u64,
     pub dirs: u64,
     pub symlinks: u64,
     pub skipped: u64,
@@ -60,6 +66,12 @@ pub struct ImportProgress {
 }
 
 const BATCH: usize = 256;
+
+/// Files under `blobs/` that are not content: the shared-blob layout's
+/// `.refs` hints and marker, which huggingface_hub rewrites in place.
+fn mutable_blob_sidecar(name: &[u8]) -> bool {
+    name.starts_with(b".") || name.ends_with(b".refs")
+}
 
 struct Pending {
     src: PathBuf,
@@ -184,6 +196,37 @@ pub async fn run(
                     progress.lock().skipped += 1; // interrupted downloads, stale locks
                     continue;
                 }
+                // Content-addressed blobs (named by their hash) that the
+                // namespace already has: adopt this file as a local copy.
+                let blob = in_blobs && !mutable_blob_sidecar(&name);
+                if blob {
+                    let existing = vfs
+                        .data()
+                        .with_reader(|c| query::lookup(c, id, &name))
+                        .map_err(sql)?;
+                    if let Some(file) = existing {
+                        match vfs.adopt_local(file, &path, md.len()).await {
+                            Ok(adopted) => {
+                                let mut p = progress.lock();
+                                if adopted {
+                                    p.adopted += 1;
+                                    p.adopted_bytes += md.len();
+                                } else {
+                                    p.skipped += 1;
+                                }
+                                drop(p);
+                                if opts.r#move {
+                                    let _ = std::fs::remove_file(&path);
+                                }
+                            }
+                            Err(err) => progress
+                                .lock()
+                                .errors
+                                .push(format!("{}: {err}", path.display())),
+                        }
+                        continue;
+                    }
+                }
                 pending.push(Pending {
                     src: path,
                     parent: id,
@@ -193,7 +236,7 @@ pub async fn run(
                     mtime: Timestamp(md.mtime() * 1_000_000_000 + md.mtime_nsec()),
                     seal: match seal_mode {
                         SealMode::All => true,
-                        SealMode::Blobs => in_blobs,
+                        SealMode::Blobs => blob,
                         _ => false,
                     },
                 });

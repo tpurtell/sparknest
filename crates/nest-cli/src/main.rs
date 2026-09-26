@@ -391,6 +391,13 @@ async fn wait_job(c: &Client, id: u64) -> Result<Value> {
             }
         }
         if let Some(ip) = v["import"].as_object() {
+            if ip["adopted"].as_u64().unwrap_or(0) > 0 {
+                line += &format!(
+                    "  {} existing blobs adopted ({}),",
+                    ip["adopted"],
+                    human(ip["adopted_bytes"].as_u64().unwrap_or(0))
+                );
+            }
             line += &format!(
                 "  {} files ({}), {} dirs, {} symlinks, {} skipped, {} errors",
                 ip["files"],

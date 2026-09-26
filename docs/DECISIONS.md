@@ -183,7 +183,7 @@ Validation target is huggingface_hub 2.0.x (what the user runs via Homebrew);
 the layout floor is 1.32, and 2.0 changed the HTTP stack and removed deprecated
 APIs without touching the cache format. Venv pins may lag as long as they are
 ≥ 1.32 for anything that downloads into the mount. The resolver reads any layout by
-following symlink chains to terminal files. `nest import --adopt` preserves
+following symlink chains to terminal files. `nest import` preserves
 legacy layouts unchanged. Sealing triggers on rename from `*.incomplete` under
 any `blobs/` directory. `trees/<commit>.json` drives completeness.
 
@@ -394,7 +394,14 @@ forces the owner to wait out its lease while serving nothing stale.
    "intent" ADR-013 anticipated, without a journal). `*.incomplete` and
    `*.lock` files are skipped. Seal mode `auto` seals files under `blobs/`
    below a rename-from-incomplete policy (refs/ and trees/ stay writable
-   because huggingface_hub rewrites them in place).
+   because huggingface_hub rewrites them in place; so do the shared
+   store's `.refs` hints and marker).
+   **Adoption.** A blob under `blobs/` whose path the namespace already
+   has, with the same size and a stable generation, becomes this node's
+   copy of it (hard link, then a conditional `PublishReplica`): blob names
+   are content hashes, so equal paths mean equal bytes. This is how each
+   Spark's existing cache joins without copying (2026-09-27). A size
+   mismatch is reported and the file left alone.
 6. **Management API** on a 0600 Unix socket; `nest` CLI uses only it.
    Nodes register their names in the stores table at startup.
 

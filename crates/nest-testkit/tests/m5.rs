@@ -314,3 +314,100 @@ async fn remove_and_readd_a_member() {
     c.converge().await;
     assert!(c.lookup(3, FileId::ROOT, "after-remove").is_some());
 }
+
+/// Migration: a second host's cache holds blobs the namespace already has.
+/// Its files become that host's copies (hard links, nothing copied); a blob
+/// whose size disagrees is refused; new blobs import normally; `.refs`
+/// hints and the shared-store marker stay writable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn import_on_another_host_adopts_blobs_the_namespace_has() {
+    let c = ready(3).await;
+    let n1 = c.node(1);
+    n1.vfs.mkdir(FileId::ROOT, b"hub", 0o755).await.unwrap();
+    let hub = c.lookup(1, FileId::ROOT, "hub").unwrap();
+    n1.meta
+        .propose(nest_meta::Command::SetSealPolicy {
+            dir: hub,
+            policy: SealPolicy::RenameFromIncomplete,
+            now: Timestamp::now(),
+        })
+        .await
+        .unwrap();
+
+    let src1 = c.state_dir(1).join("cache1");
+    make_hf_cache(&src1);
+    std::fs::write(src1.join("blobs/0f/0fweights.refs"), b"models--org--tiny\n").unwrap();
+    let p = run_import(&c, 1, src1, true).await;
+    assert!(p.errors.is_empty() && p.adopted == 0, "{p:?}");
+
+    let src2 = c.state_dir(2).join("cache2");
+    make_hf_cache(&src2);
+    std::fs::write(src2.join("blobs/0f/0fweights.refs"), b"models--org--tiny\n").unwrap();
+    let repo2 = src2.join("models--org--tiny");
+    std::fs::write(repo2.join("blobs/cfg2"), b"{\"v\"").unwrap(); // truncated
+    std::fs::write(repo2.join("blobs/cfg3"), b"{\"v\":3}").unwrap(); // new
+    let p = run_import(&c, 2, src2.clone(), false).await;
+    assert_eq!((p.adopted, p.files), (2, 1), "{p:?}");
+    assert_eq!(p.adopted_bytes, (3 << 20) + 7, "{p:?}");
+    assert!(
+        p.errors.len() == 1 && p.errors[0].contains("cfg2"),
+        "{:?}",
+        p.errors
+    );
+    // Linked, not copied: the source now has a second name in n2's store.
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(src2.join("blobs/0f/0fweights"))
+            .unwrap()
+            .nlink(),
+        2
+    );
+    c.converge().await;
+
+    let r = n1.meta.open_reader().unwrap();
+    let id = |p: &str| nest_place::selector::resolve_path(&r, p).unwrap().0;
+    let stores = |f: FileId| {
+        let mut s: Vec<u64> = nest_meta::query::replicas(&r, f)
+            .unwrap()
+            .iter()
+            .map(|x| x.store.0)
+            .collect();
+        s.sort();
+        s
+    };
+    assert_eq!(stores(id("/hub/blobs/0f/0fweights")), vec![1, 2]);
+    assert_eq!(stores(id("/hub/models--org--tiny/blobs/cfg1")), vec![1, 2]);
+    assert_eq!(stores(id("/hub/models--org--tiny/blobs/cfg2")), vec![1]);
+    assert_eq!(stores(id("/hub/models--org--tiny/blobs/cfg3")), vec![2]);
+    // n2 reads its adopted copy locally with the right bytes.
+    let w = id("/hub/blobs/0f/0fweights");
+    let (fh, _) = c.node(2).vfs.open(w, 0).await.unwrap();
+    let data = c.node(2).vfs.read(fh, 0, 4096).await.unwrap();
+    assert!(data.iter().all(|b| *b == 7));
+    c.node(2).vfs.release(fh, None).await;
+
+    let sealed = |p: &str| c.attr(1, id(p)).unwrap().sealed;
+    assert!(sealed("/hub/blobs/0f/0fweights"));
+    assert!(!sealed("/hub/blobs/0f/0fweights.refs"));
+    assert!(!sealed("/hub/blobs/.huggingface-shared-blobs"));
+}
+
+async fn run_import(
+    c: &TestCluster,
+    node: u64,
+    src: std::path::PathBuf,
+    mv: bool,
+) -> nest_place::import::ImportProgress {
+    let p = &c.node(node).placer;
+    let id = p.import(ImportOptions {
+        src,
+        dst: "/hub".into(),
+        r#move: mv,
+        seal: SealMode::Auto,
+    });
+    c.eventually("import done", Duration::from_secs(10), |c| {
+        c.node(node).placer.job(id).is_some_and(|j| j.finished)
+    })
+    .await;
+    p.import_progress(id).unwrap()
+}

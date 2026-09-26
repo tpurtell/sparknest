@@ -1737,6 +1737,62 @@ impl Vfs {
         }
     }
 
+    /// Register a local file as this node's copy of `file`'s current
+    /// generation by hard-linking it into the store: no bytes move. Only for
+    /// callers that know the contents are identical, such as
+    /// content-addressed Hugging Face blobs (the name is the hash). Checks
+    /// kind, stability and size; publication is conditional on the
+    /// generation. `Ok(false)` if this node already had a copy.
+    pub async fn adopt_local(
+        &self,
+        file: FileId,
+        src: &std::path::Path,
+        size: u64,
+    ) -> NestResult<bool> {
+        let a = self.raw_attr(file)?;
+        if a.kind != FileKind::Regular {
+            return Err(NestError::Invalid("not a regular file".into()));
+        }
+        if a.gen_state != GenState::Stable {
+            return Err(NestError::Busy("file is being written".into()));
+        }
+        if a.size != size {
+            return Err(NestError::Invalid(format!(
+                "{} bytes here but {} in the cluster; left alone",
+                size, a.size
+            )));
+        }
+        let me_store = self.me().live_store();
+        if self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
+            return Ok(false);
+        }
+        let key = ObjectKey::new(file, a.generation);
+        let store = self.d.store().clone();
+        let src = src.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            // An unpublished leftover under this key is never served.
+            let _ = store.delete(key);
+            store.link_from(&src, key)
+        })
+        .await
+        .map_err(|e| NestError::Io(e.to_string()))?
+        .map_err(|e| NestError::Io(e.to_string()))?;
+        match self
+            .propose(Command::PublishReplica {
+                file,
+                generation: a.generation,
+                store: me_store,
+            })
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let _ = self.d.store().delete(key);
+                Err(e)
+            }
+        }
+    }
+
     /// Copy exactly `a`'s generation into `dest` (committed into its objects,
     /// not published anywhere): from a local copy if this node has one, else
     /// from a holder over RDMA/TCP. `Stale` if the generation moved.
