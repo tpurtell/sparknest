@@ -336,3 +336,61 @@ async fn parallel_random_offset_writers() {
     .await;
     c.node(1).unmount();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn seal_through_an_extended_attribute() {
+    let Some((c, mp)) = cluster_with_mount(1).await else {
+        return;
+    };
+    let p = mp.join("weights.safetensors");
+    let p2 = p.clone();
+    blocking(move || fs::write(&p2, b"tensor").unwrap()).await;
+    let id = c
+        .lookup(1, nest_types::FileId::ROOT, "weights.safetensors")
+        .unwrap();
+    c.eventually("stable", std::time::Duration::from_secs(3), |c| {
+        c.attr(1, id).unwrap().gen_state == nest_types::GenState::Stable
+    })
+    .await;
+    blocking(move || {
+        use std::ffi::CString;
+        let path = CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        let name = CString::new("user.sparknest.sealed").unwrap();
+        let get = || {
+            let mut buf = [0u8; 8];
+            let n = unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                )
+            };
+            assert!(n > 0, "getxattr: {}", std::io::Error::last_os_error());
+            buf[..n as usize].to_vec()
+        };
+        assert_eq!(get(), b"0");
+        let r = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                b"1".as_ptr() as *const _,
+                1,
+                0,
+            )
+        };
+        assert_eq!(r, 0, "setxattr: {}", std::io::Error::last_os_error());
+        assert_eq!(get(), b"1");
+        assert_eq!(
+            OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(fs::read(&p).unwrap(), b"tensor");
+    })
+    .await;
+    c.node(1).unmount();
+}

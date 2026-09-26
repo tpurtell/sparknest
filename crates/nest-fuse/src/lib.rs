@@ -65,6 +65,9 @@ impl std::ops::Deref for Fs {
     }
 }
 
+/// Extended attribute that exposes (and sets) the seal bit.
+const SEAL_XATTR: &[u8] = b"user.sparknest.sealed";
+
 fn errno(e: &NestError) -> Errno {
     Errno::from_i32(e.errno())
 }
@@ -643,29 +646,68 @@ impl Filesystem for Fs {
         }
     }
 
-    fn getxattr(&self, _req: &Request, _i: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
-        reply.error(Errno::from_i32(libc::ENODATA));
+    fn getxattr(&self, _req: &Request, i: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        if name.as_bytes() != SEAL_XATTR {
+            return reply.error(Errno::from_i32(libc::ENODATA));
+        }
+        let inner = self.inner.clone();
+        self.spawn(async move {
+            match inner.vfs.getattr(fid(i)).await {
+                Ok(a) if a.kind == FileKind::Regular => {
+                    let v: &[u8] = if a.sealed { b"1" } else { b"0" };
+                    if size == 0 {
+                        reply.size(v.len() as u32)
+                    } else if (size as usize) < v.len() {
+                        reply.error(Errno::from_i32(libc::ERANGE))
+                    } else {
+                        reply.data(v)
+                    }
+                }
+                Ok(_) => reply.error(Errno::from_i32(libc::ENODATA)),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn listxattr(&self, _req: &Request, _i: INodeNo, size: u32, reply: ReplyXattr) {
+        // Advertise the seal attribute; listing values is by getxattr.
+        let list = [SEAL_XATTR, b"\0"].concat();
         if size == 0 {
-            reply.size(0);
+            reply.size(list.len() as u32);
+        } else if (size as usize) < list.len() {
+            reply.error(Errno::from_i32(libc::ERANGE));
         } else {
-            reply.data(&[]);
+            reply.data(&list);
         }
     }
 
+    /// `setfattr -n user.sparknest.sealed -v 1 FILE` seals a file (enforced
+    /// immutability; unlocks passthrough and page caching), `-v 0` unseals.
     fn setxattr(
         &self,
         _req: &Request,
-        _i: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
+        i: INodeNo,
+        name: &OsStr,
+        value: &[u8],
         _flags: i32,
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::from_i32(libc::ENOTSUP));
+        if name.as_bytes() != SEAL_XATTR {
+            return reply.error(Errno::from_i32(libc::ENOTSUP));
+        }
+        let sealed = match value {
+            b"1" | b"true" | b"yes" => true,
+            b"0" | b"false" | b"no" => false,
+            _ => return reply.error(Errno::EINVAL),
+        };
+        let vfs = self.vfs.clone();
+        self.spawn(async move {
+            match vfs.seal(fid(i), sealed).await {
+                Ok(_) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn removexattr(&self, _req: &Request, _i: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
