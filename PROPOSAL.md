@@ -266,11 +266,43 @@ allocations.
 
 ### 6.3 Write path
 
-Daemon-mediated, FUSE writeback cache off initially. Owner appends/pwrites to
-its object, tracks size and mtime, replies. Remote writers ship data over the
-fabric to the owner. `flush`/`fsync` are real: fsync the object, then commit a
-`SyncPoint`/size update if required. Large application writes are not one
-distributed transaction; the atomicity unit is the fabric request.
+Two write workloads exist and they are asymmetric:
+
+- **Downloads (hf_xet):** parallel random-offset `pwrite` from many threads
+  into one `.incomplete` file, but Internet-bound (1 Gbit today, 10 Gbit as an
+  upper bound: ≤ 1.25 GB/s). The download host creates the file, so it is the
+  owner; **these writes never cross the fabric**. The requirement is
+  correctness under concurrent offsets and staying out of the way, not
+  bandwidth.
+- **Remote writers** (a Spark writing a file owned elsewhere): rare in
+  practice, fabric-bound, owner-routed.
+
+Rules that follow:
+
+1. The registered RDMA arena is a **read and replication resource**. Local
+   writes never allocate from it. Remote writes use a small per-connection
+   write ring (or read-ring credits), sized in the low tens of MiB cluster-wide
+   and never grown by write concurrency.
+2. Writes are daemon-mediated with FUSE writeback cache off: each application
+   `pwrite` becomes one FUSE WRITE (≤ 1 MiB) that the owner applies directly to
+   its object file. No coalescing buffers, no per-file staging; the kernel page
+   cache of the object file is the only buffer. At 16k requests/s this is far
+   below FUSE limits.
+3. **Owner-local passthrough writes** (planned optimization, verify first):
+   when the opener already holds ownership (a file it just created, or a file
+   already `OWNED` by this node), open the handle as a writable passthrough to
+   the backing object so the kernel writes to NVMe with the daemon out of the
+   loop for the whole download. Ownership-acquire-on-first-write cannot be
+   observed through passthrough, so handles on `STABLE` files stay
+   daemon-mediated until the first write establishes ownership. Size/mtime are
+   taken from the backing file at fsync/release/getattr; confirm kernel 6.9+
+   attr refresh behaviour for passthrough writes before relying on it.
+4. `truncate`/`fallocate` preallocation (hf_xet may size the file up front)
+   is a mutation and acquires ownership like a write.
+
+`flush`/`fsync` are real: fsync the object, then commit a size/`SyncPoint`
+update if required. Large application writes are not one distributed
+transaction; the atomicity unit is one fabric request or one FUSE WRITE.
 
 ### 6.4 Model-loading reality
 
