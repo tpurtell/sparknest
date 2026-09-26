@@ -255,3 +255,30 @@ and exactly-once application of retried requests.
 
 **Consequences.** Everything openraft-specific lives in `nest-raft`; moving
 to 0.10 later is a one-crate change.
+
+## ADR-013 — Metadata write outcomes, rejoin, and reconcile-first recovery (2026-09-26)
+
+1. **Definite vs unknown write failures.** A leader whose last quorum
+   acknowledgement is older than the election timeout refuses proposals
+   without appending them, so `NoQuorum` (EROFS) means "not applied". If an
+   attempt may have reached a leader and the proposal deadline passes, the
+   error is `Unavailable("outcome unknown")` (EIO): the entry may still
+   commit later. Within the deadline, retries are safe because the state
+   machine deduplicates `(client, seq)`.
+2. **Nodes may lose their disk.** `loosen-follower-log-revert` is enabled so
+   a re-imaged node whose log went backwards does not panic the leader. It
+   rejoins and catches up by snapshot. Operationally, a node that lost its
+   disk should be removed and re-added (`nest cluster rejoin`, M5) so it
+   cannot cast a second vote in a term it already voted in.
+3. **Reconcile against committed state, not an intents journal.** Objects
+   keyed by `(file, generation)` let startup reconciliation resolve crash
+   windows from metadata alone: unexpected objects are deleted, a missing
+   working object is recovered from the previous generation and truncated
+   to the recorded size, missing replicas are retired, leftover ownerships
+   are finalized, and staging is discarded. Reconciliation waits until the
+   local state machine has re-applied everything the log had committed
+   before the crash (meta.sqlite uses synchronous=NORMAL). Only import by
+   rename needs a real intent (M5).
+4. **Caught-up gate.** A started node serves no object until it has passed
+   a leader read barrier, so an invalidation committed while it was down is
+   applied (fenced) before any read could use the stale copy.

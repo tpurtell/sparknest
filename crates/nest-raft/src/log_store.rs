@@ -39,6 +39,15 @@ impl LogStore {
         })
     }
 
+    /// The commit index persisted by the previous run, if any. Entries up
+    /// to it are re-applied at startup.
+    pub fn persisted_committed(&self) -> rusqlite::Result<Option<u64>> {
+        let c = self.db.lock();
+        Ok(Self::get_state::<Option<LogId>>(&c, "committed")?
+            .flatten()
+            .map(|l| l.index))
+    }
+
     async fn blocking<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,

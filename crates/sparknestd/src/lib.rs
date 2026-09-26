@@ -2,3 +2,6 @@
 //! so that `nest-testkit` can run several nodes in one process.
 
 pub mod config;
+mod node;
+
+pub use node::{Node, Tuning};

@@ -59,9 +59,14 @@ enum MetaReq {
 
 #[derive(Serialize, Deserialize)]
 enum MetaResp {
-    Written { index: u64, resp: Response },
+    Written {
+        index: u64,
+        resp: Response,
+    },
     ReadIndex(u64),
     NotLeader(Option<u64>),
+    /// Definitely not appended: the leader has lost contact with a quorum.
+    NoQuorum,
     Failed(String),
 }
 
@@ -72,19 +77,32 @@ pub struct MetaNode {
     meta_path: PathBuf,
     /// Identifies this process for request deduplication.
     client: u64,
+    /// Commit index recorded by the previous run.
+    startup_committed: u64,
     seq: AtomicU64,
 }
 
 struct MetaService {
     raft: Raft,
+    /// A leader that has not heard from a quorum for this long refuses new
+    /// writes instead of appending entries that may commit much later.
+    lease_ms: u64,
 }
 
 impl Handler for MetaService {
     fn call(&self, _peer: NodeId, body: Bytes) -> BoxFuture<'static, Result<Bytes, String>> {
         let raft = self.raft.clone();
+        let lease_ms = self.lease_ms;
         async move {
             let req: MetaReq = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
+            let stale_leader = {
+                let m = raft.metrics();
+                let m = m.borrow();
+                m.state == openraft::ServerState::Leader
+                    && m.millis_since_quorum_ack.is_none_or(|ms| ms > lease_ms)
+            };
             let resp = match req {
+                MetaReq::Propose(_) if stale_leader => MetaResp::NoQuorum,
                 MetaReq::Propose(r) => match raft.client_write(r).await {
                     Ok(w) => MetaResp::Written {
                         index: w.log_id.index,
@@ -122,6 +140,7 @@ impl MetaNode {
         std::fs::create_dir_all(&cfg.dir)
             .with_context(|| format!("creating {}", cfg.dir.display()))?;
         let log = LogStore::open(&cfg.dir.join("raft.sqlite")).context("opening raft log")?;
+        let startup_committed = log.persisted_committed()?.unwrap_or(0);
         let sm = StateMachine::open(&cfg.dir, handler).context("opening state machine")?;
         let meta_path = sm.meta_path().to_path_buf();
         let config = openraft::Config {
@@ -143,13 +162,20 @@ impl MetaNode {
         )
         .await?;
         network::register(&rpc, raft.clone());
-        rpc.register(service::META, Arc::new(MetaService { raft: raft.clone() }));
+        rpc.register(
+            service::META,
+            Arc::new(MetaService {
+                raft: raft.clone(),
+                lease_ms: cfg.election_max_ms,
+            }),
+        );
         Ok(Arc::new(MetaNode {
             cfg,
             raft,
             rpc,
             meta_path,
             client: rand::random(),
+            startup_committed,
             seq: AtomicU64::new(1),
         }))
     }
@@ -182,6 +208,16 @@ impl MetaNode {
             .last_applied
             .map(|l| l.index)
             .unwrap_or(0)
+    }
+
+    /// Wait until everything committed before the previous shutdown has been
+    /// re-applied locally. The local database may lag the durable log after
+    /// a power loss; nothing may be reconciled against it before this.
+    pub async fn wait_startup_replay(&self) -> Result<(), NestError> {
+        if self.startup_committed == 0 {
+            return Ok(());
+        }
+        self.wait_applied(self.startup_committed).await
     }
 
     /// Initialize a brand-new cluster with `members` (voters). Does nothing
@@ -223,6 +259,10 @@ impl MetaNode {
         let body: Bytes = nest_rpc::encode(req)
             .map_err(|e| NestError::Io(e.to_string()))?
             .into();
+        // Set when an attempt may have reached a leader without us learning
+        // the outcome. Retrying is safe (requests are deduplicated), but if
+        // the deadline passes the outcome is unknown, not "not applied".
+        let mut uncertain = false;
         loop {
             let target = hint.unwrap_or(self.cfg.node);
             self.learn_addr(target);
@@ -230,19 +270,41 @@ impl MetaNode {
                 .rpc
                 .call(target, service::META, body.clone(), Duration::from_secs(5))
                 .await;
-            let pause = match r.and_then(|b| nest_rpc::decode::<MetaResp>(&b)) {
-                Ok(MetaResp::NotLeader(Some(l))) if l != target.0 => {
-                    hint = Some(NodeId(l));
-                    Duration::ZERO
-                }
-                Ok(MetaResp::NotLeader(_)) | Ok(MetaResp::Failed(_)) | Err(_) => {
+            let pause = match r {
+                Ok(b) => match nest_rpc::decode::<MetaResp>(&b) {
+                    Ok(MetaResp::NotLeader(Some(l))) if l != target.0 => {
+                        hint = Some(NodeId(l));
+                        Duration::ZERO
+                    }
+                    Ok(MetaResp::NotLeader(_)) | Ok(MetaResp::NoQuorum) => {
+                        hint = self.leader().filter(|l| Some(*l) != hint);
+                        Duration::from_millis(50)
+                    }
+                    Ok(MetaResp::Failed(e)) => {
+                        // client_write failed inside the leader, e.g. it
+                        // stepped down mid-request: may or may not commit.
+                        tracing::debug!(error = %e, "proposal failed on leader; retrying");
+                        uncertain = true;
+                        hint = None;
+                        Duration::from_millis(50)
+                    }
+                    Ok(resp) => return Ok((target, resp)),
+                    Err(e) => return Err(NestError::Io(e.to_string())),
+                },
+                Err(e) => {
+                    if !e.not_delivered() {
+                        uncertain = true;
+                    }
                     hint = self.leader().filter(|l| Some(*l) != hint);
                     Duration::from_millis(50)
                 }
-                Ok(resp) => return Ok((target, resp)),
             };
             if Instant::now() + pause > deadline {
-                return Err(NestError::NoQuorum);
+                return Err(if uncertain {
+                    NestError::Unavailable("metadata write outcome unknown".into())
+                } else {
+                    NestError::NoQuorum
+                });
             }
             tokio::time::sleep(pause).await;
         }

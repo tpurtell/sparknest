@@ -770,7 +770,17 @@ dependencies = [
 name = "nest-data"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nest-meta",
+ "nest-raft",
+ "nest-rpc",
+ "nest-store",
  "nest-types",
+ "parking_lot",
+ "rusqlite",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -864,7 +874,18 @@ dependencies = [
 name = "nest-testkit"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nest-data",
+ "nest-meta",
+ "nest-raft",
+ "nest-store",
  "nest-types",
+ "openraft",
+ "rusqlite",
+ "sparknestd",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1431,7 +1452,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nest-data",
+ "nest-meta",
+ "nest-raft",
+ "nest-rpc",
+ "nest-store",
  "nest-types",
+ "openraft",
  "serde",
  "tokio",
  "toml",

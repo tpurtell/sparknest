@@ -35,7 +35,7 @@ serde_json = "1"
 toml = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
-openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "loosen-follower-log-revert"] }
 fuser = { version = "0.18", default-features = false }
 axum = "0.8"
 tonic = "0.14"

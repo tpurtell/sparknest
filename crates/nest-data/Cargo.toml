@@ -1,6 +1,6 @@
 [package]
 name = "nest-data"
-description = "Sessions, read grants, ranged reads, owner-routed writes, prefetch, transfers"
+description = "Node-local data service: replica lifecycle, sessions, orphans, reads/writes, transfers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,15 @@ license.workspace = true
 
 [dependencies]
 nest-types.workspace = true
+nest-meta.workspace = true
+nest-raft.workspace = true
+nest-store.workspace = true
+nest-rpc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

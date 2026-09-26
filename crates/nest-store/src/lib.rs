@@ -111,6 +111,15 @@ impl ObjectStore {
         Ok(fs::metadata(self.path(k))?.len())
     }
 
+    /// Size and modification time of an object.
+    pub fn stat(&self, k: ObjectKey) -> io::Result<(u64, nest_types::Timestamp)> {
+        let md = fs::metadata(self.path(k))?;
+        Ok((
+            md.len(),
+            nest_types::Timestamp::from_system_time(md.modified()?),
+        ))
+    }
+
     /// Create a new, empty object. Fails if it already exists.
     pub fn create(&self, k: ObjectKey) -> io::Result<File> {
         OpenOptions::new()

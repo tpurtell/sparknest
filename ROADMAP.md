@@ -11,7 +11,7 @@ raw CSV).
 - Cargo workspace with all crates stubbed; `scripts/build.sh`;
   `scripts/deploy-cluster.sh` (build on raptor + ostrich, push to all nodes);
   `packaging/` with systemd user unit, `node.toml` sample, fuse.conf note.
-- rustup on raptor and ostrich; vendored verbs bindings for amd64 and arm64.
+- Rust (Homebrew) on raptor and ostrich. Vendored verbs bindings moved to M4.
 - `docs/TOOLING.md` started. CI-free but `cargo test` and `cargo clippy` clean.
 
 ## M1 — Metadata core (nest-meta, nest-raft, nest-store)

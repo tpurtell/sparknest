@@ -221,6 +221,10 @@ async fn minority_cannot_write() {
     c.stop(others[0]).await;
     c.stop(others[1]).await;
     let meta = c.nodes[&leader].meta.clone();
+    // Once the leader's quorum lease lapses it refuses outright: the
+    // write is definitely not applied, so the answer is NoQuorum rather
+    // than "outcome unknown".
+    tokio::time::sleep(Duration::from_millis(600)).await;
     let mut cfg_deadline = tokio::time::Instant::now();
     cfg_deadline += Duration::from_secs(20);
     let r = tokio::time::timeout_at(cfg_deadline, meta.propose(mkdir("lonely")))
