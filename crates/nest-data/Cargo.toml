@@ -12,6 +12,7 @@ nest-meta.workspace = true
 nest-raft.workspace = true
 nest-store.workspace = true
 nest-rpc.workspace = true
+nest-fabric.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true

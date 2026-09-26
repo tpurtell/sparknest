@@ -14,6 +14,7 @@
 //!   owner-routed writes and whole-file transfers.
 
 mod local;
+mod readahead;
 mod remote;
 mod session;
 pub mod vfs;

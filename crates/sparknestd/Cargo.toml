@@ -21,6 +21,7 @@ nest-rpc.workspace = true
 nest-store.workspace = true
 nest-data.workspace = true
 nest-fuse.workspace = true
+nest-fabric.workspace = true
 openraft.workspace = true
 anyhow.workspace = true
 serde.workspace = true

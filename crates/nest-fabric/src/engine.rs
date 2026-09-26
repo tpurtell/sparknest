@@ -339,6 +339,28 @@ impl Fabric {
         self.cfg.chunk
     }
 
+    /// Landing slots free on the tightest device: speculative readahead only
+    /// uses spare slots so demanded reads always find one.
+    pub fn spare_landing(&self) -> usize {
+        self.devices
+            .iter()
+            .map(|d| d.landing.available())
+            .min()
+            .unwrap_or(0)
+    }
+
+    pub fn landing_slots(&self) -> usize {
+        self.cfg.client_slots as usize
+    }
+
+    /// Whether a working link to `peer` exists or can be tried.
+    pub fn has_link(&self, peer: NodeId) -> bool {
+        self.links
+            .lock()
+            .get(&peer)
+            .is_some_and(|l| l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst)))
+    }
+
     // ------------------------------------------------------------ lanes
 
     fn new_lane(&self, rail: &Rail, peer: NodeId) -> std::io::Result<Arc<Lane>> {

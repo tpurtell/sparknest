@@ -35,9 +35,11 @@ pub fn fast_tuning() -> Tuning {
             finalize_linger: Duration::from_millis(50),
             catch_up_wait: Duration::from_secs(5),
             rpc_timeout: Duration::from_secs(3),
+            readahead_chunks: 8,
         },
         lease: Duration::from_millis(800),
         mount: false,
+        fabric: None,
     }
 }
 

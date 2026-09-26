@@ -13,6 +13,7 @@ nest-store.workspace = true
 nest-data.workspace = true
 nest-raft.workspace = true
 sparknestd = { path = "../sparknestd" }
+nest-fabric.workspace = true
 openraft.workspace = true
 tokio.workspace = true
 tempfile.workspace = true

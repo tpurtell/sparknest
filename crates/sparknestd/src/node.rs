@@ -23,6 +23,8 @@ pub struct Tuning {
     pub lease: Duration,
     /// Mount the filesystem if the config names a mountpoint.
     pub mount: bool,
+    /// RDMA fabric settings; `None` disables it (TCP data path only).
+    pub fabric: Option<nest_fabric::FabricConfig>,
 }
 
 impl Default for Tuning {
@@ -37,6 +39,7 @@ impl Default for Tuning {
             vfs: VfsConfig::default(),
             lease: Duration::from_secs(2),
             mount: true,
+            fabric: Some(nest_fabric::FabricConfig::default()),
         }
     }
 }
@@ -48,6 +51,7 @@ pub struct Node {
     pub meta: Arc<MetaNode>,
     pub data: Arc<DataNode>,
     pub vfs: Arc<Vfs>,
+    pub fabric: Option<Arc<nest_fabric::Fabric>>,
     mounted: parking_lot::Mutex<Option<nest_fuse::Mounted>>,
 }
 
@@ -109,12 +113,38 @@ impl Node {
         let report = data.attach(meta.clone()).await?;
         tracing::info!(?report, "local store reconciled");
         let vfs = Vfs::new(data.clone(), tuning.vfs.clone());
+        let fabric = match (cfg.fabric.mode, &tuning.fabric) {
+            (crate::config::FabricMode::Tcp, _) | (_, None) => None,
+            (mode, Some(fc)) => {
+                let mut fc = fc.clone();
+                fc.devices = cfg.fabric.devices.clone();
+                match nest_fabric::Fabric::start(id, fc, rpc.clone()) {
+                    Ok(Some(f)) => {
+                        vfs.attach_fabric(f.clone());
+                        Some(f)
+                    }
+                    Ok(None) if mode == crate::config::FabricMode::Rdma => {
+                        anyhow::bail!("fabric.mode = rdma but no RoCE rail was found")
+                    }
+                    Ok(None) => {
+                        tracing::info!("no RoCE rail found; data path uses TCP");
+                        None
+                    }
+                    Err(e) if mode == crate::config::FabricMode::Rdma => return Err(e.into()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "RDMA fabric unavailable; data path uses TCP");
+                        None
+                    }
+                }
+            }
+        };
         let node = Node {
             cfg,
             rpc,
             meta,
             data,
             vfs,
+            fabric,
             mounted: parking_lot::Mutex::new(None),
         };
         if tuning.mount
@@ -150,6 +180,9 @@ impl Node {
 
     pub async fn shutdown(&self) {
         self.unmount();
+        if let Some(f) = &self.fabric {
+            f.shutdown();
+        }
         self.data.shutdown();
         self.meta.shutdown().await;
         self.rpc.shutdown();

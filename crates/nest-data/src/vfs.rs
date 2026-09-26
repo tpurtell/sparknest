@@ -48,6 +48,8 @@ pub struct VfsConfig {
     pub catch_up_wait: Duration,
     /// Timeout for data requests to other nodes.
     pub rpc_timeout: Duration,
+    /// Largest readahead window, in fabric chunks.
+    pub readahead_chunks: usize,
 }
 
 impl Default for VfsConfig {
@@ -56,6 +58,7 @@ impl Default for VfsConfig {
             finalize_linger: Duration::from_millis(250),
             catch_up_wait: Duration::from_secs(10),
             rpc_timeout: Duration::from_secs(10),
+            readahead_chunks: 16,
         }
     }
 }
@@ -95,6 +98,8 @@ struct Handle {
     lock_owners: Mutex<HashSet<u64>>,
     /// A remote owner this handle wrote through, to leave on close.
     remote: Mutex<Option<(NodeId, Epoch)>>,
+    /// Sequential readahead state for remote reads over the fabric.
+    readahead: tokio::sync::Mutex<Option<crate::readahead::Readahead>>,
 }
 
 /// This node's state for a file it owns.
@@ -126,6 +131,7 @@ pub struct Vfs {
     inflight: Mutex<HashMap<FileId, u32>>,
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
+    fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
 }
 
 fn io(e: std::io::Error) -> NestError {
@@ -187,6 +193,7 @@ impl Vfs {
             inflight: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
             fence_hooks: Mutex::new(Vec::new()),
+            fabric: Mutex::new(None),
         });
         d.meta().rpc().register(
             nest_rpc::service::DATA,
@@ -207,6 +214,19 @@ impl Vfs {
 
     pub fn data(&self) -> &Arc<DataNode> {
         &self.d
+    }
+
+    /// Use `fabric` for remote reads, and serve its requests from here.
+    pub fn attach_fabric(self: &Arc<Self>, fabric: Arc<nest_fabric::Fabric>) {
+        let src: Arc<dyn nest_fabric::ReadSource> = self.clone();
+        fabric.set_source(Arc::downgrade(&src));
+        // The fabric holds a Weak; keep the trait object alive with us.
+        std::mem::forget(src);
+        *self.fabric.lock() = Some(fabric);
+    }
+
+    pub fn fabric(&self) -> Option<Arc<nest_fabric::Fabric>> {
+        self.fabric.lock().clone()
     }
 
     /// Register a blocking page-cache invalidation run during fencing.
@@ -987,15 +1007,9 @@ impl Vfs {
         Inflight { vfs: self, file }
     }
 
-    /// Read bytes of exactly `generation` from this node, if it may serve it.
-    async fn serve_read(
-        &self,
-        file: FileId,
-        generation: Generation,
-        offset: u64,
-        len: u32,
-    ) -> NestResult<Vec<u8>> {
-        let _t = self.track(file);
+    /// The object holding exactly `generation` of `file`, if this node may
+    /// serve it right now (the rule every remote read goes through).
+    fn servable_object(&self, file: FileId, generation: Generation) -> NestResult<std::fs::File> {
         let a = self.raw_attr(file)?;
         if a.generation != generation {
             return Err(NestError::Stale);
@@ -1011,7 +1025,19 @@ impl Vfs {
                 "no copy of that generation here".into(),
             ));
         }
-        let f = self.d.store().open_read(key).map_err(io)?;
+        self.d.store().open_read(key).map_err(io)
+    }
+
+    /// Read bytes of exactly `generation` from this node, if it may serve it.
+    async fn serve_read(
+        &self,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: u32,
+    ) -> NestResult<Vec<u8>> {
+        let _t = self.track(file);
+        let f = self.servable_object(file, generation)?;
         tokio::task::spawn_blocking(move || pread(&f, offset, len))
             .await
             .expect("blocking task")
@@ -1029,6 +1055,7 @@ impl Vfs {
             reader: Mutex::new(None),
             lock_owners: Mutex::new(HashSet::new()),
             remote: Mutex::new(None),
+            readahead: tokio::sync::Mutex::new(None),
         });
         self.handles.lock().insert(fh, h);
         self.d.handle_opened(file);
@@ -1233,6 +1260,45 @@ impl Vfs {
                 continue;
             }
             for s in sources {
+                if let Some(fab) = self.fabric() {
+                    let r = {
+                        let mut ra = h.readahead.lock().await;
+                        if !ra
+                            .as_ref()
+                            .is_some_and(|r| r.matches(h.file, a.generation, s))
+                        {
+                            let size = (a.gen_state == GenState::Stable).then_some(a.size);
+                            *ra = Some(crate::readahead::Readahead::new(
+                                &fab,
+                                h.file,
+                                a.generation,
+                                s,
+                                self.cfg.readahead_chunks,
+                                size,
+                            ));
+                        }
+                        ra.as_mut()
+                            .expect("just set")
+                            .read(&fab, offset, size)
+                            .await
+                    };
+                    match r {
+                        Ok(b) => return Ok(b),
+                        Err(NestError::Stale) => {
+                            last = NestError::Stale;
+                            break; // generation moved: refresh
+                        }
+                        Err(NestError::NotFound) => {
+                            last = NestError::NotFound;
+                            continue;
+                        }
+                        Err(e) => {
+                            // Fabric trouble: fall back to TCP for this read.
+                            tracing::debug!(peer = %s, error = %e, "RDMA read failed; using TCP");
+                            *h.readahead.lock().await = None;
+                        }
+                    }
+                }
                 match self
                     .call(
                         s,
@@ -1465,6 +1531,44 @@ impl Vfs {
         let cap = self.d.store().capacity().map_err(io)?;
         let t = self.q(query::totals)?;
         Ok((cap, t.files + t.dirs))
+    }
+}
+
+impl nest_fabric::ReadSource for Vfs {
+    fn read_into(
+        &self,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: usize,
+        mut slot: nest_fabric::Slot,
+    ) -> futures::future::BoxFuture<'static, (nest_fabric::Slot, Result<usize, NestError>)> {
+        let me = self.arc();
+        Box::pin(async move {
+            let _t = me.track(file);
+            let f = match me.servable_object(file, generation) {
+                Ok(f) => f,
+                Err(e) => return (slot, Err(e)),
+            };
+            tokio::task::spawn_blocking(move || {
+                let buf = slot.as_mut_slice(len);
+                let mut done = 0;
+                let r = loop {
+                    if done == buf.len() {
+                        break Ok(done);
+                    }
+                    match f.read_at(&mut buf[done..], offset + done as u64) {
+                        Ok(0) => break Ok(done),
+                        Ok(n) => done += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => break Err(io(e)),
+                    }
+                };
+                (slot, r)
+            })
+            .await
+            .expect("blocking task")
+        })
     }
 }
 
