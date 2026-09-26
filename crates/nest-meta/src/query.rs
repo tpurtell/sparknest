@@ -414,3 +414,32 @@ pub fn path_of(c: &Connection, file: FileId) -> rusqlite::Result<Option<Vec<u8>>
     }
     Ok(None)
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BackupRow {
+    pub id: u64,
+    pub name: String,
+    pub store: StoreId,
+    pub created: Timestamp,
+    pub selector: String,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+pub fn backups(c: &Connection) -> rusqlite::Result<Vec<BackupRow>> {
+    let mut st = c.prepare_cached(
+        "SELECT id, name, store, created, selector, files, bytes FROM backups ORDER BY id",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(BackupRow {
+            id: r.get::<_, i64>(0)? as u64,
+            name: r.get(1)?,
+            store: StoreId(r.get::<_, i64>(2)? as u64),
+            created: Timestamp(r.get(3)?),
+            selector: r.get(4)?,
+            files: r.get::<_, i64>(5)? as u64,
+            bytes: r.get::<_, i64>(6)? as u64,
+        })
+    })?;
+    rows.collect()
+}

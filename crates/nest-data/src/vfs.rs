@@ -1720,12 +1720,35 @@ impl Vfs {
         if self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
             return Ok(0);
         }
-        let holders = self.holders(&a)?;
-        // A copy on this node (live store or another archive we gateway) is
-        // the cheapest source: copy it locally.
+        self.fetch_into(&a, &dest).await?;
+        let r = self
+            .propose(Command::PublishReplica {
+                file,
+                generation: a.generation,
+                store: me_store,
+            })
+            .await;
+        match r {
+            Ok(_) => Ok(a.size),
+            Err(e) => {
+                let _ = dest.delete(key);
+                Err(e)
+            }
+        }
+    }
+
+    /// Copy exactly `a`'s generation into `dest` (committed into its objects,
+    /// not published anywhere): from a local copy if this node has one, else
+    /// from a holder over RDMA/TCP. `Stale` if the generation moved.
+    pub async fn fetch_into(
+        &self,
+        a: &FileAttr,
+        dest: &Arc<nest_store::ObjectStore>,
+    ) -> NestResult<()> {
+        let holders = self.holders(a)?;
         let mut sources: Vec<Option<NodeId>> = Vec::new();
-        if let Some(local) = self.local_source(&a)
-            && !Arc::ptr_eq(&local, &dest)
+        if let Some(local) = self.local_source(a)
+            && !Arc::ptr_eq(&local, dest)
         {
             sources.push(None);
         }
@@ -1736,26 +1759,11 @@ impl Vfs {
         let mut last = NestError::Unavailable("no holder reachable".into());
         for src in sources {
             let copied = match src {
-                None => self.copy_local(&a, &dest).await,
-                Some(n) => self.copy_from(n, &a, &dest).await,
+                None => self.copy_local(a, dest).await,
+                Some(n) => self.copy_from(n, a, dest).await,
             };
             match copied {
-                Ok(()) => {
-                    let r = self
-                        .propose(Command::PublishReplica {
-                            file,
-                            generation: a.generation,
-                            store: me_store,
-                        })
-                        .await;
-                    return match r {
-                        Ok(_) => Ok(a.size),
-                        Err(e) => {
-                            let _ = dest.delete(key);
-                            Err(e)
-                        }
-                    };
-                }
+                Ok(()) => return Ok(()),
                 Err(NestError::Stale) => return Err(NestError::Stale),
                 Err(e) => last = e,
             }

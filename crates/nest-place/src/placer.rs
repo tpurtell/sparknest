@@ -82,6 +82,25 @@ pub struct Placer {
     dirty: Arc<tokio::sync::Notify>,
 }
 
+/// The leader snapshots metadata into every healthy archive store this often.
+const META_SNAPSHOT_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+async fn auto_meta_snapshots(p: std::sync::Weak<Placer>) {
+    loop {
+        tokio::time::sleep(META_SNAPSHOT_EVERY).await;
+        let Some(p) = p.upgrade() else { return };
+        if p.vfs.data().meta().leader() != Some(p.vfs.data().id()) {
+            continue;
+        }
+        for (_, name, _) in p.archive_stores().unwrap_or_default() {
+            match p.meta_snapshot(&name).await {
+                Ok(path) => tracing::info!(%path, "metadata snapshot written"),
+                Err(e) => tracing::warn!(store = %name, error = %e, "metadata snapshot failed"),
+            }
+        }
+    }
+}
+
 /// Quiet period after the last change before automatic rules are applied.
 const AUTO_DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -151,6 +170,7 @@ impl Placer {
             }
         }));
         tokio::spawn(auto_reconcile(Arc::downgrade(&p)));
+        tokio::spawn(auto_meta_snapshots(Arc::downgrade(&p)));
         // Record our name so rules and tools can say "raptor" (needs quorum;
         // retried until it lands).
         let me = vfs.data().id();
@@ -775,6 +795,194 @@ impl Placer {
             .await?;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------ backups
+
+    /// Start a job on one node and mirror its progress under `label`.
+    async fn remote_job(
+        self: &Arc<Self>,
+        what: String,
+        host: String,
+        node: NodeId,
+        req: impl FnOnce(u64) -> AdminReq,
+    ) -> NestResult<u64> {
+        let hid = rand::random::<u64>();
+        admin::call(self.rpc(), node, &req(hid), Duration::from_secs(30)).await?;
+        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let job = Arc::new(Mutex::new(ClusterJob {
+            id,
+            what,
+            ..Default::default()
+        }));
+        self.jobs.lock().insert(id, job.clone());
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match admin::call(
+                    me.rpc(),
+                    node,
+                    &AdminReq::JobStatus { job: hid },
+                    Duration::from_secs(10),
+                )
+                .await
+                {
+                    Ok(AdminResp::Job(p)) => {
+                        let done = p.finished;
+                        let failed = p.failed.len();
+                        let mut j = job.lock();
+                        j.hosts.insert(host.clone(), p);
+                        if done {
+                            j.finished = true;
+                            if failed > 0 {
+                                j.error = Some(format!("{failed} entries failed"));
+                            }
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "polling job failed"),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+        Ok(id)
+    }
+
+    fn selector_root(&self, sel: &Selector) -> String {
+        match sel {
+            Selector::Path { path } => path.clone(),
+            Selector::Hf {
+                hub,
+                repo,
+                repo_type,
+                ..
+            } => {
+                let prefix = if repo_type == "dataset" {
+                    "datasets"
+                } else {
+                    "models"
+                };
+                format!(
+                    "{}/{prefix}--{}",
+                    hub.trim_end_matches('/'),
+                    repo.replace('/', "--")
+                )
+            }
+        }
+    }
+
+    /// Back up a selection into archive store `store` (retained, versioned).
+    pub async fn backup_create(
+        self: &Arc<Self>,
+        sel: Selector,
+        name: String,
+        store: String,
+    ) -> NestResult<u64> {
+        let t = self
+            .resolve_targets(std::slice::from_ref(&store))
+            .await?
+            .pop()
+            .ok_or(NestError::NotFound)?;
+        if !nest_data::is_archive(t.store) {
+            return Err(NestError::Invalid(format!(
+                "{store:?} is not an archive store"
+            )));
+        }
+        let root = self.selector_root(&sel);
+        let st = t.store;
+        self.remote_job(
+            format!("backup {} -> {store} as {name}", sel.describe()),
+            t.name,
+            t.node,
+            move |job| AdminReq::BackupCreate {
+                job,
+                name,
+                root,
+                store: st,
+            },
+        )
+        .await
+    }
+
+    fn backup_store(&self, id: u64) -> NestResult<(StoreId, String)> {
+        let rows = query::backups(&self.conn()?).map_err(sql)?;
+        let b = rows
+            .into_iter()
+            .find(|b| b.id == id)
+            .ok_or(NestError::NotFound)?;
+        let name = self
+            .archive_stores()?
+            .into_iter()
+            .find(|(s, _, _)| *s == b.store)
+            .map(|(_, n, _)| n)
+            .ok_or(NestError::NotFound)?;
+        Ok((b.store, name))
+    }
+
+    pub async fn backup_restore(self: &Arc<Self>, id: u64, dst: String) -> NestResult<u64> {
+        let (store, name) = self.backup_store(id)?;
+        let t = self
+            .resolve_targets(std::slice::from_ref(&name))
+            .await?
+            .pop()
+            .ok_or(NestError::NotFound)?;
+        self.remote_job(
+            format!("restore backup {id} -> {dst}"),
+            t.name,
+            t.node,
+            move |job| AdminReq::BackupRestore {
+                job,
+                id,
+                store,
+                dst,
+            },
+        )
+        .await
+    }
+
+    pub async fn backup_delete(&self, id: u64) -> NestResult<u64> {
+        let (store, name) = self.backup_store(id)?;
+        let t = self
+            .resolve_targets(std::slice::from_ref(&name))
+            .await?
+            .pop()
+            .ok_or(NestError::NotFound)?;
+        match admin::call(
+            self.rpc(),
+            t.node,
+            &AdminReq::BackupDelete { id, store },
+            Duration::from_secs(600),
+        )
+        .await?
+        {
+            AdminResp::Removed(n) => Ok(n),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
+    }
+
+    pub fn backups(&self) -> NestResult<Vec<query::BackupRow>> {
+        query::backups(&self.conn()?).map_err(sql)
+    }
+
+    /// Snapshot metadata into an archive store (through a healthy gateway).
+    pub async fn meta_snapshot(&self, store: &str) -> NestResult<String> {
+        let t = self
+            .resolve_targets(&[store.to_string()])
+            .await?
+            .pop()
+            .ok_or(NestError::NotFound)?;
+        match admin::call(
+            self.rpc(),
+            t.node,
+            &AdminReq::MetaSnapshot { store: t.store },
+            Duration::from_secs(600),
+        )
+        .await?
+        {
+            AdminResp::Path(p) => Ok(format!("{}:{p}", t.name)),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
     }
 
     // ------------------------------------------------------------ membership

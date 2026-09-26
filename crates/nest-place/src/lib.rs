@@ -12,6 +12,7 @@
 //! Rules are the only authorization to create copies; reading never does.
 
 pub mod admin;
+pub mod backup;
 pub mod import;
 pub mod placer;
 pub mod selector;

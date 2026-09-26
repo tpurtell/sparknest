@@ -225,6 +225,18 @@ fn format_is_pinned() {
             "DeleteRule",
         ),
         (Command::Batch(vec![]), "Batch"),
+        (
+            Command::RecordBackup {
+                name: String::new(),
+                store: StoreId(1),
+                selector: String::new(),
+                files: 0,
+                bytes: 0,
+                now: t,
+            },
+            "RecordBackup",
+        ),
+        (Command::DeleteBackup { id: 0 }, "DeleteBackup"),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");
@@ -259,6 +271,7 @@ fn format_is_pinned() {
     assert_eq!(tag(&Reply::Batch(vec![])), 9);
     assert_eq!(tag(&Reply::Revision(1)), 7);
     assert_eq!(tag(&Reply::FileIds(f)), 8);
+    assert_eq!(tag(&Reply::Backup(1)), 10);
     let errs = [
         NestError::NotFound,
         NestError::Exists,

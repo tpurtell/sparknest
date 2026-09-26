@@ -5,7 +5,25 @@ use std::path::Path;
 
 /// Bumped whenever the schema changes. Snapshots carry the version so a node
 /// never installs a snapshot it cannot read.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Migrations from version N to N+1, applied in order at open.
+const MIGRATIONS: &[(i64, &str)] = &[(
+    1,
+    r#"
+-- Retained, versioned backups of selections (ADR-021). The manifest and
+-- objects live in the archive store; this row is the catalog entry.
+CREATE TABLE IF NOT EXISTS backups (
+    id       INTEGER PRIMARY KEY,
+    name     TEXT    NOT NULL,
+    store    INTEGER NOT NULL,
+    created  INTEGER NOT NULL,
+    selector TEXT    NOT NULL,
+    files    INTEGER NOT NULL,
+    bytes    INTEGER NOT NULL
+);
+"#,
+)];
 
 const SCHEMA: &str = r#"
 CREATE TABLE files (
@@ -153,17 +171,55 @@ fn init(conn: &Connection) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     match version {
         0 => {
+            let all: String = MIGRATIONS.iter().map(|(_, m)| *m).collect();
             conn.execute_batch(&format!(
-                "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                "BEGIN; {SCHEMA} {all} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
             ))?;
             Ok(())
         }
         SCHEMA_VERSION => Ok(()),
+        v if v > 0 && v < SCHEMA_VERSION => {
+            for (from, sql) in MIGRATIONS.iter().filter(|(f, _)| *f >= v) {
+                conn.execute_batch(&format!(
+                    "BEGIN; {sql} PRAGMA user_version = {}; COMMIT;",
+                    from + 1
+                ))?;
+            }
+            Ok(())
+        }
         other => Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
             Some(format!(
                 "meta schema version {other}, expected {SCHEMA_VERSION}"
             )),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_1_databases_migrate_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("meta.sqlite");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(&format!("BEGIN; {SCHEMA} PRAGMA user_version = 1; COMMIT;"))
+                .unwrap();
+            c.execute("INSERT INTO kv (k, v) VALUES ('probe', 7)", [])
+                .unwrap();
+        }
+        let c = open_write(&p).unwrap();
+        let v: i64 = c
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        c.execute("INSERT INTO backups (name, store, created, selector, files, bytes) VALUES ('b', 1, 0, 's', 0, 0)", []).unwrap();
+        let probe: i64 = c
+            .query_row("SELECT v FROM kv WHERE k = 'probe'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(probe, 7, "existing data survives");
     }
 }

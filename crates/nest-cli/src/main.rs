@@ -76,6 +76,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RuleCmd,
     },
+    /// Retained backups and metadata snapshots.
+    Backup {
+        #[command(subcommand)]
+        cmd: BackupCmd,
+    },
     /// Archive stores.
     Store {
         #[command(subcommand)]
@@ -121,6 +126,38 @@ enum Cmd {
         seal: String,
         #[arg(long)]
         wait: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BackupCmd {
+    /// Capture a selection into an archive store (retained; later writes
+    /// and deletes never touch it).
+    Create {
+        selector: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    Ls,
+    /// Recreate a backup under a namespace directory.
+    Restore {
+        id: u64,
+        dst: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Delete a backup and content no other backup needs.
+    Rm {
+        id: u64,
+    },
+    /// Snapshot the metadata into an archive store now.
+    Meta {
+        #[arg(long)]
+        store: String,
     },
 }
 
@@ -562,6 +599,59 @@ async fn main() -> Result<()> {
             }
             RuleCmd::Rm { name } => {
                 c.call(Method::DELETE, &format!("/v1/rules/{}", enc(name)), None)
+                    .await?
+            }
+        },
+        Cmd::Backup { cmd } => match cmd {
+            BackupCmd::Create {
+                selector,
+                name,
+                store,
+                wait,
+            } => {
+                let v = c
+                    .post(
+                        "/v1/backups",
+                        json!({ "selector": abspath(selector), "name": name, "store": store }),
+                    )
+                    .await?;
+                let id = v["job"].as_u64().unwrap_or(0);
+                if *wait { wait_job(&c, id).await? } else { v }
+            }
+            BackupCmd::Ls => {
+                let v = c.get("/v1/backups").await?;
+                if !cli.json {
+                    for b in v["backups"].as_array().into_iter().flatten() {
+                        println!(
+                            "{:>4}  {:<20} {:<10} {:>6} files {:>10}  {}",
+                            b["id"],
+                            b["name"].as_str().unwrap_or(""),
+                            b["store"].as_str().unwrap_or("?"),
+                            b["files"],
+                            human(b["bytes"].as_u64().unwrap_or(0)),
+                            b["selector"].as_str().unwrap_or("")
+                        );
+                    }
+                    return Ok(());
+                }
+                v
+            }
+            BackupCmd::Restore { id, dst, wait } => {
+                let v = c
+                    .post(
+                        &format!("/v1/backups/{id}/restore"),
+                        json!({ "dst": abspath(dst) }),
+                    )
+                    .await?;
+                let jid = v["job"].as_u64().unwrap_or(0);
+                if *wait { wait_job(&c, jid).await? } else { v }
+            }
+            BackupCmd::Rm { id } => {
+                c.call(Method::DELETE, &format!("/v1/backups/{id}"), None)
+                    .await?
+            }
+            BackupCmd::Meta { store } => {
+                c.post("/v1/backups/meta", json!({ "store": store }))
                     .await?
             }
         },

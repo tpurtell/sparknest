@@ -454,3 +454,27 @@ it grows, the API contract does not change.
 across nodes and archive stores; clicking a cell copies there or removes
 from there), Files (browse with copy locations, seal toggle, copy-to),
 Rules (create, apply, delete), Jobs (live progress).
+
+## ADR-021 — Backups, metadata snapshots and offline export (2026-09-26)
+
+1. **Backups are not replicas.** A backup captures a selection's structure
+   (directories, symlinks, files, modes, times) into an archive store:
+   `backups/manifests/<id>.sqlite` plus content in `backups/objects/`, keyed
+   by (file, generation) and shared by every backup that captured that
+   generation. Live writes, deletes and invalidations never touch them.
+   Catalog rows live in replicated metadata (`backups` table, schema v2).
+2. **Consistency.** Each file is copied at its exact generation (reads are
+   generation-fenced); a file being written is reported and the backup is
+   not recorded rather than recorded inconsistently.
+3. **Restore** recreates the capture under a destination as new files,
+   relative to the capture's common base directory, so symlinks between an
+   HF repo and its shared blobs keep resolving.
+4. **Delete** removes the manifest and every object no remaining manifest
+   in that store references.
+5. **Metadata snapshots**: the leader writes `meta/meta-<unix>-<index>.sqlite`
+   into every healthy archive store every 6 h (14 kept); `nest backup meta`
+   does it on demand.
+6. **Offline export**: `sparknestd export --meta SNAPSHOT --objects DIR...
+   --out DIR [--path P] [--link]` rebuilds any subtree as a plain directory
+   tree from a snapshot and any object directories (live stores, archive
+   roots, backup areas), with no cluster running.

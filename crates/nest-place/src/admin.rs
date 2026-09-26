@@ -79,6 +79,26 @@ pub(crate) enum AdminReq {
     },
     /// Run on the leader: change Raft membership.
     Membership(MembershipChange),
+    /// Run on a gateway of `store`: back up the tree at `root`.
+    BackupCreate {
+        job: u64,
+        name: String,
+        root: String,
+        store: StoreId,
+    },
+    BackupRestore {
+        job: u64,
+        id: u64,
+        store: StoreId,
+        dst: String,
+    },
+    BackupDelete {
+        id: u64,
+        store: StoreId,
+    },
+    MetaSnapshot {
+        store: StoreId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,11 +123,13 @@ pub(crate) enum AdminResp {
         removed: u64,
         refused: Vec<(FileId, String)>,
     },
+    Removed(u64),
+    Path(String),
     Err(String),
 }
 
 pub struct Admin {
-    vfs: Arc<Vfs>,
+    pub(crate) vfs: Arc<Vfs>,
     name: String,
     mountpoint: Option<String>,
     jobs: Mutex<HashMap<u64, Arc<Mutex<JobProgress>>>>,
@@ -204,6 +226,25 @@ impl Admin {
         });
     }
 
+    fn area(
+        &self,
+        store: StoreId,
+    ) -> Result<(Arc<nest_data::Archive>, Arc<crate::backup::BackupArea>), String> {
+        let d = self.vfs.data();
+        let arch = d
+            .archive(store)
+            .ok_or("this node cannot reach that store (not a gateway, or unmounted)")?;
+        let area = crate::backup::BackupArea::open(std::path::Path::new(&arch.config.path), d.id())
+            .map_err(|e| e.to_string())?;
+        Ok((arch, Arc::new(area)))
+    }
+
+    fn track_job(&self, job: u64) -> Arc<Mutex<JobProgress>> {
+        let p = Arc::new(Mutex::new(JobProgress::default()));
+        self.jobs.lock().insert(job, p.clone());
+        p
+    }
+
     async fn evict(&self, files: Vec<FileId>, store: StoreId) -> AdminResp {
         let mut removed = 0;
         let mut refused = Vec::new();
@@ -274,6 +315,68 @@ impl Handler for AdminService {
                     None => AdminResp::Err(format!("no job {job}")),
                 },
                 AdminReq::Evict { files, store } => a.evict(files, store).await,
+                AdminReq::BackupCreate {
+                    job,
+                    name,
+                    root,
+                    store,
+                } => match a.area(store) {
+                    Ok((_, area)) => {
+                        let p = a.track_job(job);
+                        let vfs = a.vfs.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::backup::create(vfs, area, store, name, root, p.clone()).await
+                            {
+                                let mut g = p.lock();
+                                g.failed.push((FileId(0), e.to_string()));
+                                g.finished = true;
+                            }
+                        });
+                        AdminResp::Started
+                    }
+                    Err(e) => AdminResp::Err(e),
+                },
+                AdminReq::BackupRestore {
+                    job,
+                    id,
+                    store,
+                    dst,
+                } => match a.area(store) {
+                    Ok((_, area)) => {
+                        let p = a.track_job(job);
+                        let vfs = a.vfs.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::backup::restore(vfs, area, id, dst, p.clone()).await
+                            {
+                                let mut g = p.lock();
+                                g.failed.push((FileId(0), e.to_string()));
+                                g.finished = true;
+                            }
+                        });
+                        AdminResp::Started
+                    }
+                    Err(e) => AdminResp::Err(e),
+                },
+                AdminReq::BackupDelete { id, store } => match a.area(store) {
+                    Ok((_, area)) => match crate::backup::delete(a.vfs.clone(), area, id).await {
+                        Ok(n) => AdminResp::Removed(n),
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    },
+                    Err(e) => AdminResp::Err(e),
+                },
+                AdminReq::MetaSnapshot { store } => match a.area(store) {
+                    Ok((arch, _)) => match crate::backup::meta_snapshot(
+                        &a.vfs,
+                        std::path::Path::new(&arch.config.path),
+                        14,
+                    ) {
+                        Ok(p) => AdminResp::Path(p.to_string_lossy().into_owned()),
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    },
+                    Err(e) => AdminResp::Err(e),
+                },
                 AdminReq::Membership(change) => {
                     let meta = a.vfs.data().meta().clone();
                     let r = match change {

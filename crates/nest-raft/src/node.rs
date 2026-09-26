@@ -196,6 +196,29 @@ impl MetaNode {
         &self.rpc
     }
 
+    /// Write a consistent copy of the local metadata to `dest` (VACUUM INTO)
+    /// and return the log index it reflects. The copy is a complete
+    /// namespace at that point, usable offline (`sparknestd export`).
+    pub fn snapshot_to(&self, dest: &std::path::Path) -> rusqlite::Result<u64> {
+        let c = self.open_reader()?;
+        c.execute("VACUUM INTO ?1", rusqlite::params![dest.to_string_lossy()])?;
+        let copy = rusqlite::Connection::open_with_flags(
+            dest,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let last: Option<Vec<u8>> = copy
+            .query_row("SELECT v FROM sm_state WHERE k = 'last_applied'", [], |r| {
+                r.get(0)
+            })
+            .ok();
+        let idx = last
+            .and_then(|b| postcard::from_bytes::<Option<crate::LogId>>(&b).ok())
+            .flatten()
+            .map(|l| l.index)
+            .unwrap_or(0);
+        Ok(idx)
+    }
+
     /// A read-only connection to the local materialized metadata.
     pub fn open_reader(&self) -> rusqlite::Result<rusqlite::Connection> {
         nest_meta::open_read(&self.meta_path)

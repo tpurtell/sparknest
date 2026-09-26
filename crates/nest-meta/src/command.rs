@@ -216,6 +216,20 @@ pub enum Command {
     /// Apply several commands in one log entry. Each sub-command succeeds or
     /// fails on its own.
     Batch(Vec<Command>),
+
+    // ---- appended after format 1 (ADR-018: append only) -------------------
+    /// Catalog a completed backup whose manifest and objects are in `store`.
+    RecordBackup {
+        name: String,
+        store: StoreId,
+        selector: String,
+        files: u64,
+        bytes: u64,
+        now: Timestamp,
+    },
+    DeleteBackup {
+        id: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,4 +327,6 @@ pub enum Reply {
     /// First of a reserved block of file ids.
     FileIds(FileId),
     Batch(Vec<Result<Reply, nest_types::NestError>>),
+    /// Id of a newly cataloged backup (appended after format 1).
+    Backup(u64),
 }

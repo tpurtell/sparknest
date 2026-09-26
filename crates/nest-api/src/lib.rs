@@ -133,6 +133,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/import", post(import))
         .route("/v1/stores", get(stores).post(add_store))
         .route("/v1/offload", post(offload))
+        .route("/v1/backups", get(backups).post(backup_create))
+        .route("/v1/backups/{id}/restore", post(backup_restore))
+        .route("/v1/backups/{id}", axum::routing::delete(backup_delete))
+        .route("/v1/backups/meta", post(meta_snapshot))
         .route("/v1/hf", get(hf_repos))
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
@@ -627,5 +631,68 @@ async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
 async fn web_info(State(api): State<Api>) -> R<serde_json::Value> {
     Ok(Json(
         json!({ "addr": api.web_addr, "token": api.web_token }),
+    ))
+}
+
+async fn backups(State(api): State<Api>) -> R<serde_json::Value> {
+    let stores: HashMap<u64, String> = api
+        .placer
+        .archive_stores()?
+        .into_iter()
+        .map(|(id, n, _)| (id.0, n))
+        .collect();
+    let list: Vec<serde_json::Value> = api
+        .placer
+        .backups()?
+        .into_iter()
+        .map(|b| json!({ "id": b.id, "name": b.name, "store": stores.get(&b.store.0), "created": b.created.0 / 1_000_000_000,
+            "selector": b.selector, "files": b.files, "bytes": b.bytes }))
+        .collect();
+    Ok(Json(json!({ "backups": list })))
+}
+
+#[derive(Deserialize)]
+struct BackupReq {
+    selector: String,
+    name: String,
+    store: String,
+}
+
+async fn backup_create(State(api): State<Api>, Json(r): Json<BackupReq>) -> R<serde_json::Value> {
+    let sel = api.selector(&r.selector)?;
+    Ok(Json(
+        json!({ "job": api.placer.backup_create(sel, r.name, r.store).await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RestoreReq {
+    dst: String,
+}
+
+async fn backup_restore(
+    State(api): State<Api>,
+    Path(id): Path<u64>,
+    Json(r): Json<RestoreReq>,
+) -> R<serde_json::Value> {
+    Ok(Json(
+        json!({ "job": api.placer.backup_restore(id, api.ns(&r.dst)).await? }),
+    ))
+}
+
+async fn backup_delete(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json::Value> {
+    Ok(Json(
+        json!({ "deleted": id, "objects_removed": api.placer.backup_delete(id).await? }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct MetaReq {
+    store: String,
+}
+
+async fn meta_snapshot(State(api): State<Api>, Json(r): Json<MetaReq>) -> R<serde_json::Value> {
+    Ok(Json(
+        json!({ "snapshot": api.placer.meta_snapshot(&r.store).await? }),
     ))
 }

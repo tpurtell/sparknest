@@ -236,6 +236,33 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
             });
             Ok(Reply::Done)
         }
+        Command::RecordBackup {
+            name,
+            store,
+            selector,
+            files,
+            bytes,
+            now,
+        } => {
+            let id: i64 = c
+                .prepare_cached(
+                    "INSERT INTO backups (name, store, created, selector, files, bytes) VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
+                )?
+                .query_row(
+                    params![name, store.0 as i64, now.0, selector, *files as i64, *bytes as i64],
+                    |r| r.get(0),
+                )?;
+            Ok(Reply::Backup(id as u64))
+        }
+        Command::DeleteBackup { id } => {
+            let n = c
+                .prepare_cached("DELETE FROM backups WHERE id = ?1")?
+                .execute(params![*id as i64])?;
+            if n == 0 {
+                return err(NestError::NotFound);
+            }
+            Ok(Reply::Done)
+        }
         Command::SetRule {
             name,
             spec,

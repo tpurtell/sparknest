@@ -22,6 +22,31 @@ struct Args {
     /// Raft state yet. Use on exactly one node, once.
     #[arg(long)]
     bootstrap: bool,
+    #[command(subcommand)]
+    cmd: Option<Sub>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Sub {
+    /// Disaster recovery without a cluster: rebuild the namespace (or part
+    /// of it) as a plain directory tree from a metadata snapshot and object
+    /// directories (live stores, archive stores, backup areas).
+    Export {
+        /// Metadata snapshot (an archive's meta/meta-*.sqlite, or meta.sqlite).
+        #[arg(long)]
+        meta: PathBuf,
+        /// Directories holding objects/ (repeatable).
+        #[arg(long = "objects", required = true)]
+        objects: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        /// Namespace subtree to export.
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Hard-link instead of copying where possible.
+        #[arg(long)]
+        link: bool,
+    },
 }
 
 #[tokio::main]
@@ -33,6 +58,37 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+    if let Some(Sub::Export {
+        meta,
+        objects,
+        out,
+        path,
+        link,
+    }) = &args.cmd
+    {
+        let r = sparknestd::export::run(&sparknestd::export::ExportArgs {
+            meta: meta.clone(),
+            objects: objects.clone(),
+            out: out.clone(),
+            path: path.clone(),
+            link: *link,
+        })?;
+        println!(
+            "exported {} dirs, {} files ({} bytes), {} symlinks",
+            r.dirs, r.files, r.bytes, r.symlinks
+        );
+        if !r.missing.is_empty() {
+            println!(
+                "{} files had no object in the given directories:",
+                r.missing.len()
+            );
+            for m in r.missing.iter().take(50) {
+                println!("  {m}");
+            }
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     let cfg = Config::load(&args.config)?;
     tracing::info!(node = %cfg.node.name, id = %cfg.node.id, cluster = %cfg.cluster.name, "configuration loaded");
     if args.check {

@@ -175,3 +175,138 @@ async fn shared_store_with_several_gateways() {
         .unwrap();
     assert!(ready[0].ready);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn backups_survive_edits_restore_and_export_offline() {
+    let c = ready(3).await;
+    let p = &c.node(1).placer;
+    let nas = c.state_dir(1).join("nas-backups");
+    std::fs::create_dir_all(&nas).unwrap();
+    p.add_store("nas", nas.to_str().unwrap(), &["@all".into()])
+        .await
+        .unwrap();
+
+    // A small HF-shaped tree on n2: a blob, a snapshot symlink, a ref.
+    let v2 = &c.node(2).vfs;
+    let repo = v2.mkdir(FileId::ROOT, b"repo", 0o755).await.unwrap().id;
+    let blobs = v2.mkdir(repo, b"blobs", 0o755).await.unwrap().id;
+    let snap = v2.mkdir(repo, b"snap", 0o755).await.unwrap().id;
+    let write = |parent: FileId, name: &'static [u8], data: Vec<u8>| {
+        let v2 = v2.clone();
+        async move {
+            let (a, fh, _) = v2
+                .create(parent, name, 0o644, oflags::WRONLY | oflags::EXCL)
+                .await
+                .unwrap();
+            v2.write(fh, 0, data).await.unwrap();
+            v2.release(fh, None).await;
+            a.id
+        }
+    };
+    let blob = write(blobs, b"abc123", vec![5u8; 3 << 20]).await;
+    let refm = write(repo, b"main", b"v1".to_vec()).await;
+    v2.symlink(snap, b"model.bin", b"../blobs/abc123")
+        .await
+        .unwrap();
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        [blob, refm].iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+
+    // Back up, then change the live tree.
+    let job = p
+        .backup_create(
+            Selector::parse("/repo", "/hub").unwrap(),
+            "before-edit".into(),
+            "nas".into(),
+        )
+        .await
+        .unwrap();
+    let j = wait_job(&c, job).await;
+    assert!(j.error.is_none(), "{j:?}");
+    let backups = p.backups().unwrap();
+    assert_eq!((backups.len(), backups[0].files), (1, 2));
+    let (fh, _) = v2.open(refm, oflags::WRONLY | oflags::TRUNC).await.unwrap();
+    v2.write(fh, 0, b"v2".to_vec()).await.unwrap();
+    v2.release(fh, None).await;
+
+    // Restore elsewhere: the old bytes and the symlink come back.
+    let job = p
+        .backup_restore(backups[0].id, "/restored".into())
+        .await
+        .unwrap();
+    let j = wait_job(&c, job).await;
+    assert!(j.error.is_none(), "{j:?}");
+    c.converge().await;
+    let v3 = &c.node(3).vfs;
+    let read = |path: &'static str| {
+        let c = &c;
+        async move {
+            let r = c.node(3).meta.open_reader().unwrap();
+            let (id, _) = nest_place::selector::resolve_path(&r, path).unwrap();
+            drop(r);
+            let (fh, _) = v3.open(id, 0).await.unwrap();
+            let b = v3.read(fh, 0, 4 << 20).await.unwrap();
+            v3.release(fh, None).await;
+            b
+        }
+    };
+    assert_eq!(read("/restored/repo/main").await, b"v1");
+    assert_eq!(
+        read("/restored/repo/blobs/abc123").await,
+        vec![5u8; 3 << 20]
+    );
+    {
+        let r = c.node(3).meta.open_reader().unwrap();
+        let (l, _) =
+            nest_place::selector::resolve_path(&r, "/restored/repo/snap/model.bin").unwrap();
+        assert_eq!(
+            nest_meta::query::readlink(&r, l).unwrap().unwrap(),
+            b"../blobs/abc123"
+        );
+    }
+    assert_eq!(
+        read("/repo/main").await,
+        b"v2",
+        "live tree untouched by restore"
+    );
+
+    // A second backup reuses the unchanged blob; deleting the first keeps it.
+    let job = p
+        .backup_create(
+            Selector::parse("/repo", "/hub").unwrap(),
+            "after-edit".into(),
+            "nas".into(),
+        )
+        .await
+        .unwrap();
+    assert!(wait_job(&c, job).await.error.is_none());
+    let removed = p.backup_delete(backups[0].id).await.unwrap();
+    assert_eq!(removed, 1, "only the old ref generation is unreferenced");
+
+    // Offline export from a metadata snapshot and raw object directories.
+    let snap_path = p.meta_snapshot("nas").await.unwrap();
+    let snap_file = snap_path.split_once(':').unwrap().1.to_string();
+    let out = c.state_dir(1).join("exported");
+    let r = nest_testkit::sparknestd::export::run(&nest_testkit::sparknestd::export::ExportArgs {
+        meta: snap_file.into(),
+        objects: vec![c.state_dir(1), c.state_dir(2), c.state_dir(3), nas.clone()],
+        out: out.clone(),
+        path: "/repo".into(),
+        link: true,
+    })
+    .unwrap();
+    assert!(r.missing.is_empty(), "{:?}", r.missing);
+    assert_eq!(std::fs::read(out.join("main")).unwrap(), b"v2");
+    assert_eq!(
+        std::fs::read(out.join("snap/model.bin")).unwrap(),
+        vec![5u8; 3 << 20]
+    );
+    assert_eq!(
+        std::fs::read_link(out.join("snap/model.bin")).unwrap(),
+        std::path::PathBuf::from("../blobs/abc123")
+    );
+}
