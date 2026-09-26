@@ -241,3 +241,70 @@ pub fn totals(c: &Connection) -> rusqlite::Result<Totals> {
         },
     )
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockRow {
+    pub session: SessionId,
+    pub owner: u64,
+    pub start: u64,
+    pub end: u64,
+    pub write: bool,
+    pub pid: u32,
+}
+
+/// The first lock held by someone other than `(session, owner)` that
+/// conflicts with a request for `[start, end]` (write conflicts with
+/// anything; read conflicts with write).
+pub fn lock_conflict(
+    c: &Connection,
+    file: FileId,
+    session: SessionId,
+    owner: u64,
+    start: u64,
+    end: u64,
+    write: bool,
+) -> rusqlite::Result<Option<LockRow>> {
+    c.prepare_cached(
+        "SELECT session, owner, start, end_, kind, pid FROM locks WHERE file = ?1 \
+         AND NOT (session = ?2 AND owner = ?3) AND start <= ?5 AND end_ >= ?4 AND (kind = 1 OR ?6) \
+         ORDER BY start LIMIT 1",
+    )?
+    .query_row(
+        params![
+            file.0 as i64,
+            session.0 as i64,
+            owner as i64,
+            start as i64,
+            end as i64,
+            write
+        ],
+        |r| {
+            Ok(LockRow {
+                session: SessionId(r.get::<_, i64>(0)? as u64),
+                owner: r.get::<_, i64>(1)? as u64,
+                start: r.get::<_, i64>(2)? as u64,
+                end: r.get::<_, i64>(3)? as u64,
+                write: r.get::<_, i64>(4)? == 1,
+                pid: r.get::<_, i64>(5)? as u32,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn locks_of(c: &Connection, file: FileId) -> rusqlite::Result<Vec<LockRow>> {
+    let mut st = c.prepare_cached(
+        "SELECT session, owner, start, end_, kind, pid FROM locks WHERE file = ?1 ORDER BY session, owner, start",
+    )?;
+    let rows = st.query_map(params![file.0 as i64], |r| {
+        Ok(LockRow {
+            session: SessionId(r.get::<_, i64>(0)? as u64),
+            owner: r.get::<_, i64>(1)? as u64,
+            start: r.get::<_, i64>(2)? as u64,
+            end: r.get::<_, i64>(3)? as u64,
+            write: r.get::<_, i64>(4)? == 1,
+            pid: r.get::<_, i64>(5)? as u32,
+        })
+    })?;
+    rows.collect()
+}

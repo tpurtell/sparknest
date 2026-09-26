@@ -54,6 +54,10 @@ pub enum Effect {
     AttrChanged {
         file: FileId,
     },
+    /// Locks on `file` were released; blocked lockers should retry.
+    LocksReleased {
+        file: FileId,
+    },
     SessionOpened {
         session: SessionId,
         node: NodeId,

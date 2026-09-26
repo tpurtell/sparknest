@@ -19,6 +19,6 @@ pub mod query;
 pub mod schema;
 
 pub use apply::apply;
-pub use command::{Command, CreateReply, RenameFlags, Reply, StoreClass};
+pub use command::{Command, CreateReply, LockKind, RenameFlags, Reply, StoreClass};
 pub use effect::Effect;
 pub use schema::{open_memory, open_read, open_write};

@@ -8,3 +8,4 @@ license.workspace = true
 
 [dependencies]
 nest-types.workspace = true
+fuser.workspace = true

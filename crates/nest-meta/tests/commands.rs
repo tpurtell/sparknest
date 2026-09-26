@@ -629,3 +629,71 @@ fn stores_register() {
         Err(NestError::Exists)
     );
 }
+
+fn lock(
+    db: &mut Db,
+    f: FileId,
+    s: SessionId,
+    owner: u64,
+    start: u64,
+    end: u64,
+    kind: nest_meta::LockKind,
+) -> Result<Reply, NestError> {
+    db.run(Command::SetLock {
+        file: f,
+        session: s,
+        owner,
+        start,
+        end,
+        kind,
+        pid: 1,
+    })
+    .0
+}
+
+#[test]
+fn advisory_locks() {
+    use nest_meta::LockKind::*;
+    let mut db = Db::new();
+    let s1 = db.session(1);
+    let s2 = db.session(2);
+    let f = db.file(ROOT, "hub.lock", 1, 0);
+    // flock-style whole-file exclusive lock, as huggingface's filelock uses.
+    lock(&mut db, f.id, s1, 10, 0, u64::MAX, Write).unwrap();
+    assert_eq!(
+        lock(&mut db, f.id, s2, 20, 0, u64::MAX, Write),
+        Err(NestError::WouldBlock)
+    );
+    assert_eq!(
+        lock(&mut db, f.id, s2, 20, 5, 5, Read),
+        Err(NestError::WouldBlock)
+    );
+    // Same owner may convert its own lock.
+    lock(&mut db, f.id, s1, 10, 0, u64::MAX, Read).unwrap();
+    lock(&mut db, f.id, s2, 20, 0, 99, Read).unwrap();
+    assert_eq!(
+        lock(&mut db, f.id, s2, 21, 50, 60, Write),
+        Err(NestError::WouldBlock)
+    );
+    // Unlocking a middle range splits the owner's lock.
+    lock(&mut db, f.id, s1, 10, 100, 199, Unlock).unwrap();
+    let rows = query::locks_of(&db.c, f.id).unwrap();
+    let mine: Vec<(u64, u64)> = rows
+        .iter()
+        .filter(|r| r.owner == 10)
+        .map(|r| (r.start, r.end))
+        .collect();
+    assert_eq!(mine, vec![(0, 99), (200, i64::MAX as u64)]);
+    lock(&mut db, f.id, s2, 22, 150, 160, Write).unwrap();
+    // Close releases everything the owner holds on the file.
+    let (_, fx) = db.run(Command::ReleaseLocks {
+        file: f.id,
+        session: s1,
+        owner: 10,
+    });
+    assert_eq!(fx, vec![Effect::LocksReleased { file: f.id }]);
+    // Session expiry releases the rest.
+    let (_, fx) = db.run(Command::ExpireSession { session: s2 });
+    assert!(fx.contains(&Effect::LocksReleased { file: f.id }));
+    assert!(query::locks_of(&db.c, f.id).unwrap().is_empty());
+}

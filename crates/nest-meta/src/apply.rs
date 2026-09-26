@@ -1,6 +1,6 @@
 //! Deterministic application of commands to the metadata database.
 
-use crate::command::{Command, CreateReply, RenameFlags, Reply, StoreClass};
+use crate::command::{Command, CreateReply, LockKind, RenameFlags, Reply, StoreClass};
 use crate::effect::Effect;
 use crate::query::{self, ATTR_COLS, attr_from_row};
 use nest_types::{
@@ -168,6 +168,30 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
         Command::ReleaseOrphans { session, files } => {
             for f in files {
                 release_orphan(c, *f, *session, fx)?;
+            }
+            Ok(Reply::Done)
+        }
+        Command::SetLock {
+            file,
+            session,
+            owner,
+            start,
+            end,
+            kind,
+            pid,
+        } => set_lock(c, *file, *session, *owner, *start, *end, *kind, *pid, fx),
+        Command::ReleaseLocks {
+            file,
+            session,
+            owner,
+        } => {
+            let n = c
+                .prepare_cached(
+                    "DELETE FROM locks WHERE file = ?1 AND session = ?2 AND owner = ?3",
+                )?
+                .execute(params![file.0 as i64, session.0 as i64, *owner as i64])?;
+            if n > 0 {
+                fx.push(Effect::LocksReleased { file: *file });
             }
             Ok(Reply::Done)
         }
@@ -339,6 +363,8 @@ fn delete_file(c: &Connection, f: FileId, fx: &mut Vec<Effect>) -> R<()> {
         .execute(params![f.0 as i64])?;
     c.prepare_cached("DELETE FROM orphans WHERE file = ?1")?
         .execute(params![f.0 as i64])?;
+    c.prepare_cached("DELETE FROM locks WHERE file = ?1")?
+        .execute(params![f.0 as i64])?;
     c.prepare_cached("DELETE FROM files WHERE id = ?1")?
         .execute(params![f.0 as i64])?;
     fx.push(Effect::FileDeleted { file: f });
@@ -376,6 +402,19 @@ fn expire_session(c: &Connection, s: SessionId, fx: &mut Vec<Effect>) -> R<bool>
     let Some(node) = node else { return Ok(false) };
     for f in query::orphans_of(c, s)? {
         release_orphan(c, f, s, fx)?;
+    }
+    let mut st = c.prepare_cached("DELETE FROM locks WHERE session = ?1 RETURNING file")?;
+    let files: Vec<i64> = st
+        .query_map(params![s.0 as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(st);
+    let mut files = files;
+    files.sort();
+    files.dedup();
+    for f in files {
+        fx.push(Effect::LocksReleased {
+            file: FileId(f as u64),
+        });
     }
     fx.push(Effect::SessionExpired {
         session: s,
@@ -989,6 +1028,100 @@ fn retire_replica(
         generation,
         store,
     });
+    Ok(Reply::Done)
+}
+
+// ---------------------------------------------------------------- locks
+
+/// Lock ranges are stored inclusive; `u64::MAX` (EOF) is stored as
+/// `i64::MAX` so SQLite comparisons stay in signed range.
+fn lk(v: u64) -> i64 {
+    v.min(i64::MAX as u64) as i64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_lock(
+    c: &Connection,
+    file: FileId,
+    session: SessionId,
+    owner: u64,
+    start: u64,
+    end: u64,
+    kind: LockKind,
+    pid: u32,
+    fx: &mut Vec<Effect>,
+) -> R<Reply> {
+    if end < start {
+        return err(NestError::Invalid("lock range end before start".into()));
+    }
+    attr(c, file)?;
+    let (start, end) = (lk(start), lk(end));
+    if kind != LockKind::Unlock {
+        let write = kind == LockKind::Write;
+        if query::lock_conflict(c, file, session, owner, start as u64, end as u64, write)?.is_some()
+        {
+            return err(NestError::WouldBlock);
+        }
+    }
+    // Carve [start, end] out of this owner's existing ranges on the file,
+    // keeping the parts outside it.
+    let mut st = c.prepare_cached(
+        "DELETE FROM locks WHERE file = ?1 AND session = ?2 AND owner = ?3 AND start <= ?5 AND end_ >= ?4 \
+         RETURNING start, end_, kind, pid",
+    )?;
+    let removed: Vec<(i64, i64, i64, i64)> = st
+        .query_map(
+            params![file.0 as i64, session.0 as i64, owner as i64, start, end],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(st);
+    let mut ins = c.prepare_cached(
+        "INSERT OR REPLACE INTO locks (file, session, owner, start, end_, kind, pid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (s0, e0, k0, p0) in &removed {
+        if *s0 < start {
+            ins.execute(params![
+                file.0 as i64,
+                session.0 as i64,
+                owner as i64,
+                s0,
+                start - 1,
+                k0,
+                p0
+            ])?;
+        }
+        if *e0 > end {
+            ins.execute(params![
+                file.0 as i64,
+                session.0 as i64,
+                owner as i64,
+                end + 1,
+                e0,
+                k0,
+                p0
+            ])?;
+        }
+    }
+    match kind {
+        LockKind::Unlock => {}
+        LockKind::Read | LockKind::Write => {
+            let k = i64::from(kind == LockKind::Write);
+            ins.execute(params![
+                file.0 as i64,
+                session.0 as i64,
+                owner as i64,
+                start,
+                end,
+                k,
+                pid as i64
+            ])?;
+        }
+    }
+    // Releasing or downgrading may unblock someone.
+    if !removed.is_empty() && kind != LockKind::Write {
+        fx.push(Effect::LocksReleased { file });
+    }
     Ok(Reply::Done)
 }
 

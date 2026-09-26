@@ -23,6 +23,7 @@ enum Op {
     Seal(u8, bool),
     OpenSession(u8),
     Release(u8, u8),
+    Lock(u8, u8, u8, u8, u8),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -48,6 +49,14 @@ fn op() -> impl Strategy<Value = Op> {
         (any::<u8>(), any::<bool>()).prop_map(|(a, b)| Op::Seal(a, b)),
         any::<u8>().prop_map(Op::OpenSession),
         (any::<u8>(), any::<u8>()).prop_map(|(a, b)| Op::Release(a, b)),
+        (
+            any::<u8>(),
+            any::<u8>(),
+            any::<u8>(),
+            any::<u8>(),
+            any::<u8>()
+        )
+            .prop_map(|(a, b, c, d, e)| Op::Lock(a, b, c, d, e)),
     ]
 }
 
@@ -178,6 +187,30 @@ fn to_command(db: &mut Db, op: &Op) -> Option<Command> {
             now,
         },
         Op::OpenSession(x) => Command::OpenSession { node: node(x), now },
+        Op::Lock(f, s, o, r, k) => {
+            let sessions = query::sessions(&db.c).unwrap();
+            if sessions.is_empty() {
+                return None;
+            }
+            let start = (r % 8) as u64 * 10;
+            Command::SetLock {
+                file: pick_file(db, f)?.id,
+                session: sessions[s as usize % sessions.len()].id,
+                owner: (o % 3) as u64,
+                start,
+                end: if r % 5 == 0 {
+                    u64::MAX
+                } else {
+                    start + (r as u64 % 25)
+                },
+                kind: [
+                    nest_meta::LockKind::Read,
+                    nest_meta::LockKind::Write,
+                    nest_meta::LockKind::Unlock,
+                ][k as usize % 3],
+                pid: 1,
+            }
+        }
         Op::Release(s, f) => {
             let sessions = query::sessions(&db.c).unwrap();
             if sessions.is_empty() {

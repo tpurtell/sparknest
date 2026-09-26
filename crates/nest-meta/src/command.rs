@@ -137,6 +137,26 @@ pub enum Command {
         files: Vec<FileId>,
     },
 
+    // ---- advisory locks -------------------------------------------------
+    /// Set, change or clear (`kind == Unlock`) a byte-range lock held by
+    /// `(session, owner)`. Fails with `WouldBlock` on conflict; nothing
+    /// changes then. Ranges are inclusive; `end == u64::MAX` means EOF.
+    SetLock {
+        file: FileId,
+        session: SessionId,
+        owner: u64,
+        start: u64,
+        end: u64,
+        kind: LockKind,
+        pid: u32,
+    },
+    /// Drop every lock `(session, owner)` holds on `file` (close/flush).
+    ReleaseLocks {
+        file: FileId,
+        session: SessionId,
+        owner: u64,
+    },
+
     // ---- stores ---------------------------------------------------------
     RegisterStore {
         name: String,
@@ -155,6 +175,14 @@ pub enum Command {
 pub struct RenameFlags {
     pub noreplace: bool,
     pub exchange: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockKind {
+    Read,
+    Write,
+    Unlock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

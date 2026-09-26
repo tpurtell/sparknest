@@ -56,6 +56,22 @@ pub fn check(c: &Connection) -> rusqlite::Result<Vec<String>> {
         "orphan row for dead session",
     )?;
     q(
+        "SELECT printf('file %d session %d', l.file, l.session) FROM locks l LEFT JOIN sessions s ON s.id = l.session LEFT JOIN files f ON f.id = l.file WHERE s.id IS NULL OR f.id IS NULL",
+        "lock held by dead session or on missing file",
+    )?;
+    q(
+        "SELECT printf('file %d: %d/%d [%d,%d] vs %d/%d [%d,%d]', a.file, a.session, a.owner, a.start, a.end_, b.session, b.owner, b.start, b.end_) \
+         FROM locks a JOIN locks b ON a.file = b.file \
+         WHERE (a.session < b.session OR (a.session = b.session AND a.owner < b.owner)) \
+         AND a.start <= b.end_ AND b.start <= a.end_ AND (a.kind = 1 OR b.kind = 1)",
+        "conflicting locks",
+    )?;
+    q(
+        "SELECT printf('file %d owner %d/%d at %d', a.file, a.session, a.owner, b.start) FROM locks a JOIN locks b \
+         ON a.file = b.file AND a.session = b.session AND a.owner = b.owner AND a.start < b.start AND a.end_ >= b.start",
+        "overlapping ranges of one owner",
+    )?;
+    q(
         "SELECT printf('file %d gen %d store %d', r.file, r.gen, r.store) FROM replicas r LEFT JOIN files f ON f.id = r.file WHERE f.id IS NULL OR f.kind != 1",
         "replica of missing file",
     )?;

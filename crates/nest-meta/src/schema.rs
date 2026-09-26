@@ -67,6 +67,21 @@ CREATE TABLE orphans (
 ) WITHOUT ROWID;
 CREATE INDEX orphans_session ON orphans(session);
 
+-- Advisory locks (fcntl and flock), cluster-wide. `owner` is the kernel's
+-- lock owner id, unique per node; with `session` it identifies the holder.
+-- Ranges are inclusive; `end_` = u64::MAX as i64 means to end of file.
+CREATE TABLE locks (
+    file    INTEGER NOT NULL,
+    session INTEGER NOT NULL,
+    owner   INTEGER NOT NULL,
+    start   INTEGER NOT NULL,
+    end_    INTEGER NOT NULL,
+    kind    INTEGER NOT NULL,   -- 0 read (shared), 1 write (exclusive)
+    pid     INTEGER NOT NULL,
+    PRIMARY KEY (file, session, owner, start)
+) WITHOUT ROWID;
+CREATE INDEX locks_session ON locks(session);
+
 CREATE TABLE stores (
     id     INTEGER PRIMARY KEY,
     name   TEXT    NOT NULL UNIQUE,
