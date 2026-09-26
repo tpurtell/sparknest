@@ -72,6 +72,13 @@ struct Iov([libc::iovec; 2]);
 unsafe impl Send for Iov {}
 unsafe impl Sync for Iov {}
 
+/// Serve a READ without leaving the queue thread, straight into the ring
+/// payload: `(fh, offset, buf)` → bytes read, or a positive errno; `None`
+/// sends the request down the normal dispatch path.
+pub type ReadFast = Arc<dyn Fn(u64, u64, &mut [u8]) -> Option<Result<usize, i32>> + Send + Sync>;
+
+const FUSE_READ: u32 = 15;
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub queues: AtomicUsize,
@@ -204,6 +211,7 @@ pub fn start(
     max_write: usize,
     max_pages: usize,
     stats: Arc<Stats>,
+    read_fast: ReadFast,
 ) -> io::Result<usize> {
     let n = possible_cpus();
     let payload = payload_size(max_write, max_pages);
@@ -213,9 +221,10 @@ pub fn start(
         let dispatcher = dispatcher.clone();
         let tx = tx.clone();
         let stats = stats.clone();
+        let read_fast = read_fast.clone();
         std::thread::Builder::new()
             .name(format!("fuse-uring-{cpu}"))
-            .spawn(move || run_queue(cpu, fd, payload, dispatcher, stats, tx))?;
+            .spawn(move || run_queue(cpu, fd, payload, dispatcher, stats, read_fast, tx))?;
     }
     drop(tx);
     let mut ok = 0;
@@ -254,6 +263,7 @@ fn run_queue(
     payload: usize,
     dispatcher: RingDispatcher,
     stats: Arc<Stats>,
+    read_fast: ReadFast,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     pin(cpu);
@@ -378,6 +388,10 @@ fn run_queue(
                 }
                 continue;
             }
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            if serve_read_fast(&q, slot, &read_fast) {
+                continue;
+            }
             // A request is in the entry: rebuild the /dev/fuse layout.
             req.clear();
             let unique;
@@ -400,7 +414,6 @@ fn run_queue(
                     req.extend_from_slice(&e.payload[..psz]);
                 }
             }
-            stats.requests.fetch_add(1, Ordering::Relaxed);
             let sink: Arc<dyn RingSink> = q.clone();
             if req.is_empty() || !dispatcher.dispatch(&req, sink, slot as u64) {
                 tracing::warn!(qid, unique, "malformed FUSE io_uring request");
@@ -437,4 +450,44 @@ fn run_queue(
     }
     drop(ring);
     tracing::debug!(qid, "FUSE io_uring queue finished");
+}
+
+/// Answer a READ in place when the fast path can: the bytes land directly
+/// in the payload buffer the kernel copies from. Returns whether it did.
+fn serve_read_fast(q: &Queue, slot: usize, read_fast: &ReadFast) -> bool {
+    let mut guard = q.entries[slot].lock();
+    let e = &mut *guard;
+    let h = &e.header.0;
+    let opcode = u32::from_ne_bytes(h[4..8].try_into().unwrap());
+    if opcode != FUSE_READ {
+        return false;
+    }
+    let unique = u64::from_ne_bytes(h[8..16].try_into().unwrap());
+    e.commit_id = u64::from_ne_bytes(h[ENT_COMMIT_ID..ENT_COMMIT_ID + 8].try_into().unwrap());
+    // struct fuse_read_in: fh, offset, size, ...
+    let op = &h[IN_OUT..IN_OUT + OP_IN];
+    let fh = u64::from_ne_bytes(op[0..8].try_into().unwrap());
+    let offset = u64::from_ne_bytes(op[8..16].try_into().unwrap());
+    let size = u32::from_ne_bytes(op[16..20].try_into().unwrap()) as usize;
+    if size > e.payload.len() {
+        return false;
+    }
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_fast(fh, offset, &mut e.payload[..size])
+    }))
+    .unwrap_or(None);
+    let (err, n) = match r {
+        None => return false,
+        Some(Ok(n)) => (0i32, n),
+        Some(Err(errno)) => (-errno, 0),
+    };
+    let h = &mut e.header.0;
+    h[..IN_OUT].fill(0);
+    h[0..4].copy_from_slice(&((OUT_HEADER + n) as u32).to_ne_bytes());
+    h[4..8].copy_from_slice(&err.to_ne_bytes());
+    h[8..16].copy_from_slice(&unique.to_ne_bytes());
+    h[ENT_PAYLOAD_SZ..ENT_PAYLOAD_SZ + 4].copy_from_slice(&(n as u32).to_ne_bytes());
+    drop(guard);
+    q.ready.lock().push(slot);
+    true
 }

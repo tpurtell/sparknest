@@ -162,6 +162,19 @@ impl Drop for Inflight<'_> {
     }
 }
 
+fn pread_into(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> NestResult<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        match f.read_at(&mut buf[done..], offset + done as u64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(e)),
+        }
+    }
+    Ok(done)
+}
+
 fn pread(f: &std::fs::File, offset: u64, len: u32) -> NestResult<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
     let mut done = 0;
@@ -1403,6 +1416,36 @@ impl Vfs {
     /// Sparks every thread hand-off can cost a deep-idle wake (hundreds of
     /// microseconds), which dominated small-request latency.
     pub fn try_read_now(&self, fh: u64, offset: u64, size: u32) -> Option<NestResult<Vec<u8>>> {
+        self.try_read_now_with(fh, offset, size, |f| pread(f, offset, size), Ok)
+    }
+
+    /// `try_read_now` into a caller's buffer (FUSE over io_uring reads
+    /// straight into the ring entry the kernel copies from).
+    pub fn try_read_into(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Option<NestResult<usize>> {
+        let size = buf.len() as u32;
+        // Exactly one of the two closures runs; both need the buffer.
+        let local = std::cell::RefCell::new(buf);
+        self.try_read_now_with(
+            fh,
+            offset,
+            size,
+            |f| pread_into(f, offset, &mut local.borrow_mut()),
+            |v| {
+                let mut b = local.borrow_mut();
+                b[..v.len()].copy_from_slice(&v);
+                Ok(v.len())
+            },
+        )
+    }
+
+    fn try_read_now_with<R>(
+        &self,
+        fh: u64,
+        offset: u64,
+        size: u32,
+        from_file: impl FnOnce(&std::fs::File) -> NestResult<R>,
+        from_readahead: impl FnOnce(Vec<u8>) -> NestResult<R>,
+    ) -> Option<NestResult<R>> {
         let h = self.handle(fh).ok()?;
         let a = self.raw_attr(h.file).ok()?;
         let key = ObjectKey::new(h.file, a.generation);
@@ -1425,7 +1468,7 @@ impl Vfs {
                     }
                 }
             };
-            return Some(pread(&f, offset, size));
+            return Some(from_file(&f));
         }
         // Only STABLE generations are cached ahead: their bytes never change.
         if a.gen_state != GenState::Stable {
@@ -1439,7 +1482,7 @@ impl Vfs {
         }
         let out = r.try_ready(offset, size)?;
         r.advance(&fab, offset, size);
-        Some(Ok(out))
+        Some(from_readahead(out))
     }
 
     /// Complete a write without waiting, if this node already owns the file

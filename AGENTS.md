@@ -54,8 +54,9 @@ Read in this order: `PROPOSAL.md` (architecture and invariants),
 - Rust 2024 edition, `tokio` runtime, `tracing` for logs, `anyhow` at edges
   and typed errors inside crates, `clap` derive for CLIs, `serde` DTOs in
   `nest-types`.
-- `unsafe` only in `nest-fabric`'s verbs layer, each block with a safety
-  comment; registered buffers have RAII owners.
+- `unsafe` only in `nest-fabric`'s verbs layer and the FUSE io_uring
+  transport (`nest-fuse/src/uring.rs`, ADR-025), each block with a safety
+  comment; registered buffers have RAII owners or are never freed.
 - Blocking filesystem/SQLite work goes on dedicated blocking pools; never on
   the FUSE reply path's async executor threads.
 - Public API changes update the OpenAPI document in the same commit.

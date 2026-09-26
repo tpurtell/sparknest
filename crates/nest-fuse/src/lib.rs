@@ -939,6 +939,13 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
             MAX_WRITE as usize,
             max_pages,
             inner.uring_stats.clone(),
+            {
+                let vfs = vfs.clone();
+                Arc::new(move |fh, offset, buf: &mut [u8]| {
+                    vfs.try_read_into(fh, offset, buf)
+                        .map(|r| r.map_err(|e| e.errno()))
+                })
+            },
         ) {
             Ok(n) => tracing::info!(
                 queues = n,

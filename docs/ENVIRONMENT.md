@@ -118,9 +118,10 @@ Other root-level performance levers, measured or suspected on the Sparks
   single-stream daemon-mediated I/O is latency-bound (~0.5 ms/request).
   `sudo cpupower idle-set -D 100` (disable states slower than 100 µs) is the
   obvious experiment; it costs idle power.
-- **FUSE over io_uring.** Compiled in on all kernels but disabled
-  (`/sys/module/fuse/parameters/enable_uring` = N). Not yet supported by
-  `fuser`; a later optimization.
+- **FUSE over io_uring.** Enabled on all hosts on 2026-09-27 with
+  `fuse.enable_uring=1` on the kernel command line (FUSE is built in, so
+  `/etc/modprobe.d` options are ignored). sparknest uses it automatically
+  (ADR-025).
 
 Optional later: raise switch ports to 200G for the benchmark pass; create
 `/mnt/models/sparknest` on the NAS share; reformat `/mnt/scratch` after drain.

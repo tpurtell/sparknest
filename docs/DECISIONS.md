@@ -552,3 +552,30 @@ free: owner writes (including the FUSE fast path) and incoming replicas get
 `ENOSPC` past it, while namespace operations, deletes and evictions, which
 free space, keep working. The store samples statvfs at most every 250 ms
 and subtracts writes in between. Archive stores have no reserve.
+
+## ADR-025 — FUSE over io_uring, built (2026-09-27; supersedes ADR-023's deferral)
+
+The user enabled `fuse.enable_uring=1` on every host (kernel command line;
+FUSE is built into these kernels, so modprobe options do not apply).
+sparknest now negotiates `FUSE_OVER_IO_URING` at INIT whenever the kernel
+offers it (`[fuse] io_uring = true`, the default) and runs one queue thread
+per possible CPU, pinned, each with its own ring and two entries. It warns
+and stays on /dev/fuse when the parameter is off.
+
+- **fuser is vendored** (`vendor/fuser`, `SPARKNEST.md`) with a small patch:
+  a reply target on `ChannelSender` and a `RingDispatcher`, so ring requests
+  use fuser's decoding and our `Filesystem` unchanged. FORGET, INTERRUPT and
+  notifications stay on /dev/fuse, as the kernel requires.
+- **Every ring command is issued by its queue's thread.** Replies made on
+  other threads are handed over through an eventfd, so completions never run
+  as task work on tokio threads.
+- **READ is answered in place** when the local fast path can serve it: the
+  bytes are read straight into the entry's payload buffer. Without this,
+  the extra copy cost 15–20% on parallel reads.
+- `unsafe` outside `nest-fabric` is confined to `crates/nest-fuse/src/uring.rs`
+  (SQE layout, buffers shared with the kernel, eventfd), each block with a
+  safety comment. Buffers the kernel may still reference are never freed.
+
+Measured on ostrich (benchmarks/M8-FUSE-IO-URING.md): 4 KiB reads 58–179 µs
+→ ~20 µs, 128 KiB reads 0.4 → 2.3–3.4 GB/s, 1 MiB reads 1.5–2.2 → 3.1–3.3
+GB/s, writes +55%, parallel reads level.

@@ -3,6 +3,19 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-27 — M8: io_uring, soak, disk-full reserve
+
+- FUSE over io_uring (ADR-025) on all hosts after the user enabled
+  `fuse.enable_uring=1`: single-stream reads 2–8× faster on a Spark
+  (benchmarks/M8-FUSE-IO-URING.md).
+- 15-minute chaos soak with 21 SIGKILLs: 88 GB written, 84 GB read and
+  verified, zero corruption (benchmarks/M8-SOAK.md). The cluster also came
+  back intact from a reboot of all seven hosts.
+- Data reserve protects metadata from a full disk (ADR-024); import adopts
+  existing blobs without copying; the daemon clears dead FUSE mounts.
+- Next: arm64 formula test (Homebrew's ghcr downloads are slow on
+  ostrich), cut v0.1.0 when the user wants it published.
+
 ## 2026-09-27 — M8: release tooling, migration tooling
 
 - Every CLI command prints plain text (`--json` for machines); the web UI
