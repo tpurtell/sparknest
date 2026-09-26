@@ -197,3 +197,26 @@ many threads, close is not a boundary).
 `pwrite` into one file. M5 must verify no silent fallback to repo-local
 storage on the FUSE mount. User venvs should be upgraded to ≥ 1.32 before
 migration.
+
+## ADR-011 — Lifecycle refinements found while implementing nest-meta (2026-09-26)
+
+1. **Replicated generation state is STABLE or OWNED only.** Revocation and
+   finalization are owner-local phases: in both, every other node already
+   routes to the owner, so replicating them buys nothing. `AcquireOwner`
+   bumps generation and epoch together, invalidates every other replica in
+   the same apply, and the owner withholds its first mutation until all
+   nodes acknowledge applying the grant or their read lease has expired.
+2. **Unsealed regular files are always opened FUSE direct-I/O.** Only sealed
+   files get passthrough (local) or the kernel page cache (remote). A sealed
+   file never changes, so its cache is valid forever and needs no revocation.
+   This removes read grants for page caches entirely; generic large-file trees
+   get the fast path through an auto-seal policy (M5) or `nest seal`.
+3. **Unlink while open, cluster-wide, without per-open consensus.** When the
+   last name goes, a regular file becomes an orphan held for every live
+   session. Each node releases orphans it has no handles to, in batches;
+   session expiry (including a node restart) releases the rest. Opens of an
+   orphan fail with ENOENT, which matches POSIX for a removed name.
+4. **Names are bytes.** Stored as SQLite BLOBs; only `/`, NUL, `.`, `..` are
+   refused.
+5. **Readdir offsets are per-entry cookies** assigned at insertion, so
+   concurrent inserts and removals never skip or repeat entries.

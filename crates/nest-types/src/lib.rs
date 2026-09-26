@@ -60,6 +60,13 @@ impl FileId {
     pub const ROOT: FileId = FileId(1);
 }
 
+impl NodeId {
+    /// Every node's live object store has the same id as the node.
+    pub fn live_store(self) -> StoreId {
+        StoreId(self.0)
+    }
+}
+
 /// Nanoseconds since the Unix epoch. Timestamps are chosen by the proposer
 /// of a command so that apply stays deterministic on every replica.
 #[derive(
@@ -116,36 +123,30 @@ impl FileKind {
     }
 }
 
-/// Lifecycle of a regular file's current generation (PROPOSAL §6.1).
+/// Replicated lifecycle of a regular file's current generation
+/// (PROPOSAL §6.1, ADR-011). Revocation and finalization are owner-local
+/// phases; every other node routes to the owner in both, so they are not
+/// replicated states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenState {
     /// Settled content; any LIVE replica may serve it.
     Stable,
-    /// Ownership requested; read authority for the old generation is being
-    /// withdrawn. No new read grants.
-    Revoking,
-    /// One owner is authoritative for changing content.
+    /// One owner is authoritative for the changing content.
     Owned,
-    /// Writers released; owner is settling size before publishing STABLE.
-    Finalizing,
 }
 
 impl GenState {
     pub fn as_i64(self) -> i64 {
         match self {
             GenState::Stable => 0,
-            GenState::Revoking => 1,
-            GenState::Owned => 2,
-            GenState::Finalizing => 3,
+            GenState::Owned => 1,
         }
     }
     pub fn from_i64(v: i64) -> Option<Self> {
         Some(match v {
             0 => GenState::Stable,
-            1 => GenState::Revoking,
-            2 => GenState::Owned,
-            3 => GenState::Finalizing,
+            1 => GenState::Owned,
             _ => return None,
         })
     }
@@ -208,7 +209,7 @@ pub struct FileAttr {
 /// A directory entry as returned by readdir.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntry {
-    pub name: String,
+    pub name: Vec<u8>,
     pub id: FileId,
     pub kind: FileKind,
 }
@@ -216,10 +217,15 @@ pub struct DirEntry {
 /// Maximum length of one path component, matching Linux NAME_MAX.
 pub const NAME_MAX: usize = 255;
 
-/// Validate a single path component for create/link/rename.
-pub fn validate_name(name: &str) -> NestResult<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
-        return Err(NestError::Invalid(format!("invalid name {name:?}")));
+/// Validate a single path component for create/link/rename. Names are
+/// arbitrary bytes like on Linux; only `/`, NUL, `.` and `..` are refused.
+pub fn validate_name(name: &[u8]) -> NestResult<()> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
+    {
+        return Err(NestError::Invalid(format!(
+            "invalid name {:?}",
+            String::from_utf8_lossy(name)
+        )));
     }
     if name.len() > NAME_MAX {
         return Err(NestError::NameTooLong);
@@ -233,12 +239,13 @@ mod tests {
 
     #[test]
     fn names() {
-        assert!(validate_name("config.json").is_ok());
-        assert!(validate_name("").is_err());
-        assert!(validate_name("..").is_err());
-        assert!(validate_name("a/b").is_err());
+        assert!(validate_name(b"config.json").is_ok());
+        assert!(validate_name(b"\xff\xfe").is_ok());
+        assert!(validate_name(b"").is_err());
+        assert!(validate_name(b"..").is_err());
+        assert!(validate_name(b"a/b").is_err());
         assert!(matches!(
-            validate_name(&"x".repeat(256)),
+            validate_name(&[b'x'; 256]),
             Err(NestError::NameTooLong)
         ));
     }
@@ -248,12 +255,7 @@ mod tests {
         for k in [FileKind::Regular, FileKind::Directory, FileKind::Symlink] {
             assert_eq!(FileKind::from_i64(k.as_i64()), Some(k));
         }
-        for s in [
-            GenState::Stable,
-            GenState::Revoking,
-            GenState::Owned,
-            GenState::Finalizing,
-        ] {
+        for s in [GenState::Stable, GenState::Owned] {
             assert_eq!(GenState::from_i64(s.as_i64()), Some(s));
         }
     }
