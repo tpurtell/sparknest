@@ -54,7 +54,7 @@ struct Inner {
     local_addr: SocketAddr,
     handlers: parking_lot::RwLock<HashMap<u8, Arc<dyn Handler>>>,
     addrs: parking_lot::RwLock<HashMap<NodeId, SocketAddr>>,
-    conns: Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<Option<Arc<Conn>>>>>>,
+    conns: Mutex<HashMap<NodeId, ConnSlot>>,
     filter: Filter,
     shutdown: watch::Sender<bool>,
 }
@@ -113,6 +113,9 @@ async fn writer(mut w: BufWriter<OwnedWriteHalf>, mut rx: mpsc::Receiver<Frame>)
         }
     }
 }
+
+/// Per-peer slot; the async mutex serializes (re)connection attempts.
+type ConnSlot = Arc<tokio::sync::Mutex<Option<Arc<Conn>>>>;
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Bytes, RpcError>>>>;
 
@@ -309,10 +312,10 @@ impl Rpc {
     async fn conn(&self, peer: NodeId) -> Result<Arc<Conn>, RpcError> {
         let slot = self.inner.conns.lock().entry(peer).or_default().clone();
         let mut slot = slot.lock().await;
-        if let Some(c) = slot.as_ref() {
-            if !c.dead.load(Ordering::SeqCst) {
-                return Ok(c.clone());
-            }
+        if let Some(c) = slot.as_ref()
+            && !c.dead.load(Ordering::SeqCst)
+        {
+            return Ok(c.clone());
         }
         let addr = self
             .peer_addr(peer)
