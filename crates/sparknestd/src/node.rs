@@ -19,6 +19,8 @@ pub struct Tuning {
     pub propose_deadline: Duration,
     pub connect_timeout: Duration,
     pub vfs: VfsConfig,
+    /// Read lease period (see `DataNode`).
+    pub lease: Duration,
     /// Mount the filesystem if the config names a mountpoint.
     pub mount: bool,
 }
@@ -33,6 +35,7 @@ impl Default for Tuning {
             propose_deadline: Duration::from_secs(15),
             connect_timeout: Duration::from_secs(2),
             vfs: VfsConfig::default(),
+            lease: Duration::from_secs(2),
             mount: true,
         }
     }
@@ -76,7 +79,7 @@ impl Node {
         }
         let store =
             Arc::new(ObjectStore::open(&cfg.node.state_dir).context("opening object store")?);
-        let (data, handler) = DataNode::new(id, store);
+        let (data, handler) = DataNode::new(id, store, tuning.lease);
         let mut mc = MetaNodeConfig::new(id, cfg.node.state_dir.clone(), cfg.cluster.name.clone());
         mc.heartbeat_ms = tuning.heartbeat_ms;
         mc.election_min_ms = tuning.election_min_ms;

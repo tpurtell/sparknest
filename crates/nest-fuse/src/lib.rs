@@ -183,17 +183,24 @@ impl Filesystem for Fs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.vfs.lookup(fid(parent), name.as_bytes()) {
-            Ok(a) => reply.entry(&self.ttl, &self.attr(&a), Generation(0)),
-            Err(e) => reply.error(errno(&e)),
-        }
+        let inner = self.inner.clone();
+        let name = name.as_bytes().to_vec();
+        self.spawn(async move {
+            match inner.vfs.lookup(fid(parent), &name).await {
+                Ok(a) => reply.entry(&inner.ttl, &inner.attr(&a), Generation(0)),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn getattr(&self, _req: &Request, i: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.vfs.getattr(fid(i)) {
-            Ok(a) => reply.attr(&self.ttl, &self.attr(&a)),
-            Err(e) => reply.error(errno(&e)),
-        }
+        let inner = self.inner.clone();
+        self.spawn(async move {
+            match inner.vfs.getattr(fid(i)).await {
+                Ok(a) => reply.attr(&inner.ttl, &inner.attr(&a)),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn setattr(
@@ -550,11 +557,9 @@ impl Filesystem for Fs {
     }
 
     fn opendir(&self, _req: &Request, i: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.vfs.getattr(fid(i)) {
-            Ok(a) if a.kind == FileKind::Directory => {
-                reply.opened(FileHandle(0), FopenFlags::empty())
-            }
-            Ok(_) => reply.error(Errno::ENOTDIR),
+        // readdir past the end: validates that `i` is a directory, cheaply.
+        match self.vfs.readdir(fid(i), u64::MAX, 0) {
+            Ok(_) => reply.opened(FileHandle(0), FopenFlags::empty()),
             Err(e) => reply.error(errno(&e)),
         }
     }
@@ -804,11 +809,18 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
     let notifier = session.notifier();
     let session = session.spawn()?;
 
+    // Fencing drops this node's page cache for a file synchronously before
+    // acknowledging revocation (mmap of unsealed files uses the page cache).
+    let fence_notifier = notifier.clone();
+    vfs.add_fence_hook(Arc::new(move |file: FileId| {
+        let _ = fence_notifier.inval_inode(ino(file), 0, 0);
+    }));
+
     // Kernel cache invalidation runs on its own thread: inval_entry may
     // wait on a directory lock held by a request we are still answering.
     let (tx, rx) = std::sync::mpsc::channel::<Inval>();
     let tap_tx = std::sync::Mutex::new(tx.clone());
-    vfs.data().add_tap(Arc::new(move |e: &Effect| {
+    vfs.data().add_tap(Arc::new(move |_index: u64, e: &Effect| {
         let msg = match e {
             Effect::EntryChanged { parent, name } => Inval::Entry(*parent, name.clone()),
             Effect::AttrChanged { file } => Inval::Attr(*file),

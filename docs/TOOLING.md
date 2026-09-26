@@ -5,7 +5,8 @@ Add a row the moment a new tool is introduced.
 
 | Tool | Where | Install | Purpose |
 |---|---|---|---|
-| rustup + stable toolchain | raptor, ostrich (build hosts) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh -s -- -y` | native amd64/arm64 builds; toolchain pinned by `rust-toolchain.toml` |
+| Rust 1.98.1 | raptor | Homebrew `rust` (already installed) | native amd64 builds |
+| Rust 1.98.1 | ostrich (arm64 build host) | rustup: `curl -sSf https://sh.rustup.rs \| sh -s -- -y --profile minimal --default-toolchain 1.98.1 -c clippy -c rustfmt` | native arm64 builds. Homebrew's `rust` bottle depends on a multi-hundred-MB `llvm@22` bottle that downloaded too slowly from ghcr.io, so rustup is used here. |
 | libibverbs-dev, librdmacm-dev | all nodes | already installed (rdma-core) | verbs FFI link target |
 | fusermount3 | all nodes | already installed (`fuse3`) | mounting as user |
 | node ≥ 24, npm | raptor | already installed | build `web/` bundle |

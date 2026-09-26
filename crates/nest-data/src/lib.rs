@@ -14,8 +14,9 @@
 //!   owner-routed writes and whole-file transfers.
 
 mod local;
+mod remote;
 mod session;
 pub mod vfs;
 
 pub use local::{DataNode, ReconcileReport};
-pub use vfs::{OpenMode, Vfs, VfsConfig};
+pub use vfs::{FenceHook, OpenMode, Vfs, VfsConfig};

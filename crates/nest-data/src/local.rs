@@ -24,8 +24,9 @@ enum ObjOp {
     },
 }
 
-/// An observer of applied effects.
-pub type EffectTap = Arc<dyn Fn(&Effect) + Send + Sync>;
+/// An observer of applied effects, with the log index of the batch that
+/// produced them.
+pub type EffectTap = Arc<dyn Fn(u64, &Effect) + Send + Sync>;
 
 #[derive(Default)]
 pub(crate) struct State {
@@ -74,6 +75,12 @@ pub struct DataNode {
     /// Set once this node has passed a leader read barrier after start:
     /// before that its view may predate invalidations and it serves nothing.
     caught_up: std::sync::atomic::AtomicBool,
+    /// Read lease: local copies may be served until this instant. Renewed
+    /// by periodic leader read barriers, so a node cut off from the leader
+    /// stops serving within one lease period (owners rely on this when a
+    /// node cannot acknowledge a fence).
+    lease_until: Mutex<Option<std::time::Instant>>,
+    lease: std::time::Duration,
     weak: Weak<DataNode>,
 }
 
@@ -91,7 +98,11 @@ impl DataNode {
     /// Create the data service and the effect handler to pass to
     /// [`MetaNode::start`]. Call [`DataNode::attach`] once the meta node
     /// is running.
-    pub fn new(id: NodeId, store: Arc<ObjectStore>) -> (Arc<DataNode>, Arc<dyn EffectHandler>) {
+    pub fn new(
+        id: NodeId,
+        store: Arc<ObjectStore>,
+        lease: std::time::Duration,
+    ) -> (Arc<DataNode>, Arc<dyn EffectHandler>) {
         let (gate, _) = watch::channel(false);
         let (stopping, _) = watch::channel(false);
         let mut senders = Vec::with_capacity(SHARDS);
@@ -116,6 +127,8 @@ impl DataNode {
             stopping,
             deletions: AtomicU64::new(0),
             caught_up: std::sync::atomic::AtomicBool::new(false),
+            lease_until: Mutex::new(None),
+            lease,
         });
         for rx in receivers {
             tokio::spawn(worker(Arc::downgrade(&d), rx, d.gate.subscribe()));
@@ -149,7 +162,7 @@ impl DataNode {
     /// node is caught up, committed metadata lists it as a live replica
     /// here, it is not fenced for deletion, and it exists.
     pub fn servable(&self, key: ObjectKey) -> bool {
-        if !self.caught_up() || self.st.lock().fenced.contains(&key) {
+        if !self.lease_valid() || self.st.lock().fenced.contains(&key) {
             return false;
         }
         let Some(meta) = self.meta.get() else {
@@ -174,6 +187,18 @@ impl DataNode {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         true
+    }
+
+    /// Whether the read lease is currently valid.
+    pub fn lease_valid(&self) -> bool {
+        self.lease_until
+            .lock()
+            .is_some_and(|t| std::time::Instant::now() < t)
+    }
+
+    /// The configured lease period.
+    pub fn lease(&self) -> std::time::Duration {
+        self.lease
     }
 
     /// Whether this node has confirmed its metadata is current since start.
@@ -211,12 +236,12 @@ impl DataNode {
 
     fn on_event(&self, ev: &SmEvent) {
         match ev {
-            SmEvent::Applied { effects, .. } => {
+            SmEvent::Applied { index, effects } => {
                 let taps = self.taps.lock().clone();
                 for e in effects {
                     self.on_effect(e);
                     for t in &taps {
-                        t(e);
+                        t(*index, e);
                     }
                 }
             }
@@ -408,10 +433,13 @@ impl DataNode {
         Ok(report)
     }
 
-    /// Pass a leader read barrier: afterwards every invalidation committed
-    /// before we started has been applied here (and fenced).
+    /// Keep the read lease fresh: a leader read barrier every quarter lease.
+    /// The lease runs from the moment the barrier was started, so it never
+    /// outlives what the leader had committed at that point by more than
+    /// one period.
     fn spawn_catch_up(self: Arc<Self>) {
         let weak = self.weak.clone();
+        let period = self.lease / 4;
         drop(self);
         tokio::spawn(async move {
             loop {
@@ -419,13 +447,23 @@ impl DataNode {
                 if *d.stopping.borrow() {
                     return;
                 }
-                if d.meta().barrier().await.is_ok() {
-                    d.caught_up.store(true, Ordering::SeqCst);
-                    tracing::info!("caught up with the cluster; serving");
-                    return;
+                let started = std::time::Instant::now();
+                let ok = tokio::time::timeout(d.lease, d.meta().barrier())
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                if ok {
+                    *d.lease_until.lock() = Some(started + d.lease);
+                    if !d.caught_up.swap(true, Ordering::SeqCst) {
+                        tracing::info!("caught up with the cluster; serving");
+                    }
                 }
                 drop(d);
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let wait = if ok {
+                    period
+                } else {
+                    std::time::Duration::from_millis(100)
+                };
+                tokio::time::sleep(wait.saturating_sub(started.elapsed())).await;
             }
         });
     }

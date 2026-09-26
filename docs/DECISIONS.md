@@ -308,3 +308,37 @@ to 0.10 later is a one-crate change.
 6. **Not supported:** extended attributes (ENODATA/ENOTSUP), device nodes,
    FIFOs and sockets (EPERM), chown (accepted and ignored; ADR-007),
    ioctls (ENOTTY).
+
+## ADR-015 — Multi-node data plane: routing, fencing, read leases (2026-09-26)
+
+1. **Routing.** Reads use a local copy when this node may serve it, else the
+   owner (while OWNED) or a node holding a live copy of the current
+   generation. Every remote read names its generation; a server refuses a
+   generation that is not current in its view (`Stale`) and the reader
+   catches up and retries. Mutations go to the owner.
+2. **Who owns.** On the first mutation of a STABLE file, the proposer picks
+   the owner: itself if it holds the content or the mutation discards it
+   (O_TRUNC, truncate to zero), otherwise a reachable holder. A 40 GB file
+   is never moved to make a small edit.
+3. **Fencing (revocation).** The owner, on observing its grant at log index
+   `i`, sends `Fence(file, i)` to every member. A member answers once it has
+   applied `i` (so its reads route to the new owner) and no older local read
+   of the file is running, after dropping page caches. The owner withholds
+   the first mutation until all members answer or, for any that do not, one
+   read lease has passed since the grant. New files skip fencing.
+4. **Read leases.** A node renews a lease with a leader read barrier every
+   quarter period (default 2 s) and serves local copies only while it
+   holds one. A partitioned node therefore stops serving within one lease,
+   which is what makes (3) safe without its acknowledgement.
+5. **Writers anywhere.** Remote writer handles join the owner's epoch on
+   first write and leave on close; a node's session expiry drops its
+   writers. Unused ownerships granted on someone's behalf finalize after
+   the linger.
+6. **Transport.** M3 carries bytes in `nest-rpc` messages over TCP;
+   M4 moves ranged reads onto the RDMA fabric behind the same calls.
+
+Tests (`crates/nest-testkit/tests/m3.rs`): visibility before close,
+write-through-holder, truncating ownership, readers never regress to stale
+bytes during revocation (disabling fencing makes this fail), unlink with a
+remote open handle, owner partition fails closed, and a partitioned holder
+forces the owner to wait out its lease while serving nothing stale.

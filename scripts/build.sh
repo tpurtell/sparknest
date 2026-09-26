@@ -9,6 +9,9 @@ cd "$(dirname "$0")/.."
 if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
   eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 fi
+# rustup toolchains (used on arm64 build hosts) take precedence when present.
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH"
+command -v cargo >/dev/null || { echo "cargo not found (see docs/TOOLING.md)" >&2; exit 1; }
 
 mode=release
 case "${1:-}" in

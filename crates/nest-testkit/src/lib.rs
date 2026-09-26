@@ -34,7 +34,9 @@ pub fn fast_tuning() -> Tuning {
         vfs: nest_data::VfsConfig {
             finalize_linger: Duration::from_millis(50),
             catch_up_wait: Duration::from_secs(5),
+            rpc_timeout: Duration::from_secs(3),
         },
+        lease: Duration::from_millis(800),
         mount: false,
     }
 }

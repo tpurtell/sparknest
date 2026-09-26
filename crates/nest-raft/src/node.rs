@@ -310,7 +310,8 @@ impl MetaNode {
         }
     }
 
-    async fn wait_applied(&self, index: u64) -> Result<(), NestError> {
+    /// Wait until the local state machine has applied `index`.
+    pub async fn wait_applied(&self, index: u64) -> Result<(), NestError> {
         self.raft
             .wait(Some(self.cfg.propose_deadline))
             .applied_index_at_least(Some(index), "sparknest read-your-writes")
