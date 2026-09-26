@@ -541,3 +541,14 @@ config switch, keeping the /dev/fuse read path as the fallback. If latency
 does not move, the bottleneck is elsewhere and io_uring is not the lever.
 Sealed files already bypass the daemon via passthrough (ADR-014), so this
 matters only for unsealed files and metadata-heavy work.
+
+## ADR-024 — A data reserve protects metadata from a full disk (2026-09-27)
+
+The metadata database and the Raft log live on the same filesystem as the
+node's objects. A disk filled with object data would stop the node from
+appending to its log; on the leader that stalls every metadata operation in
+the cluster. So object data must leave `node.data_reserve_gib` (default 4)
+free: owner writes (including the FUSE fast path) and incoming replicas get
+`ENOSPC` past it, while namespace operations, deletes and evictions, which
+free space, keep working. The store samples statvfs at most every 250 ms
+and subtracts writes in between. Archive stores have no reserve.

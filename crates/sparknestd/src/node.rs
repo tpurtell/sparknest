@@ -86,6 +86,7 @@ impl Node {
         }
         let store =
             Arc::new(ObjectStore::open(&cfg.node.state_dir).context("opening object store")?);
+        store.set_reserve(cfg.node.data_reserve_gib << 30);
         let (data, handler) = DataNode::new(id, store, tuning.lease);
         let mut mc = MetaNodeConfig::new(id, cfg.node.state_dir.clone(), cfg.cluster.name.clone());
         mc.heartbeat_ms = tuning.heartbeat_ms;

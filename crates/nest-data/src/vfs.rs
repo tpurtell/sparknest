@@ -859,6 +859,9 @@ impl Vfs {
         if !*guard {
             return Err(NestError::Stale); // finalized under us
         }
+        if let OwnerOp::Write { data, .. } = &op {
+            self.d.store().reserve_room(data.len() as u64).map_err(io)?;
+        }
         o.activity.fetch_add(1, Ordering::SeqCst);
         let f = o.file.clone();
         let resp = tokio::task::spawn_blocking(move || -> std::io::Result<DataResp> {
@@ -1458,6 +1461,9 @@ impl Vfs {
         if !*guard {
             return None;
         }
+        if let Err(e) = self.d.store().reserve_room(data.len() as u64) {
+            return Some(Err(io(e)));
+        }
         o.participants.lock().insert((self.me(), fh));
         o.activity.fetch_add(1, Ordering::SeqCst);
         let r = (|| {
@@ -1801,6 +1807,7 @@ impl Vfs {
         a: &FileAttr,
         dest: &Arc<nest_store::ObjectStore>,
     ) -> NestResult<()> {
+        dest.reserve_room(a.size).map_err(io)?;
         let holders = self.holders(a)?;
         let mut sources: Vec<Option<NodeId>> = Vec::new();
         if let Some(local) = self.local_source(a)

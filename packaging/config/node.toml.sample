@@ -8,6 +8,9 @@ state_dir = "/srv/sparknest-test"
 mountpoint = "/mnt/sparknest-test"
 listen = "10.55.0.22:7410"
 api_listen = "10.55.0.22:7411"
+# Free space object data must leave on the state_dir filesystem for the
+# metadata database and Raft log; writes past it fail with ENOSPC.
+data_reserve_gib = 4
 
 [cluster]
 name = "trial"

@@ -32,6 +32,10 @@ pub struct NodeSection {
     /// Management API listener on the network (bearer auth). The Unix
     /// socket `<state_dir>/api.sock` is always served.
     pub api_listen: Option<SocketAddr>,
+    /// Space object data must leave free on the state directory's
+    /// filesystem for metadata and the Raft log (writes past it get ENOSPC).
+    #[serde(default = "default_reserve_gib")]
+    pub data_reserve_gib: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +96,10 @@ impl Default for FuseSection {
             ttl_ms: default_ttl_ms(),
         }
     }
+}
+
+fn default_reserve_gib() -> u64 {
+    4
 }
 
 fn default_true() -> bool {

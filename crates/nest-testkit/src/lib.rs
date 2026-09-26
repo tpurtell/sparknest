@@ -96,6 +96,7 @@ impl TestCluster {
     fn config(&self, id: u64, listen: SocketAddr) -> Config {
         Config {
             node: NodeSection {
+                data_reserve_gib: 0,
                 id: NodeId(id),
                 name: format!("n{id}"),
                 state_dir: self.state_dir(id),

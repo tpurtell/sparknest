@@ -52,6 +52,10 @@ pub struct ObjectStore {
     root: PathBuf,
     objects: PathBuf,
     staging: PathBuf,
+    /// Bytes data writes must leave free (0 = no limit); see `reserve_room`.
+    reserve: std::sync::atomic::AtomicU64,
+    /// Last statvfs sample: (when, free bytes minus writes since).
+    room: std::sync::Mutex<(std::time::Instant, u64)>,
 }
 
 fn object_name(k: ObjectKey) -> String {
@@ -97,6 +101,8 @@ impl ObjectStore {
             root: root.to_path_buf(),
             objects,
             staging,
+            reserve: std::sync::atomic::AtomicU64::new(0),
+            room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
         })
     }
 
@@ -248,6 +254,35 @@ impl ObjectStore {
         }
         out.sort_by_key(|o| o.key);
         Ok(out)
+    }
+
+    /// Keep `bytes` free on this store's filesystem for everything that is
+    /// not object data: the metadata database and Raft log share it, and a
+    /// full disk there would stall the cluster's metadata.
+    pub fn set_reserve(&self, bytes: u64) {
+        self.reserve
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Account for a data write of `bytes`: `ENOSPC` if it would eat into
+    /// the reserve. statvfs is sampled at most every 250 ms; writes in
+    /// between are subtracted from the sample (overwrites count too, which
+    /// errs on the safe side until the next sample).
+    pub fn reserve_room(&self, bytes: u64) -> io::Result<()> {
+        let reserve = self.reserve.load(std::sync::atomic::Ordering::Relaxed);
+        if reserve == 0 {
+            return Ok(());
+        }
+        let mut g = self.room.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = g.0.elapsed() >= std::time::Duration::from_millis(250);
+        if stale || g.1 < reserve.saturating_add(bytes) {
+            *g = (std::time::Instant::now(), self.capacity()?.free);
+        }
+        if g.1 < reserve.saturating_add(bytes) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        g.1 -= bytes;
+        Ok(())
     }
 
     pub fn capacity(&self) -> io::Result<Capacity> {
