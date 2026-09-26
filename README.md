@@ -20,4 +20,4 @@ Start with [`PROPOSAL.md`](PROPOSAL.md). Decisions: [`docs/DECISIONS.md`](docs/D
 Machines and prerequisites: [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 Plan: [`ROADMAP.md`](ROADMAP.md). How to work here: [`AGENTS.md`](AGENTS.md).
 
-Status: design accepted, implementation starting (M0). Rust workspace.
+Status: M1–M7 done and running on the trial cluster; M8 (hardening, release) in progress. Rust workspace.

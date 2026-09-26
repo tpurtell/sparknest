@@ -690,12 +690,21 @@ async fn main() -> Result<()> {
                     }
                 );
                 for h in v["hosts"].as_array().into_iter().flatten() {
+                    let now = h["free_now"].as_u64().unwrap_or(0);
+                    let after = h["projected_free"].as_u64().unwrap_or(0);
+                    let target = h["target"].as_u64().unwrap_or(0);
+                    let gain = if after > now {
+                        format!(" (+{})", human(after - now))
+                    } else {
+                        String::new()
+                    };
+                    let mark = if after >= target { "ok" } else { "SHORT" };
                     println!(
-                        "  {:<9} free {} -> {} (target {})",
+                        "  {:<9} free {} -> {}{gain}, target {}  {mark}",
                         h["host"].as_str().unwrap_or(""),
-                        human(h["free_now"].as_u64().unwrap_or(0)),
-                        human(h["projected_free"].as_u64().unwrap_or(0)),
-                        human(h["target"].as_u64().unwrap_or(0))
+                        human(now),
+                        human(after),
+                        human(target)
                     );
                 }
                 for st in v["steps"].as_array().into_iter().flatten() {

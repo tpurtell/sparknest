@@ -188,8 +188,10 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
             && let Some((store, room)) = archive.as_mut()
         {
             let mut off = Vec::new();
+            let mut left = Vec::new();
             for cp in only.drain(..) {
                 if deficit == 0 || cp.size > *room {
+                    left.push(cp);
                     continue;
                 }
                 *room -= cp.size;
@@ -197,6 +199,7 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
                 projected += cp.size;
                 off.push(cp);
             }
+            only = left;
             if !off.is_empty() {
                 steps.push(Step::Offload {
                     host: host.clone(),
@@ -214,10 +217,15 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
             }
             let stuck: u64 = only.iter().map(|c| c.size).sum();
             if stuck > 0 {
-                why += &format!(
-                    "; {} are the only copies and no archive has room",
-                    human(stuck)
-                );
+                let archive_why = if archive.is_some() {
+                    "no archive store has room for them"
+                } else {
+                    "no archive store is available"
+                };
+                why += &format!("; {} here are only copies and {archive_why}", human(stuck));
+            }
+            if req_bytes.is_empty() && stuck == 0 {
+                why += "; nothing else sparknest holds here can move (the rest is other data)";
             }
             blocked.push(why);
         }

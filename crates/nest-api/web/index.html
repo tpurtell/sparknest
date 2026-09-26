@@ -145,11 +145,12 @@ function modal(title, bodyHtml, actions) {
 }
 
 // ---------------------------------------------------------------- state
-const views = ["Overview", "Models", "Files", "Rules", "Jobs"];
+const views = ["Overview", "Models", "Files", "Rules", "Space", "Jobs"];
 let view = (() => { const v = new URLSearchParams(location.search).get("view"); return views.includes(v) ? v : "Overview"; })();
 let status = null, stores = [];
 let filesPath = new URLSearchParams(location.search).get("path") || "/";
 let timer = null;
+let groups = [], lastPlan = null, planInputs = {};
 
 function targets() {
   const t = (status?.nodes || []).map(n => ({ name: n.name, kind: "node" }));
@@ -190,6 +191,7 @@ async function render() {
     else if (view === "Models") main.innerHTML = await models();
     else if (view === "Files") main.innerHTML = await files();
     else if (view === "Rules") main.innerHTML = await rules();
+    else if (view === "Space") main.innerHTML = await space();
     else if (view === "Jobs") main.innerHTML = await jobs();
     bind();
   } catch (e) { main.innerHTML = `<div class="card"><b>Error:</b> ${esc(e.message)}</div>`; }
@@ -266,7 +268,9 @@ async function rules() {
   const rows = v.rules.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.selector)}</td><td>${r.hosts.map(h => `<span class="badge">${esc(h)}</span>`).join("")}</td>
     <td>${r.auto ? "auto" : ""}</td><td><button class="btn" data-act="reconcile" data-name="${esc(r.name)}">Apply</button>
     <button class="btn danger" data-act="delrule" data-name="${esc(r.name)}">Delete</button></td></tr>`).join("");
-  const checks = targets().map(t => `<label><input type="checkbox" name="h" value="${esc(t.name)}">${esc(t.name)}</label>`).join("");
+  groups = (await get("/v1/groups")).groups;
+  const checks = groups.map(g => `<label title="${esc(g.members.join(", "))}"><input type="checkbox" name="h" value="@${esc(g.name)}"><b>@${esc(g.name)}</b></label>`).join("") +
+    targets().map(t => `<label><input type="checkbox" name="h" value="${esc(t.name)}">${esc(t.name)}</label>`).join("");
   return `<h2>Rules</h2><div class="tablewrap"><table><tr><th>Name</th><th>Selection</th><th>Where</th><th></th><th></th></tr>
     ${rows || `<tr><td colspan="5" class="empty">No rules yet</td></tr>`}</table></div>
     <h2>New rule</h2><div class="card"><div class="row"><input id="rname" placeholder="name"><input id="rsel" placeholder="hf:org/name or /path" style="flex:1;min-width:220px">
@@ -288,6 +292,48 @@ async function jobs() {
     const state = !j.finished ? "running" : j.error ? `<span style="color:var(--bad)">${esc(j.error)}</span>` : "done";
     return `<tr><td>${esc(j.what)}</td><td>${state}</td><td>${hosts}</td></tr>`;
   }).join("") + `</table></div>`;
+}
+
+function parseSize(s) {
+  const m = /^\s*([\d.]+)\s*([kmgt]?)(i?b)?\s*$/i.exec(s);
+  if (!m) throw new Error(`bad size "${s}" (e.g. 400GiB, 1.5T)`);
+  return Math.floor(parseFloat(m[1]) * 1024 ** " kmgt".indexOf((m[2] || " ").toLowerCase()));
+}
+
+async function space() {
+  groups = (await get("/v1/groups")).groups;
+  const input = k => `<input class="free" data-k="${esc(k)}" placeholder="—" value="${esc(planInputs[k] || "")}" style="width:110px">`;
+  const grows = groups.map(g => `<tr><td><b>@${esc(g.name)}</b></td><td class="small muted">${esc(g.members.join(", "))}</td><td></td><td>${input("@" + g.name)}</td></tr>`).join("");
+  const nrows = (status?.nodes || []).map(n => `<tr><td>${esc(n.name)}</td><td class="num">${n.info ? human(n.info.free_bytes) : "?"}</td>
+    <td class="num">${n.info ? human(n.info.total_bytes) : "?"}</td><td>${input(n.name)}</td></tr>`).join("");
+  let out = `<h2>Desired free space</h2><p class="muted small">Set a floor for hosts or groups; a host set directly beats its group. Planning moves nothing:
+    it lists redundant copies to remove, then sole copies to offload to an archive store. Last copies and copies a rule requires are never removed.</p>
+    <div class="tablewrap"><table><tr><th>Host</th><th class="num">Free</th><th class="num">Total</th><th>Keep free</th></tr>${grows}${nrows}</table></div>
+    <div class="row"><button class="btn primary" data-act="mkplan">Make plan</button>${lastPlan ? ` <button class="btn" data-act="clearplan">Clear</button>` : ""}</div>`;
+  if (lastPlan) {
+    const p = lastPlan;
+    const hosts = p.hosts.map(h => `<tr><td>${esc(h.host)}</td><td class="num">${human(h.free_now)}</td><td class="num">${human(h.projected_free)}${h.projected_free > h.free_now ? ` <span class="muted small">+${human(h.projected_free - h.free_now)}</span>` : ""}</td>
+      <td class="num">${human(h.target)}</td><td>${h.projected_free >= h.target ? "✓" : `<span style="color:var(--bad)">short ${human(h.target - h.projected_free)}</span>`}</td></tr>`).join("");
+    const steps = p.steps.map(st => {
+      const what = st.kind === "evict" ? `Remove ${st.copies.length} redundant copies from <b>${esc(st.host)}</b>`
+        : `Offload ${st.copies.length} sole copies from <b>${esc(st.host)}</b> to <b>${esc(st.store)}</b>`;
+      const files = st.copies.map(c => `<div class="small">${esc(c.path)} <span class="muted">${human(c.size)}</span></div>`).join("");
+      return `<details class="card"><summary>${what} · ${human(st.bytes)}</summary>${files}</details>`;
+    }).join("");
+    const blocked = p.blocked.map(b => `<div class="card" style="color:var(--bad)">${esc(b)}</div>`).join("");
+    out += `<h2>Plan ${p.id} ${p.feasible ? "" : `<span class="pill" style="color:var(--bad)">not fully feasible</span>`}</h2>
+      <div class="tablewrap"><table><tr><th>Host</th><th class="num">Free now</th><th class="num">After</th><th class="num">Target</th><th></th></tr>${hosts}</table></div>
+      ${steps || `<div class="empty">Nothing to do: every target is already met or nothing can safely move.</div>`}${blocked}
+      ${p.steps.length ? `<div class="row"><button class="btn primary" data-act="applyplan" data-id="${p.id}">Apply plan</button></div>` : ""}`;
+  }
+  const gchecks = (status?.nodes || []).map(n => `<label><input type="checkbox" value="${esc(n.name)}">${esc(n.name)}</label>`).join("");
+  const glist = groups.map(g => `<tr><td><b>@${esc(g.name)}</b></td><td>${g.members.map(m => `<span class="badge">${esc(m)}</span>`).join("")}</td>
+    <td><button class="btn danger" data-act="delgroup" data-name="${esc(g.name)}">Delete</button></td></tr>`).join("");
+  out += `<h2>Host groups</h2><div class="tablewrap"><table><tr><th>Group</th><th>Members</th><th></th></tr>
+    ${glist || `<tr><td colspan="3" class="empty">No groups yet</td></tr>`}</table></div>
+    <div class="card"><div class="row"><input id="gname" placeholder="group name, e.g. sparks"></div><div class="checks" id="gmembers">${gchecks}</div>
+    <button class="btn primary" data-act="savegroup">Save group</button></div>`;
+  return out;
 }
 
 // ---------------------------------------------------------------- actions
@@ -337,6 +383,31 @@ function bind() {
     else if (d.act === "delrule") {
       if (await modal(`Delete rule ${d.name}?`, `<p class="muted">Existing copies stay where they are.</p>`, [["Delete", "danger", true]])) {
         try { await api("DELETE", "/v1/rules/" + encodeURIComponent(d.name)); render(); } catch (err) { toast(err.message, true); }
+      }
+    }
+    else if (d.act === "mkplan") {
+      planInputs = {};
+      for (const i of document.querySelectorAll("input.free")) if (i.value.trim()) planInputs[i.dataset.k] = i.value.trim();
+      try {
+        const free = Object.entries(planInputs).map(([k, v]) => [k, parseSize(v)]);
+        if (!free.length) throw new Error("set at least one free-space target");
+        lastPlan = await post("/v1/plans", { free }); render();
+      } catch (err) { toast(err.message, true); }
+    }
+    else if (d.act === "clearplan") { lastPlan = null; render(); }
+    else if (d.act === "applyplan") {
+      if (await modal(`Apply plan ${d.id}?`, `<p class="muted">Offloads copy into the archive before anything is removed. Each step is rechecked against current rules and generations first.</p>`, [["Apply", "primary", true]])) {
+        lastPlan = null; startJob(`/v1/plans/${d.id}/apply`, {}, "Plan");
+      }
+    }
+    else if (d.act === "savegroup") {
+      const members = [...document.querySelectorAll("#gmembers input:checked")].map(i => i.value);
+      try { await api("PUT", "/v1/groups/" + encodeURIComponent($("#gname").value.trim()), { members }); toast("Group saved"); render(); }
+      catch (err) { toast(err.message, true); }
+    }
+    else if (d.act === "delgroup") {
+      if (await modal(`Delete group @${d.name}?`, `<p class="muted">Refused while a rule names it.</p>`, [["Delete", "danger", true]])) {
+        try { await api("DELETE", "/v1/groups/" + encodeURIComponent(d.name)); render(); } catch (err) { toast(err.message, true); }
       }
     }
     else if (d.act === "addrule") {

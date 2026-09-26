@@ -428,6 +428,10 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
         plan.blocked
     );
 
+    // A group a rule names cannot be deleted.
+    let e = p.delete_group("both").await.unwrap_err();
+    assert!(e.to_string().contains("pin"), "{e}");
+
     // A host named directly beats its group, whichever comes first.
     let plan = p
         .plan(&[("n1".into(), 7), ("@both".into(), 9)])

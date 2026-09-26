@@ -453,7 +453,8 @@ it grows, the API contract does not change.
 **Views.** Overview (nodes, stores), Models (per-repo readiness matrix
 across nodes and archive stores; clicking a cell copies there or removes
 from there), Files (browse with copy locations, seal toggle, copy-to),
-Rules (create, apply, delete), Jobs (live progress).
+Rules (create, apply, delete), Space (free-space plans and host groups,
+ADR-022), Jobs (live progress).
 
 ## ADR-021 — Backups, metadata snapshots and offline export (2026-09-26)
 
@@ -495,6 +496,13 @@ Rules (create, apply, delete), Jobs (live progress).
      (copy there, then evict here);
    - never removes a last copy or a rule-required copy. A shortfall that
      only those could cover is reported as blocked, naming the rules.
-3. **Apply** re-checks nothing it doesn't have to: evictions name exact
-   generations, so a file rewritten since planning keeps its new copy.
-   Plans are held in memory on the node that made them and expire with it.
+3. **Apply revalidates every step.** Evictions name exact generations, so
+   a file rewritten since planning keeps its new copy; the state machine
+   refuses a last copy; and rules are re-read before each step, so a copy a
+   rule made since planning requires is kept and reported. Plans are held
+   in memory on the node that made them and expire with it.
+4. **Groups a rule names cannot be deleted**, so rules and plans always
+   resolve.
+5. Both front ends: `nest plan` / `nest group` and the web UI's Space view
+   (targets per host or group, the proposed steps with their files, the
+   blockers, Apply, and group editing).

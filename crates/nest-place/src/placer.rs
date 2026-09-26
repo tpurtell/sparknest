@@ -299,6 +299,19 @@ impl Placer {
     }
 
     pub async fn delete_group(&self, name: &str) -> NestResult<()> {
+        let tag = format!("@{name}");
+        let users: Vec<String> = self
+            .rules()?
+            .into_iter()
+            .filter(|(_, spec, _)| spec.hosts.contains(&tag))
+            .map(|(r, _, _)| r)
+            .collect();
+        if !users.is_empty() {
+            return Err(NestError::Invalid(format!(
+                "group {tag} is used by rule(s) {}; change them first",
+                users.join(", ")
+            )));
+        }
         self.vfs
             .data()
             .meta()
