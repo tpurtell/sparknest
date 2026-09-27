@@ -1080,10 +1080,10 @@ impl Placer {
         })
     }
 
-    /// Download a Hugging Face repo to this node (see `hfimport::download`):
-    /// first a copy of what the cluster already has of it, then `hf
-    /// download` for the rest (nothing, or what was never finished).
-    /// Progress is what this node holds of the repo against hf's size.
+    /// Download to this node what the cluster lacks of a Hugging Face repo
+    /// (see `hfimport::download`): files the hub cache holds anywhere stay
+    /// where they are. Progress is what this node gained against hf's size
+    /// of the missing files.
     #[allow(clippy::too_many_arguments)]
     pub fn hf_download(
         self: &Arc<Self>,
@@ -1110,45 +1110,19 @@ impl Placer {
                 repo_type: repo_type.into(),
             };
             let here = me.vfs.data().id();
-            let name = me
-                .nodes()?
-                .into_iter()
-                .find(|h| h.node == here)
-                .map(|h| h.name)
-                .unwrap_or_default();
-            // 1. What the cluster has, here.
-            if me.manifest(&sel).await.is_ok_and(|m| !m.entries.is_empty()) {
-                let jid = me.replicate(sel.clone(), vec![name], 4).await?;
-                loop {
-                    if progress.lock().cancelled {
-                        let _ = me.cancel_job(jid).await;
-                    }
-                    match me.job(jid) {
-                        Some(j) if j.finished => {
-                            if let Some(e) = j.error {
-                                notes
-                                    .lock()
-                                    .push(format!("copying what the cluster had: {e}"));
-                            }
-                            break;
-                        }
-                        None => break,
-                        _ => tokio::time::sleep(Duration::from_millis(500)).await,
-                    }
-                }
-            }
-            // 2. How big it is.
+            // Only what the cluster lacks is fetched (hf skips files the hub
+            // cache holds, wherever they are); nothing is moved here.
             match crate::hfimport::download_size(&hf, &mount_hub, &repo, &kind, revision.as_deref())
                 .await
             {
-                Ok((files, bytes)) => {
+                Ok(s) => {
                     let mut p = progress.lock();
-                    p.total_files = files;
-                    p.total_bytes = bytes;
+                    p.total_files = s.missing_files;
+                    p.total_bytes = s.missing_bytes;
                 }
                 Err(e) => notes.lock().push(e.to_string()),
             }
-            // 3. hf fetches the rest; progress is what this node holds.
+            // Progress is what this node holds beyond what it held before.
             let prog = progress.clone();
             let (h, m, r, k, v) = (
                 hf.clone(),
@@ -1157,10 +1131,6 @@ impl Placer {
                 kind.clone(),
                 revision.clone(),
             );
-            let dl = tokio::spawn(async move {
-                crate::hfimport::download(&h, &m, &r, &k, v.as_deref(), || prog.lock().cancelled)
-                    .await
-            });
             let store = here.live_store();
             let held = |m: &Manifest| -> (u64, u64) {
                 let Ok(c) = me.conn() else { return (0, 0) };
@@ -1173,21 +1143,29 @@ impl Placer {
                     })
                     .fold((0, 0), |(n, b), e| (n + 1, b + e.size))
             };
+            let (n0, b0) = match me.manifest(&sel).await {
+                Ok(m) => held(&m),
+                Err(_) => (0, 0),
+            };
+            let dl = tokio::spawn(async move {
+                crate::hfimport::download(&h, &m, &r, &k, v.as_deref(), || prog.lock().cancelled)
+                    .await
+            });
             while !dl.is_finished() {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if let Ok(m) = me.manifest(&sel).await {
                     let (n, b) = held(&m);
                     let mut p = progress.lock();
-                    p.files = n;
-                    p.copied_bytes = b;
+                    p.files = n.saturating_sub(n0);
+                    p.copied_bytes = b.saturating_sub(b0);
                 }
             }
             let r = dl.await.map_err(|e| NestError::Io(e.to_string()))?;
             if let Ok(m) = me.manifest(&sel).await {
                 let (n, b) = held(&m);
                 let mut p = progress.lock();
-                p.files = n;
-                p.copied_bytes = b;
+                p.files = n.saturating_sub(n0);
+                p.copied_bytes = b.saturating_sub(b0);
             }
             r
         })
@@ -1762,20 +1740,60 @@ impl Placer {
     /// offloading sole copies only into the `archives` named (none: only
     /// redundant copies are removed).
     pub async fn plan(&self, goal: crate::plan::Goal) -> NestResult<crate::plan::Plan> {
-        let p = crate::plan::make(self, goal).await?;
+        self.plan_in(goal, "").await
+    }
+
+    /// `plan`, with copies named after the Hugging Face repos under `hub`.
+    pub async fn plan_in(
+        &self,
+        goal: crate::plan::Goal,
+        hub: &str,
+    ) -> NestResult<crate::plan::Plan> {
+        let mut p = crate::plan::make(self, goal).await?;
+        let c = self.conn()?;
+        let hub = hub.to_string();
+        p = tokio::task::spawn_blocking(move || crate::plan::label(&c, &hub, &mut p).map(|_| p))
+            .await
+            .map_err(|e| NestError::Io(e.to_string()))??;
         self.plans.lock().insert(p.id, p.clone());
         Ok(p)
+    }
+
+    /// A proposed plan, as last edited.
+    pub fn get_plan(&self, id: u64) -> NestResult<crate::plan::Plan> {
+        self.plans
+            .lock()
+            .get(&id)
+            .cloned()
+            .ok_or(NestError::NotFound)
+    }
+
+    /// Edit a proposed plan: skip (`on` false) or take back copies (see
+    /// `plan::select`). Returns the plan and how many copies changed.
+    pub fn select_plan(
+        &self,
+        id: u64,
+        host: Option<&str>,
+        matches: &[String],
+        on: bool,
+    ) -> NestResult<(crate::plan::Plan, usize)> {
+        let mut plans = self.plans.lock();
+        let p = plans.get_mut(&id).ok_or(NestError::NotFound)?;
+        let n = crate::plan::select(p, host, matches, on);
+        Ok((p.clone(), n))
     }
 
     /// Execute a proposed plan: offloads (copy into the archive, then evict
     /// exactly the planned generations) and evictions.
     pub async fn apply_plan(self: &Arc<Self>, id: u64) -> NestResult<u64> {
-        let plan = self
+        let mut plan = self
             .plans
             .lock()
             .get(&id)
             .cloned()
             .ok_or(NestError::NotFound)?;
+        // What the person left in.
+        plan.steps = plan.steps.iter().filter_map(|s| s.selected()).collect();
         let jid = self.next_job.fetch_add(1, Ordering::Relaxed);
         let job = Arc::new(Mutex::new(ClusterJob {
             id: jid,
@@ -1793,32 +1811,41 @@ impl Placer {
         let me = self.clone();
         tokio::spawn(async move {
             let r: NestResult<()> = async {
-                for step in &plan.steps {
-                    cancelled(&job)?;
-                    if let crate::plan::Step::Replicate {
+                // Copies onto hosts first, every host at once; removals and
+                // offloads after, in order (a removal checks its keeper).
+                let adds = plan.steps.iter().filter_map(|step| {
+                    let crate::plan::Step::Replicate {
                         host, node, copies, ..
                     } = step
-                    {
-                        // Speedup: whole files onto the host; nothing removed.
-                        let target = Target {
-                            name: host.clone(),
-                            store: node.live_store(),
-                            node: *node,
-                        };
-                        let m = Manifest {
-                            entries: copies
-                                .iter()
-                                .map(|c| crate::selector::Entry {
-                                    file: c.file,
-                                    generation: c.generation,
-                                    size: c.size,
-                                    stable: true,
-                                    path: c.path.clone(),
-                                })
-                                .collect(),
-                            dangling: vec![],
-                        };
-                        me.run_replicate(&job, m, vec![target], 8).await?;
+                    else {
+                        return None;
+                    };
+                    let target = Target {
+                        name: host.clone(),
+                        store: node.live_store(),
+                        node: *node,
+                    };
+                    let m = Manifest {
+                        entries: copies
+                            .iter()
+                            .map(|c| crate::selector::Entry {
+                                file: c.file,
+                                generation: c.generation,
+                                size: c.size,
+                                stable: true,
+                                path: c.path.clone(),
+                            })
+                            .collect(),
+                        dangling: vec![],
+                    };
+                    Some(me.run_replicate(&job, m, vec![target], 8))
+                });
+                for r in futures::future::join_all(adds).await {
+                    r?;
+                }
+                for step in &plan.steps {
+                    cancelled(&job)?;
+                    if let crate::plan::Step::Replicate { .. } = step {
                         continue;
                     }
                     let requires = match step {
@@ -1879,37 +1906,29 @@ impl Placer {
                         me.run_replicate(&job, m, targets, 8).await?;
                         cancelled(&job)?;
                     }
-                    // Consolidating: only what the chosen host now holds.
-                    let copies: Vec<_> = match requires {
-                        Some(keeper) => {
-                            let c = me.conn()?;
-                            let (keep, skip): (Vec<_>, Vec<_>) =
-                                copies.into_iter().partition(|x| {
-                                    query::has_live_replica(
-                                        &c,
-                                        x.file,
-                                        x.generation,
-                                        keeper.live_store(),
-                                    )
+                    // Moving: only what the keeping host now holds.
+                    let copies: Vec<_> = if copies.iter().any(|x| x.keeper.or(requires).is_some()) {
+                        let c = me.conn()?;
+                        let (keep, skip): (Vec<_>, Vec<_>) = copies.into_iter().partition(|x| {
+                            x.keeper.or(requires).is_none_or(|k| {
+                                query::has_live_replica(&c, x.file, x.generation, k.live_store())
                                     .unwrap_or(false)
-                                });
-                            if !skip.is_empty() {
-                                let mut j = job.lock();
-                                let p = j.hosts.entry(host.clone()).or_default();
-                                p.total_files += skip.len() as u64;
-                                for x in skip {
-                                    p.failed.push((
-                                        x.file,
-                                        format!(
-                                            "{}: kept, the target host has no copy yet",
-                                            x.path
-                                        ),
-                                    ));
-                                }
+                            })
+                        });
+                        if !skip.is_empty() {
+                            let mut j = job.lock();
+                            let p = j.hosts.entry(host.clone()).or_default();
+                            p.total_files += skip.len() as u64;
+                            for x in skip {
+                                p.failed.push((
+                                    x.file,
+                                    format!("{}: kept, the target host has no copy yet", x.label()),
+                                ));
                             }
-                            keep
                         }
-                        None => copies,
+                        keep
+                    } else {
+                        copies
                     };
                     if copies.is_empty() {
                         continue;

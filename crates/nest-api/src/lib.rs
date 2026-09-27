@@ -154,6 +154,8 @@ pub fn router(api: Api) -> Router {
         .route("/v1/stores", get(stores).post(add_store))
         .route("/v1/offload", post(offload))
         .route("/v1/plans", post(make_plan))
+        .route("/v1/plans/{id}", get(get_plan))
+        .route("/v1/plans/{id}/select", post(select_plan))
         .route("/v1/plans/{id}/apply", post(apply_plan))
         .route("/v1/groups", get(groups))
         .route("/v1/groups/{name}", put(set_group).delete(delete_group))
@@ -801,7 +803,7 @@ struct HfSizeQ {
 /// Files and bytes of a repo on the Hub (hf's dry run).
 async fn hf_size(State(api): State<Api>, Query(q): Query<HfSizeQ>) -> R<serde_json::Value> {
     let hf = hf_program(None)?;
-    let (files, bytes) = nest_place::hfimport::download_size(
+    let s = nest_place::hfimport::download_size(
         &hf,
         &mount_hub(&api)?,
         &q.repo,
@@ -809,7 +811,7 @@ async fn hf_size(State(api): State<Api>, Query(q): Query<HfSizeQ>) -> R<serde_js
         q.revision.as_deref(),
     )
     .await?;
-    Ok(Json(json!({ "files": files, "bytes": bytes })))
+    Ok(Json(json!(s)))
 }
 
 #[derive(Deserialize)]
@@ -824,8 +826,9 @@ struct HfDownloadReq {
     hf: Option<String>,
 }
 
-/// Download a repo to a host: what the cluster has is copied there first,
-/// hf fetches the rest. Returns the job (on that host).
+/// Download a repo to a host: hf fetches the files the cluster lacks (at
+/// the revision the cache holds, if any) and writes them there; nothing the
+/// cluster holds moves. Returns the job (on that host).
 async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<serde_json::Value> {
     let repo = r
         .repo
@@ -1390,23 +1393,74 @@ async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_js
     Ok(Json(
         serde_json::to_value(
             api.placer
-                .plan(match r {
-                    PlanReq::Goal(nest_place::plan::Goal::Consolidate {
-                        selector, host, ..
-                    }) => nest_place::plan::Goal::Consolidate {
-                        selector: api.selector_string(&selector),
-                        host,
-                        hub: api.hub.clone(),
+                .plan_in(
+                    match r {
+                        PlanReq::Goal(nest_place::plan::Goal::Consolidate {
+                            selector,
+                            host,
+                            ..
+                        }) => nest_place::plan::Goal::Consolidate {
+                            selector: api.selector_string(&selector),
+                            host,
+                            hub: api.hub.clone(),
+                        },
+                        PlanReq::Goal(nest_place::plan::Goal::Place {
+                            selector,
+                            hosts,
+                            factor,
+                            ..
+                        }) => nest_place::plan::Goal::Place {
+                            selector: api.selector_string(&selector),
+                            hosts,
+                            factor,
+                            hub: api.hub.clone(),
+                        },
+                        PlanReq::Goal(g) => g,
+                        PlanReq::Free { free, archives } => {
+                            nest_place::plan::Goal::Free { free, archives }
+                        }
                     },
-                    PlanReq::Goal(g) => g,
-                    PlanReq::Free { free, archives } => {
-                        nest_place::plan::Goal::Free { free, archives }
-                    }
-                })
+                    &api.hub,
+                )
                 .await?,
         )
         .unwrap_or_default(),
     ))
+}
+
+async fn get_plan(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json::Value> {
+    Ok(Json(
+        serde_json::to_value(api.placer.get_plan(id)?).unwrap_or_default(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SelectReq {
+    /// One host's copies; every host's when absent.
+    #[serde(default)]
+    host: Option<String>,
+    /// Models (org/name, hf:org/name), directories or files; every copy
+    /// (on `host`) when empty.
+    #[serde(default)]
+    matches: Vec<String>,
+    /// true takes copies back into the plan, false skips them.
+    on: bool,
+}
+
+/// Edit a proposed plan: skip copies or take them back. Returns the plan
+/// and how many copies changed.
+async fn select_plan(
+    State(api): State<Api>,
+    Path(id): Path<u64>,
+    Json(r): Json<SelectReq>,
+) -> R<serde_json::Value> {
+    let (plan, changed) = api.placer.select_plan(
+        id,
+        r.host.as_deref().filter(|h| !h.is_empty()),
+        &r.matches,
+        r.on,
+    )?;
+    Ok(Json(json!({ "plan": plan, "changed": changed })))
 }
 
 async fn apply_plan(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json::Value> {

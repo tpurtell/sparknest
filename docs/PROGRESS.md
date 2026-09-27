@@ -3,6 +3,24 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-28 — The real cluster; transfers written directly; placing models
+
+- Installed with Homebrew from a local tap on all seven hosts
+  (`scripts/install-cluster.sh`); cluster `sparknest` at /mnt/sparknest,
+  archives `models` (NAS) and `scratch` (SATA SSD).
+- Transfers (ADR-039…042): paced, then written with O_DIRECT through one
+  io_uring per process, a fixed window of writes in flight. No page-cache
+  floods on SMB, no blocking-pool exhaustion stalling the metadata apply.
+  raptor NVMe 5.7–6.0 GB/s (benchmarks/M9-DIRECT-WRITES.md).
+- Place (ADR-043): hosts plus a replica factor (1/hosts spreads, 1 copies
+  everywhere), the host reading a file most chosen first. Plans are
+  edited as a host → model → file tree before applying (UI and
+  `nest plan show|skip|unskip`). Finish downloads only files no host has.
+- UI: dialogs float on the screen (not the page), the model window fits the
+  screen with a treemap, hover details and zoom-out, the animated backdrop
+  shows through everywhere, nav links can no longer start a native drag.
+- Next: measure the scratch disk idle; daily fstrim (root checklist).
+
 ## 2026-09-27 — Reads from other hosts made fast (ADR-030…035)
 
 - Spread reads (ADR-030): local first, rendezvous stripes, capped by

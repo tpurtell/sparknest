@@ -865,13 +865,50 @@ fn parse_size(s: &str) -> u64 {
 }
 
 /// Files and bytes a download of `repo` would fetch in all (hf's dry run).
+/// A repo on the Hub against what the hub cache holds (hf's dry run).
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct DownloadSize {
+    /// Files in the repo (at the revision).
+    pub files: u64,
+    /// Files and bytes hf would download: not in the cache anywhere in the
+    /// cluster.
+    pub missing_files: u64,
+    pub missing_bytes: u64,
+}
+
+/// The revision the hub cache holds of `repo` (its `refs/main`), so that
+/// finishing a download fetches the files of that snapshot, not a newer one.
+fn cached_revision(mount_hub: &Path, repo: &str, kind: &str) -> Option<String> {
+    let dir = format!(
+        "{}s--{}",
+        repo_type(kind),
+        repo.split('@').next().unwrap_or(repo).replace('/', "--")
+    );
+    let r = std::fs::read_to_string(mount_hub.join(dir).join("refs/main")).ok()?;
+    let r = r.trim();
+    (r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())).then(|| r.to_string())
+}
+
+/// `revision`, or the one the cache holds, or none (the latest).
+fn resolve_revision(
+    mount_hub: &Path,
+    repo: &str,
+    kind: &str,
+    revision: Option<&str>,
+) -> Option<String> {
+    revision
+        .map(str::to_string)
+        .or_else(|| cached_revision(mount_hub, repo, kind))
+}
+
 pub async fn download_size(
     hf: &Path,
     mount_hub: &Path,
     repo: &str,
     kind: &str,
     revision: Option<&str>,
-) -> NestResult<(u64, u64)> {
+) -> NestResult<DownloadSize> {
+    let revision = resolve_revision(mount_hub, repo, kind, revision);
     let mut cmd = tokio::process::Command::new(hf);
     cmd.args([
         "download",
@@ -883,17 +920,25 @@ pub async fn download_size(
     ])
     .arg("--cache-dir")
     .arg(mount_hub);
-    if let Some(r) = revision {
+    if let Some(r) = &revision {
         cmd.args(["--revision", r]);
     }
     hf_env(&mut cmd, mount_hub);
     let v = hf_json(cmd, "hf download --dry-run").await?;
     let files = v.as_array().cloned().unwrap_or_default();
-    let bytes = files
-        .iter()
-        .map(|f| parse_size(f["size"].as_str().unwrap_or("0")))
-        .sum();
-    Ok((files.len() as u64, bytes))
+    let mut s = DownloadSize {
+        files: files.len() as u64,
+        ..Default::default()
+    };
+    // A file the cache holds is listed with size "-".
+    for f in &files {
+        let size = f["size"].as_str().unwrap_or("0").trim();
+        if size != "-" {
+            s.missing_files += 1;
+            s.missing_bytes += parse_size(size);
+        }
+    }
+    Ok(s)
 }
 
 /// Run `hf download` into the hub through this node's mount (so the files
@@ -906,6 +951,7 @@ pub async fn download(
     revision: Option<&str>,
     stop: impl Fn() -> bool,
 ) -> NestResult<()> {
+    let revision = resolve_revision(mount_hub, repo, kind, revision);
     let mut cmd = tokio::process::Command::new(hf);
     cmd.args(["download", repo, "--repo-type", repo_type(kind)])
         .arg("--cache-dir")
@@ -913,7 +959,7 @@ pub async fn download(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    if let Some(r) = revision {
+    if let Some(r) = &revision {
         cmd.args(["--revision", r]);
     }
     hf_env(&mut cmd, mount_hub);

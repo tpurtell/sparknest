@@ -361,6 +361,79 @@ fn follow(c: &Connection, ns: &Ns, abs: &str) -> NestResult<Option<FileId>> {
     Ok(None)
 }
 
+/// Every file Hugging Face snapshots under `hub` point at: its repo
+/// (org/name) and the name the snapshot gives it (the first snapshot's
+/// name when several name it; a file two repos share goes to the first).
+pub fn hf_names(c: &Connection, hub: &str) -> NestResult<HashMap<FileId, (String, String)>> {
+    let ns = Ns::load(c, None)?;
+    let mut out = HashMap::new();
+    let hub = hub.trim_end_matches('/');
+    let Ok((hub_id, _)) = selector::resolve_path(c, hub) else {
+        return Ok(out);
+    };
+    let mut repos: Vec<(String, FileId)> = ns
+        .down
+        .get(&hub_id)
+        .into_iter()
+        .flatten()
+        .filter(|(n, _)| n.starts_with("models--") || n.starts_with("datasets--"))
+        .map(|(n, id)| (n.clone(), *id))
+        .collect();
+    repos.sort();
+    for (dname, rid) in repos {
+        let rest = dname
+            .strip_prefix("models--")
+            .or_else(|| dname.strip_prefix("datasets--"))
+            .expect("filtered");
+        let repo = rest.replacen("--", "/", 1);
+        let snaps = ns
+            .down
+            .get(&rid)
+            .into_iter()
+            .flatten()
+            .find(|(n, _)| n == "snapshots")
+            .map(|(_, id)| *id);
+        let revs: Vec<(String, FileId)> = snaps
+            .and_then(|s| ns.down.get(&s))
+            .cloned()
+            .unwrap_or_default();
+        for (_, rev_id) in revs {
+            let mut stack = vec![(rev_id, String::new())];
+            while let Some((dir, prefix)) = stack.pop() {
+                for (n, ch) in ns.down.get(&dir).into_iter().flatten() {
+                    let rel = if prefix.is_empty() {
+                        n.clone()
+                    } else {
+                        format!("{prefix}/{n}")
+                    };
+                    let target = match ns.kind.get(ch) {
+                        Some(FileKind::Directory) => {
+                            stack.push((*ch, rel));
+                            continue;
+                        }
+                        Some(FileKind::Regular) => Some(*ch),
+                        Some(FileKind::Symlink) => {
+                            let t = query::readlink(c, *ch).map_err(sql)?.unwrap_or_default();
+                            let t = String::from_utf8_lossy(&t);
+                            let abs = if t.starts_with('/') {
+                                t.into_owned()
+                            } else {
+                                format!("{}/{t}", ns.path(dir))
+                            };
+                            follow(c, &ns, &abs)?
+                        }
+                        None => None,
+                    };
+                    if let Some(t) = target {
+                        out.entry(t).or_insert_with(|| (repo.clone(), rel));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn tree(c: &Connection, req: &TreeReq) -> NestResult<TreeNode> {
     let ns = Ns::load(c, req.store)?;
     let mut b = Builder {

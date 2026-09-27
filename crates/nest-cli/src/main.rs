@@ -26,6 +26,8 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Parsed once per run: the size of the largest variant does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Cluster, node and store overview.
@@ -150,6 +152,15 @@ enum Cmd {
         /// and remove the other hosts' copies.
         #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["free", "tidy", "speedup"])]
         consolidate: Option<String>,
+        /// Place a selection on hosts (--host, default all) with --factor
+        /// copies: each file on factor x hosts of them, the split kept even,
+        /// hosts that read a file most chosen first; copies elsewhere go.
+        #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["free", "tidy", "speedup", "consolidate"])]
+        place: Option<String>,
+        /// --place: share of the hosts each file is on, 1/hosts (spread) to
+        /// 1 (everywhere); a fraction like 2/7 or a number (default 1).
+        #[arg(long, requires = "place")]
+        factor: Option<String>,
         /// Hosts or @groups for --tidy / --speedup (default: all).
         #[arg(long = "host")]
         hosts: Vec<String>,
@@ -288,6 +299,14 @@ Examples:
   Keep a model only on the host that uses it most (or a chosen one):
     nest plan --consolidate hf:Qwen/Qwen3-8B
     nest plan --consolidate hf:Qwen/Qwen3-8B --host dodo
+  Spread a model over three hosts, one copy of each file; or everywhere:
+    nest plan --place hf:Qwen/Qwen3-8B --host dodo --host kiwi --host emu --factor 1/3
+    nest plan --place hf:Qwen/Qwen3-8B
+  Edit a plan before applying it: leave a model or one host out:
+    nest plan show 1234567 --files
+    nest plan skip 1234567 --host dodo
+    nest plan skip 1234567 Qwen/Qwen3-8B
+    nest plan unskip 1234567 Qwen/Qwen3-8B/config.json
   Copy what hosts keep pulling over the network:
     nest plan --speedup 7d
     nest plan --speedup 7d --min 4GiB --keep-free 200GiB
@@ -399,12 +418,35 @@ enum HfCmd {
 
 #[derive(Subcommand, Debug)]
 enum PlanCmd {
-    /// Execute a proposed plan.
+    /// Execute a proposed plan (what was not skipped).
     Apply {
         id: u64,
         /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
+    },
+    /// Show a proposed plan as edited: each step's models and files.
+    Show {
+        id: u64,
+        /// List every file, not only models and directories.
+        #[arg(long)]
+        files: bool,
+    },
+    /// Leave copies out of a plan: models (org/name), directories or files;
+    /// every copy (on --host) when none are named.
+    Skip {
+        id: u64,
+        /// Only this host's copies.
+        #[arg(long)]
+        host: Option<String>,
+        matches: Vec<String>,
+    },
+    /// Take skipped copies back into a plan (same matching as skip).
+    Unskip {
+        id: u64,
+        #[arg(long)]
+        host: Option<String>,
+        matches: Vec<String>,
     },
 }
 
@@ -1140,6 +1182,48 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Plan {
+            cmd: Some(PlanCmd::Show { id, files }),
+            ..
+        } => {
+            let v = c.get(&format!("/v1/plans/{id}")).await?;
+            if !cli.json {
+                print_plan(&v, *files);
+                return Ok(());
+            }
+            v
+        }
+        Cmd::Plan {
+            cmd:
+                Some(
+                    PlanCmd::Skip {
+                        id,
+                        host,
+                        matches,
+                    }
+                    | PlanCmd::Unskip {
+                        id,
+                        host,
+                        matches,
+                    },
+                ),
+            ..
+        } => {
+            let on = matches!(cli.cmd, Cmd::Plan { cmd: Some(PlanCmd::Unskip { .. }), .. });
+            let v = c
+                .post(
+                    &format!("/v1/plans/{id}/select"),
+                    json!({ "host": host, "matches": matches, "on": on }),
+                )
+                .await?;
+            if !cli.json {
+                let n = v["changed"].as_u64().unwrap_or(0);
+                println!("{} {n} copies", if on { "took back" } else { "skipped" });
+                print_plan(&v["plan"], false);
+                return Ok(());
+            }
+            v
+        }
+        Cmd::Plan {
             cmd: Some(PlanCmd::Apply { id, wait }),
             ..
         } => {
@@ -1154,11 +1238,22 @@ async fn main() -> Result<()> {
             tidy,
             speedup,
             consolidate,
+            place,
+            factor,
             hosts,
             min,
             keep_free,
         } => {
-            let body = if let Some(sel) = consolidate {
+            let body = if let Some(sel) = place {
+                let factor = match factor.as_deref() {
+                    None => 1.0,
+                    Some(f) => match f.split_once('/') {
+                        Some((a, b)) => a.trim().parse::<f64>()? / b.trim().parse::<f64>()?,
+                        None => f.trim().parse::<f64>()?,
+                    },
+                };
+                json!({ "goal": "place", "selector": abspath(sel), "hosts": hosts, "factor": factor })
+            } else if let Some(sel) = consolidate {
                 json!({ "goal": "consolidate", "selector": abspath(sel), "host": hosts.first() })
             } else if let Some(w) = tidy {
                 json!({ "goal": "tidy", "days": parse_days(w)?, "hosts": hosts, "archives": to })
@@ -1186,116 +1281,7 @@ async fn main() -> Result<()> {
             };
             let v = c.post("/v1/plans", body).await?;
             if !cli.json {
-                println!(
-                    "plan {}{}",
-                    v["id"],
-                    if v["feasible"].as_bool() == Some(true) {
-                        ""
-                    } else {
-                        "  (does not fully reach the targets)"
-                    }
-                );
-                for h in v["hosts"].as_array().into_iter().flatten() {
-                    let now = h["free_now"].as_u64().unwrap_or(0);
-                    let after = h["projected_free"].as_u64().unwrap_or(0);
-                    let target = h["target"].as_u64().unwrap_or(0);
-                    let gain = if after > now {
-                        format!(" (+{})", human(after - now))
-                    } else {
-                        String::new()
-                    };
-                    if target == 0 {
-                        // Goals other than free space set no target.
-                        println!(
-                            "  {:<9} free {} -> {}{gain}",
-                            h["host"].as_str().unwrap_or(""),
-                            human(now),
-                            human(after)
-                        );
-                        continue;
-                    }
-                    let mark = if after >= target { "ok" } else { "SHORT" };
-                    println!(
-                        "  {:<9} free {} -> {}{gain}, target {}  {mark}",
-                        h["host"].as_str().unwrap_or(""),
-                        human(now),
-                        human(after),
-                        human(target)
-                    );
-                }
-                for a in v["archives"].as_array().into_iter().flatten() {
-                    let now = a["free_now"].as_u64().unwrap_or(0);
-                    let after = a["projected_free"].as_u64().unwrap_or(0);
-                    if a["reachable"].as_bool() == Some(false) {
-                        println!(
-                            "  archive {:<9} unreachable",
-                            a["store"].as_str().unwrap_or("")
-                        );
-                        continue;
-                    }
-                    println!(
-                        "  archive {:<9} free {} -> {} (+{} stored) of {}",
-                        a["store"].as_str().unwrap_or(""),
-                        human(now),
-                        human(after),
-                        human(a["adds"].as_u64().unwrap_or(0)),
-                        human(a["total"].as_u64().unwrap_or(0))
-                    );
-                }
-                for st in v["steps"].as_array().into_iter().flatten() {
-                    let n = st["copies"].as_array().map(|a| a.len()).unwrap_or(0);
-                    let why: Vec<String> = st["copies"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .take(3)
-                        .map(|c| {
-                            format!(
-                                "      {} ({}): {}",
-                                c["path"].as_str().unwrap_or(""),
-                                human(c["size"].as_u64().unwrap_or(0)),
-                                c["why"].as_str().unwrap_or("")
-                            )
-                        })
-                        .collect();
-                    let more = n.saturating_sub(why.len());
-                    let tail = move || {
-                        for w in &why {
-                            println!("{w}");
-                        }
-                        if more > 0 {
-                            println!("      … and {more} more");
-                        }
-                    };
-                    match st["kind"].as_str() {
-                        Some("evict") => println!(
-                            "  evict {n} redundant copies ({}) from {}",
-                            human(st["bytes"].as_u64().unwrap_or(0)),
-                            st["host"].as_str().unwrap_or("")
-                        ),
-                        Some("replicate") => println!(
-                            "  copy {n} files ({}) to {}",
-                            human(st["bytes"].as_u64().unwrap_or(0)),
-                            st["host"].as_str().unwrap_or("")
-                        ),
-                        _ => println!(
-                            "  offload {n} files ({}) from {} to {}",
-                            human(st["bytes"].as_u64().unwrap_or(0)),
-                            st["host"].as_str().unwrap_or(""),
-                            st["store"].as_str().unwrap_or("")
-                        ),
-                    }
-                    tail();
-                }
-                for b in v["blocked"].as_array().into_iter().flatten() {
-                    println!("  blocked: {}", b.as_str().unwrap_or(""));
-                }
-                for b in v["notes"].as_array().into_iter().flatten() {
-                    println!("  note: {}", b.as_str().unwrap_or(""));
-                }
-                if v["steps"].as_array().is_some_and(|s| !s.is_empty()) {
-                    println!("apply with: nest plan apply {}", v["id"]);
-                }
+                print_plan(&v, false);
                 return Ok(());
             }
             v
@@ -2008,4 +1994,155 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// A plan for people: hosts' free space, then each step as a tree of
+/// models (or directories) and, with `files`, their files; skipped copies
+/// are marked.
+fn print_plan(v: &serde_json::Value, files: bool) {
+    println!(
+        "plan {}{}",
+        v["id"],
+        if v["feasible"].as_bool() == Some(true) {
+            ""
+        } else {
+            "  (does not fully reach the targets)"
+        }
+    );
+    for h in v["hosts"].as_array().into_iter().flatten() {
+        let now = h["free_now"].as_u64().unwrap_or(0);
+        let after = h["projected_free"].as_u64().unwrap_or(0);
+        let target = h["target"].as_u64().unwrap_or(0);
+        let gain = if after > now {
+            format!(" (+{})", human(after - now))
+        } else {
+            String::new()
+        };
+        if target == 0 {
+            // Goals other than free space set no target.
+            println!(
+                "  {:<9} free {} -> {}{gain}",
+                h["host"].as_str().unwrap_or(""),
+                human(now),
+                human(after)
+            );
+            continue;
+        }
+        let mark = if after >= target { "ok" } else { "SHORT" };
+        println!(
+            "  {:<9} free {} -> {}{gain}, target {}  {mark}",
+            h["host"].as_str().unwrap_or(""),
+            human(now),
+            human(after),
+            human(target)
+        );
+    }
+    for a in v["archives"].as_array().into_iter().flatten() {
+        let now = a["free_now"].as_u64().unwrap_or(0);
+        let after = a["projected_free"].as_u64().unwrap_or(0);
+        if a["reachable"].as_bool() == Some(false) {
+            println!(
+                "  archive {:<9} unreachable",
+                a["store"].as_str().unwrap_or("")
+            );
+            continue;
+        }
+        println!(
+            "  archive {:<9} free {} -> {} (+{} stored) of {}",
+            a["store"].as_str().unwrap_or(""),
+            human(now),
+            human(after),
+            human(a["adds"].as_u64().unwrap_or(0)),
+            human(a["total"].as_u64().unwrap_or(0))
+        );
+    }
+    print_steps(v, files);
+    for b in v["blocked"].as_array().into_iter().flatten() {
+        println!("  blocked: {}", b.as_str().unwrap_or(""));
+    }
+    for b in v["notes"].as_array().into_iter().flatten() {
+        println!("  note: {}", b.as_str().unwrap_or(""));
+    }
+    if v["steps"].as_array().is_some_and(|s| !s.is_empty()) {
+        println!(
+            "edit with: nest plan skip|unskip {} [--host HOST] [MODEL|PATH...]",
+            v["id"]
+        );
+        println!("apply with: nest plan apply {}", v["id"]);
+    }
+}
+
+fn print_steps(v: &serde_json::Value, files: bool) {
+    fn on(c: &serde_json::Value) -> bool {
+        c["skip"].as_bool() != Some(true)
+    }
+    fn size(c: &serde_json::Value) -> u64 {
+        c["size"].as_u64().unwrap_or(0)
+    }
+    for st in v["steps"].as_array().into_iter().flatten() {
+        let copies: Vec<&serde_json::Value> =
+            st["copies"].as_array().into_iter().flatten().collect();
+        let n = copies.iter().filter(|c| on(c)).count();
+        let bytes: u64 = copies.iter().filter(|c| on(c)).map(|c| size(c)).sum();
+        let skipped = copies.len() - n;
+        let host = st["host"].as_str().unwrap_or("");
+        let head = match st["kind"].as_str() {
+            Some("evict") => format!("- remove {n} copies ({}) from {host}", human(bytes)),
+            Some("replicate") => format!("+ copy {n} files ({}) to {host}", human(bytes)),
+            _ => format!(
+                "> offload {n} files ({}) from {host} to {}",
+                human(bytes),
+                st["store"].as_str().unwrap_or("")
+            ),
+        };
+        let skip_note = if skipped > 0 {
+            format!(", {skipped} skipped")
+        } else {
+            String::new()
+        };
+        println!("  {head}{skip_note}");
+        // Models (or directories), largest first.
+        let mut groups: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
+        for c in &copies {
+            let g = c["group"].as_str().unwrap_or("").to_string();
+            match groups.iter_mut().find(|(x, _)| *x == g) {
+                Some((_, v)) => v.push(c),
+                None => groups.push((g, vec![c])),
+            }
+        }
+        groups.sort_by_key(|(_, v)| std::cmp::Reverse(v.iter().map(|c| size(c)).sum::<u64>()));
+        for (g, cs) in groups {
+            let n = cs.iter().filter(|c| on(c)).count();
+            let b: u64 = cs.iter().filter(|c| on(c)).map(|c| size(c)).sum();
+            let mark = if n == 0 {
+                "[ ]"
+            } else if n < cs.len() {
+                "[~]"
+            } else {
+                "[x]"
+            };
+            println!(
+                "      {mark} {}  {n}/{} files, {}",
+                if g.is_empty() { "(other)" } else { &g },
+                cs.len(),
+                human(b)
+            );
+            if !files {
+                continue;
+            }
+            for c in cs {
+                let name = c["name"]
+                    .as_str()
+                    .filter(|x| !x.is_empty())
+                    .or(c["path"].as_str())
+                    .unwrap_or("");
+                println!(
+                    "          {} {name}  {}  {}",
+                    if on(c) { "[x]" } else { "[ ]" },
+                    human(size(c)),
+                    c["why"].as_str().unwrap_or("")
+                );
+            }
+        }
+    }
 }

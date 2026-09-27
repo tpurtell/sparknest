@@ -22,6 +22,19 @@
 //!   host holds that file (checked when applying); archive copies and
 //!   copies rules require stay.
 //!
+//! - **Place**: one selection over chosen hosts with a replica factor: each
+//!   file ends on `round(factor × hosts)` of them (at least one), the split
+//!   kept even (every host near its share of the bytes), and among the hosts
+//!   with room in their share, those that read that file most come first,
+//!   then those already holding it. Copies outside the assignment are
+//!   removed once a host it assigns holds the file (checked when applying).
+//!   Factor 1 copies everything everywhere; 1/hosts spreads it; one host
+//!   gathers it there.
+//!
+//! A plan can be edited before it is applied: any copy can be skipped (and
+//! taken back), by host, by model or file (`select`). Skipping a copy a
+//! removal depends on only keeps the removal from happening.
+//!
 //! Plans only remove copies the placement engine could re-create; the last
 //! copy is never removed, rule-required copies are never removed, and every
 //! step names the exact generation it planned for, so a file that changed
@@ -47,6 +60,43 @@ pub struct Copy {
     /// Why this copy is in the plan, for people.
     #[serde(default)]
     pub why: String,
+    /// Remove this copy only once this node holds the file (place).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keeper: Option<NodeId>,
+    /// Left out of the plan by the person editing it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip: bool,
+    /// The model (org/name) or directory the file belongs to, and its name
+    /// there, for people (`label`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+impl Copy {
+    /// How people know the file: group/name when labeled, else its path.
+    pub fn label(&self) -> String {
+        if self.name.is_empty() {
+            self.path.clone()
+        } else {
+            format!("{}/{}", self.group, self.name)
+        }
+    }
+
+    fn new(file: FileId, generation: Generation, size: u64, path: String, why: String) -> Copy {
+        Copy {
+            file,
+            generation,
+            size,
+            path,
+            why,
+            keeper: None,
+            skip: false,
+            group: String::new(),
+            name: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,6 +134,38 @@ impl Step {
             | Step::Offload { copies, .. }
             | Step::Replicate { copies, .. } => copies,
         }
+    }
+
+    fn parts(&mut self) -> (&str, &mut Vec<Copy>, &mut u64) {
+        match self {
+            Step::Evict {
+                host,
+                copies,
+                bytes,
+                ..
+            }
+            | Step::Offload {
+                host,
+                copies,
+                bytes,
+                ..
+            }
+            | Step::Replicate {
+                host,
+                copies,
+                bytes,
+                ..
+            } => (host, copies, bytes),
+        }
+    }
+
+    /// The step without the copies skipped; none if nothing is left.
+    pub fn selected(&self) -> Option<Step> {
+        let mut s = self.clone();
+        let (_, copies, bytes) = s.parts();
+        copies.retain(|c| !c.skip);
+        *bytes = copies.iter().map(|c| c.size).sum();
+        (!copies.is_empty()).then_some(s)
     }
 }
 
@@ -127,6 +209,23 @@ pub enum Goal {
         #[serde(default)]
         hub: String,
     },
+    Place {
+        /// A path, or hf:org/name.
+        selector: String,
+        /// Hosts or @groups it goes on; every host when empty.
+        #[serde(default)]
+        hosts: Vec<String>,
+        /// Share of those hosts each file is on: 1/hosts (spread) to 1
+        /// (everywhere).
+        #[serde(default = "default_factor")]
+        factor: f64,
+        #[serde(default)]
+        hub: String,
+    },
+}
+
+fn default_factor() -> f64 {
+    1.0
 }
 
 fn default_min_remote() -> u64 {
@@ -469,6 +568,18 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
             let host = host.clone();
             make_consolidate(placer, w, goal.clone(), &m, host.as_deref())
         }
+        Goal::Place {
+            selector,
+            hosts,
+            factor,
+            hub,
+        } => {
+            let sel = Selector::parse(selector, hub).map_err(NestError::Invalid)?;
+            let m = placer.manifest(&sel).await?;
+            let w = World::gather(placer, &[], nest_data::usage::KEEP_DAYS).await?;
+            let targets = scope(placer, hosts)?;
+            make_place(w, goal.clone(), &m, targets, *factor)
+        }
     }
 }
 
@@ -766,16 +877,7 @@ fn make_speedup(
                     human(u.archive_bytes)
                 );
             }
-            wanted.push((
-                net,
-                Copy {
-                    file: a.id,
-                    generation: a.generation,
-                    size: a.size,
-                    path,
-                    why,
-                },
-            ));
+            wanted.push((net, Copy::new(a.id, a.generation, a.size, path, why)));
         }
         wanted.sort_by_key(|w| std::cmp::Reverse(w.0));
         let floor = keep_free.unwrap_or(w.total.get(&node).copied().unwrap_or(0) / 10);
@@ -898,12 +1000,14 @@ fn make_consolidate(
         .entries
         .iter()
         .filter(|e| e.stable && !have.contains(&(e.file, e.generation)))
-        .map(|e| Copy {
-            file: e.file,
-            generation: e.generation,
-            size: e.size,
-            path: e.path.clone(),
-            why: format!("gathering it on {host_name}"),
+        .map(|e| {
+            Copy::new(
+                e.file,
+                e.generation,
+                e.size,
+                e.path.clone(),
+                format!("gathering it on {host_name}"),
+            )
         })
         .collect();
     let need: u64 = add.iter().map(|c| c.size).sum();
@@ -973,6 +1077,261 @@ fn make_consolidate(
     Ok(w.finish(goal, rows, steps))
 }
 
+fn make_place(
+    mut w: World,
+    goal: Goal,
+    m: &crate::selector::Manifest,
+    mut targets: Vec<NodeId>,
+    factor: f64,
+) -> NestResult<Plan> {
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return Err(NestError::Invalid("no hosts to place it on".into()));
+    }
+    let h = targets.len();
+    let k = ((factor.clamp(0.0, 1.0) * h as f64).round() as usize).clamp(1, h);
+    // One entry per file (a file two snapshots share is placed once).
+    let mut seen = HashSet::new();
+    let mut entries: Vec<&crate::selector::Entry> = m
+        .entries
+        .iter()
+        .filter(|e| e.stable && seen.insert(e.file))
+        .collect();
+    let skipped = m.entries.iter().filter(|e| !e.stable).count();
+    if skipped > 0 {
+        w.notes.push(format!(
+            "{skipped} files are being written and are left as they are"
+        ));
+    }
+    entries.sort_by(|a, b| b.size.cmp(&a.size).then(a.file.cmp(&b.file)));
+    let total: u64 = entries.iter().map(|e| e.size).sum();
+    // Each host's even share of the bytes to hold.
+    let share = ((total as u128 * k as u128) / h as u128) as u64;
+    // Who holds which generation now (live stores).
+    let mut holders: HashMap<(FileId, Generation), Vec<NodeId>> = HashMap::new();
+    for (n, v) in &w.copies_on {
+        for c in v {
+            holders.entry((c.file, c.generation)).or_default().push(*n);
+        }
+    }
+    let read = |w: &World, n: NodeId, f: FileId| -> u64 {
+        w.usage
+            .get(&n)
+            .and_then(|u| u.get(&f))
+            .map_or(0, |u| u.local_bytes + u.remote_bytes + u.archive_bytes)
+    };
+    let margin = |w: &World, n: NodeId| -> u64 {
+        (64u64 << 30).max(w.total.get(&n).copied().unwrap_or(0) / 20)
+    };
+    let mut assigned: HashMap<NodeId, u64> = HashMap::new();
+    let mut add: BTreeMap<NodeId, Vec<Copy>> = BTreeMap::new();
+    let mut drop: BTreeMap<NodeId, Vec<Copy>> = BTreeMap::new();
+    let mut kept: HashMap<String, u64> = HashMap::new();
+    let (mut short_files, mut short_bytes) = (0u64, 0u64);
+    for e in &entries {
+        let held = holders
+            .get(&(e.file, e.generation))
+            .cloned()
+            .unwrap_or_default();
+        let mut cands = targets.clone();
+        // Hosts still below their share first; among them, those that read
+        // this file most, then those holding it, then the emptiest.
+        cands.sort_by_key(|n| {
+            let a = assigned.get(n).copied().unwrap_or(0);
+            (
+                a >= share,
+                std::cmp::Reverse(read(&w, *n, e.file)),
+                !held.contains(n),
+                a,
+                *n,
+            )
+        });
+        let mut picked: Vec<NodeId> = Vec::new();
+        for n in cands {
+            if picked.len() == k {
+                break;
+            }
+            if !held.contains(&n) {
+                let room = w.projected.get(&n).copied().unwrap_or(0);
+                if room < e.size + margin(&w, n) {
+                    continue;
+                }
+            }
+            picked.push(n);
+        }
+        if picked.len() < k {
+            short_files += 1;
+            short_bytes += e.size;
+        }
+        for &n in &picked {
+            *assigned.entry(n).or_default() += e.size;
+            if !held.contains(&n) {
+                let p = w.projected.entry(n).or_default();
+                *p = p.saturating_sub(e.size);
+                add.entry(n).or_default().push(Copy::new(
+                    e.file,
+                    e.generation,
+                    e.size,
+                    e.path.clone(),
+                    if read(&w, n, e.file) > 0 {
+                        format!("read there ({})", human(read(&w, n, e.file)))
+                    } else {
+                        format!("{k} of {h} hosts hold each file")
+                    },
+                ));
+            }
+        }
+        let Some(&keeper) = picked.iter().find(|n| held.contains(n)).or(picked.first()) else {
+            continue;
+        };
+        for &n in &held {
+            if picked.contains(&n) {
+                continue;
+            }
+            if let Some(rule) = w.required(e.file, n) {
+                *kept
+                    .entry(format!("{}: rule {rule:?}", w.host(n)))
+                    .or_default() += e.size;
+                continue;
+            }
+            let mut c = Copy::new(
+                e.file,
+                e.generation,
+                e.size,
+                e.path.clone(),
+                format!("kept on {} instead", w.host(keeper)),
+            );
+            c.keeper = Some(keeper);
+            drop.entry(n).or_default().push(c);
+        }
+    }
+    let names: Vec<String> = targets.iter().map(|n| w.host(*n)).collect();
+    w.notes.push(if k == h && h > 1 {
+        format!("every file on each of {}", names.join(", "))
+    } else if k == 1 && h > 1 {
+        format!(
+            "one copy of each file, spread over {}: about {} each",
+            names.join(", "),
+            human(share)
+        )
+    } else if h == 1 {
+        format!("everything on {}", names[0])
+    } else {
+        format!(
+            "{k} copies of each file over {}: about {} each",
+            names.join(", "),
+            human(share)
+        )
+    });
+    if short_files > 0 {
+        w.blocked.push(format!(
+            "{short_files} files ({}) get fewer than {k} copies: the hosts lack room",
+            human(short_bytes)
+        ));
+    }
+    let mut kept: Vec<_> = kept.into_iter().collect();
+    kept.sort();
+    for (who, b) in kept {
+        let (host, rule) = who.split_once(": ").unwrap_or((&who, ""));
+        w.notes
+            .push(format!("{host}: {} stays, {rule} keeps it there", human(b)));
+    }
+    let mut steps = Vec::new();
+    for (n, copies) in add {
+        steps.push(Step::Replicate {
+            host: w.host(n),
+            node: n,
+            bytes: copies.iter().map(|c| c.size).sum(),
+            copies,
+        });
+    }
+    for (n, copies) in drop {
+        let b: u64 = copies.iter().map(|c| c.size).sum();
+        *w.projected.entry(n).or_default() += b;
+        steps.push(Step::Evict {
+            host: w.host(n),
+            node: n,
+            bytes: b,
+            copies,
+            requires: None,
+        });
+    }
+    let mut rows: Vec<NodeId> = w.name_of.keys().copied().collect();
+    rows.sort();
+    let rows = w.host_rows(rows.into_iter().map(|n| (n, 0)));
+    Ok(w.finish(goal, rows, steps))
+}
+
+/// Name every copy for people: a Hugging Face file by its repo and the name
+/// its snapshot gives it, anything else by its directory and file name.
+pub fn label(c: &rusqlite::Connection, hub: &str, plan: &mut Plan) -> NestResult<()> {
+    let names = if hub.is_empty() {
+        HashMap::new()
+    } else {
+        crate::space::hf_names(c, hub)?
+    };
+    for s in &mut plan.steps {
+        let (_, copies, _) = s.parts();
+        for cp in copies.iter_mut() {
+            (cp.group, cp.name) = match names.get(&cp.file) {
+                Some((repo, name)) => (repo.clone(), name.clone()),
+                None => match cp.path.rsplit_once('/') {
+                    Some((d, f)) => (
+                        if d.is_empty() {
+                            "/".into()
+                        } else {
+                            d.to_string()
+                        },
+                        f.to_string(),
+                    ),
+                    None => (String::new(), cp.path.clone()),
+                },
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Skip (`on` false) or take back copies of a plan: on `host` (every host
+/// when none), matching any of `matches` — a model (org/name, hf:org/name),
+/// a directory or path prefix, or one file (group/name, its path, or #id).
+/// No `matches` means every copy there. Returns how many copies changed.
+pub fn select(plan: &mut Plan, host: Option<&str>, matches: &[String], on: bool) -> usize {
+    let hit = |c: &Copy| {
+        matches.is_empty()
+            || matches.iter().any(|m| {
+                let m = m
+                    .strip_prefix("hf:")
+                    .or_else(|| m.strip_prefix("hf-dataset:"))
+                    .unwrap_or(m);
+                let m = m.trim_end_matches('/');
+                if let Some(id) = m.strip_prefix('#') {
+                    return id.parse::<u64>().is_ok_and(|id| c.file.0 == id);
+                }
+                c.group == m
+                    || format!("{}/{}", c.group, c.name) == m
+                    || c.path == m
+                    || c.path.starts_with(&format!("{m}/"))
+                    || c.group.starts_with(&format!("{m}/"))
+            })
+    };
+    let mut n = 0;
+    for s in &mut plan.steps {
+        let (h, copies, _) = s.parts();
+        if host.is_some_and(|x| x != h) {
+            continue;
+        }
+        for c in copies.iter_mut() {
+            if c.skip == on && hit(c) {
+                c.skip = !on;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 type CopyMaps = (
     HashMap<NodeId, Vec<Copy>>,
     HashMap<(FileId, Generation), usize>,
@@ -1012,13 +1371,13 @@ fn collect_copies(placer: &Placer) -> NestResult<CopyMaps> {
                 .map_err(sql)?
                 .map(|p| String::from_utf8_lossy(&p).into_owned())
                 .unwrap_or_else(|| format!("<file {f}>"));
-            copies_on.entry(NodeId(store)).or_default().push(Copy {
+            copies_on.entry(NodeId(store)).or_default().push(Copy::new(
                 file,
                 generation,
                 size,
                 path,
-                why: String::new(),
-            });
+                String::new(),
+            ));
         }
     }
     Ok((copies_on, count, created))

@@ -410,3 +410,92 @@ async fn make_room_moves_sole_copies_to_hosts_granted_room() {
     c.converge().await;
     assert_eq!(holders(&c, f), [2]);
 }
+
+/// Place: one copy of each file spread evenly over three hosts, the copies
+/// outside the assignment removed once the keeper holds the file; a skipped
+/// copy keeps the removal that depends on it from happening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn place_spreads_a_selection_evenly_and_honors_skips() {
+    let c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    let v = c.node(1).vfs.clone();
+    let dir = v.mkdir(FileId::ROOT, b"m", 0o755).await.unwrap().id;
+    let mut files = Vec::new();
+    for i in 0..6 {
+        let (a, fh, _) = v
+            .create(dir, format!("part{i}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v.write(fh, 0, vec![i as u8; (2 * MIB) as usize])
+            .await
+            .unwrap();
+        v.release(fh, None).await;
+        files.push(a.id);
+    }
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        files.iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    let goal = Goal::Place {
+        selector: "/m".into(),
+        hosts: vec![],
+        factor: 1.0 / 3.0,
+        hub: "/hub".into(),
+    };
+    let mut plan = p.plan(goal.clone()).await.unwrap();
+    assert!(plan.feasible, "{plan:?}");
+    // n1 keeps a third; n2 and n3 take a third each.
+    let adds: Vec<(String, usize)> = plan
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Replicate { host, copies, .. } => Some((host.clone(), copies.len())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(adds, [("n2".to_string(), 2), ("n3".to_string(), 2)]);
+    let drops: usize = plan
+        .steps
+        .iter()
+        .filter(|s| matches!(s, Step::Evict { .. }))
+        .map(|s| s.copies().len())
+        .sum();
+    assert_eq!(drops, 4);
+    assert!(
+        plan.steps
+            .iter()
+            .flat_map(|s| s.copies())
+            .all(|c| c.group == "/m" && c.name.starts_with("part")),
+        "labeled by directory and name"
+    );
+
+    // Leave n3 out: its files stay on n1.
+    let (edited, n) = p.select_plan(plan.id, Some("n3"), &[], false).unwrap();
+    assert_eq!(n, 2);
+    plan = edited;
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    c.converge().await;
+    let mut on: Vec<Vec<u64>> = files.iter().map(|f| holders(&c, *f)).collect();
+    on.sort();
+    assert_eq!(
+        on,
+        [vec![1], vec![1], vec![1], vec![1], vec![2], vec![2]],
+        "{job:?}"
+    );
+
+    // Planned again: n3 still takes its share.
+    let plan = p.plan(goal).await.unwrap();
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    let mut per_host = [0; 3];
+    for f in &files {
+        let h = holders(&c, *f);
+        assert_eq!(h.len(), 1, "one copy each");
+        per_host[h[0] as usize - 1] += 1;
+    }
+    assert_eq!(per_host, [2, 2, 2]);
+}

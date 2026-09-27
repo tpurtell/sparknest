@@ -1071,3 +1071,44 @@ fabric's verbs layer and the FUSE io_uring transport.
 device's sustained rate), against 2.9 GB/s with inline flushing; the
 buffered flusher's 7.1 GB/s on a 4 GiB file was flattered by the page
 cache. The scratch disk is to be measured when idle.
+
+## ADR-043 — Placing a selection by replica factor; plans are edited before they apply; Finish only downloads (2026-09-28)
+
+**Context.** Moving a model meant separate one-shot actions ("copy to every
+host", "move to 1", "move to…", offload), none of which could spread a
+model evenly or keep, say, two copies of each file over four hosts. Plans
+could only be applied whole. "Finish" on a partly downloaded model first
+copied everything the cluster had onto one host, moving data the user never
+asked to move.
+
+**Decision.**
+- A **place** goal: a selection, target hosts, and a replica factor from
+  1/hosts to 1. Each file goes on `round(factor × hosts)` of them (at least
+  one). Files are assigned largest first. Hosts still below their even
+  share of the bytes come first; among those, the hosts that read that file
+  most in the last 30 days win, then hosts already holding it (no
+  transfer), then the emptiest. A host without the file must keep
+  max(64 GiB, 5%) free after taking it. Copies outside the assignment are
+  removed only once a host the file is assigned to (its keeper, per copy)
+  holds it. Rule-required copies stay. One host with factor 1 is the old
+  consolidate. The UI's Place dialog offers multi host (hosts and factor),
+  single host (the host that reads it most, then holds most, preselected)
+  and archive (offload, or copy while keeping the hosts' copies).
+- **Plans are edited before they apply.** Every copy in a proposed plan can
+  be skipped or taken back by host, model (org/name), directory, file or
+  file id (`POST /v1/plans/{id}/select`, `nest plan skip|unskip`). Copies
+  carry the model and snapshot name they belong to, for people. Apply runs
+  what is left. The additions run on every host at once, then the
+  removals. A removal whose keeper was skipped finds no copy there and is
+  kept.
+- **Finish downloads only what no host has.** `hf download --dry-run`
+  against the hub cache (sizes of "-" are cached files) says what is
+  missing cluster-wide. Finish appears only then and runs `hf download` on
+  the chosen host, which writes the missing files there and moves nothing.
+  With no revision given, downloads and dry runs use the revision the cache
+  holds (`refs/main`), so finishing never pulls a newer snapshot.
+
+**Consequences.** The factor makes "spread" and "everywhere" two ends of
+one control. Placement may take several passes when hosts lack room, and
+the plan says how many files fell short. Plans stay in memory on the node
+that made them (as before).
