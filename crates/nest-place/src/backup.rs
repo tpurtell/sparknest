@@ -151,7 +151,9 @@ impl BackupArea {
         let root = archive_root.join("backups");
         std::fs::create_dir_all(root.join("manifests")).map_err(io)?;
         let objects = Arc::new(
-            ObjectStore::open_with_staging(&root, &format!("staging-{node}")).map_err(io)?,
+            ObjectStore::open_with_staging(&root, &format!("staging-{node}"))
+                .map_err(io)?
+                .paced(ARCHIVE_PACE),
         );
         Ok(BackupArea { root, objects })
     }
@@ -576,3 +578,6 @@ impl MaxIo for NestError {
         }
     }
 }
+
+/// Transfers into archive stores flush this often (see `ObjectStore::paced`).
+const ARCHIVE_PACE: u64 = 64 << 20;

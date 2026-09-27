@@ -56,6 +56,9 @@ pub struct ObjectStore {
     reserve: std::sync::atomic::AtomicU64,
     /// Last statvfs sample: (when, free bytes minus writes since).
     room: std::sync::Mutex<(std::time::Instant, u64)>,
+    /// Transfers into this store flush every this many bytes (see
+    /// `Staging::write_all_at`); `None`: left to the kernel.
+    pace: Option<u64>,
 }
 
 fn object_name(k: ObjectKey) -> String {
@@ -96,6 +99,7 @@ impl ObjectStore {
             staging: root.join("staging"),
             reserve: std::sync::atomic::AtomicU64::new(0),
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+            pace: None,
         })
     }
 
@@ -121,6 +125,7 @@ impl ObjectStore {
             staging,
             reserve: std::sync::atomic::AtomicU64::new(0),
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+            pace: None,
         })
     }
 
@@ -196,6 +201,16 @@ impl ObjectStore {
         }
     }
 
+    /// Flush transfers into this store every `bytes` and drop their pages
+    /// from the cache: for stores behind slow links (an SMB share, a hard
+    /// disk), where the kernel would otherwise let hundreds of GB of dirty
+    /// pages pile up on a large-memory host, then flush them for minutes
+    /// while everything else waits (raptor did, offloading a 400 GB model).
+    pub fn paced(mut self, bytes: u64) -> Self {
+        self.pace = Some(bytes.max(1 << 20));
+        self
+    }
+
     /// Start an incoming whole-file transfer.
     pub fn begin_staging(&self, k: ObjectKey) -> io::Result<Staging> {
         let path = self
@@ -211,6 +226,9 @@ impl ObjectStore {
             key: k,
             path,
             file: Some(file),
+            pace: self.pace,
+            unflushed: std::sync::atomic::AtomicU64::new(0),
+            flushing: std::sync::Mutex::new(()),
         })
     }
 
@@ -327,6 +345,11 @@ pub struct Staging {
     key: ObjectKey,
     path: PathBuf,
     file: Option<File>,
+    pace: Option<u64>,
+    /// Bytes written since the last flush.
+    unflushed: std::sync::atomic::AtomicU64,
+    /// Writers wait here while a flush runs: backpressure.
+    flushing: std::sync::Mutex<()>,
 }
 
 impl Staging {
@@ -338,6 +361,33 @@ impl Staging {
             .as_ref()
             .expect("staging file present until commit")
     }
+
+    /// Write at `off`. In a paced store, every `pace` bytes the file is
+    /// flushed (writers wait meanwhile) and its pages dropped from the
+    /// cache, so a transfer never holds more than about `pace` unflushed.
+    pub fn write_all_at(&self, buf: &[u8], off: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::Ordering::Relaxed;
+        let f = self.file();
+        let Some(pace) = self.pace else {
+            return f.write_all_at(buf, off);
+        };
+        let _turn = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        f.write_all_at(buf, off)?;
+        if self.unflushed.fetch_add(buf.len() as u64, Relaxed) + buf.len() as u64 >= pace {
+            f.sync_data()?;
+            self.unflushed.store(0, Relaxed);
+            drop_cached(f);
+        }
+        Ok(())
+    }
+}
+
+/// Ask the kernel to drop a file's clean cached pages (after a flush, or
+/// after reading through it once): a bulk copy should not evict the
+/// host's useful page cache.
+pub fn drop_cached(f: &File) {
+    let _ = nix::fcntl::posix_fadvise(f, 0, 0, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED);
 }
 
 impl Drop for Staging {
@@ -421,6 +471,38 @@ mod tests {
 
     fn k(f: u64, g: u64) -> ObjectKey {
         ObjectKey::new(FileId(f), Generation(g))
+    }
+
+    /// A paced transfer written out of order (several chunks in flight)
+    /// commits the same bytes, flushing as it goes.
+    #[test]
+    fn paced_staging_writes_commit_the_same_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ObjectStore::open_with_staging(dir.path(), "staging-1")
+            .unwrap()
+            .paced(1 << 20);
+        let data: Vec<u8> = (0..(5u32 << 20) + 123)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let st = s.begin_staging(k(3, 2)).unwrap();
+        let chunk = 768 << 10;
+        let mut starts: Vec<usize> = (0..data.len()).step_by(chunk).collect();
+        starts.reverse();
+        std::thread::scope(|t| {
+            for part in starts.chunks(3) {
+                let (st, data) = (&st, &data);
+                t.spawn(move || {
+                    for &o in part {
+                        let end = (o + chunk).min(data.len());
+                        st.write_all_at(&data[o..end], o as u64).unwrap();
+                    }
+                });
+            }
+        });
+        s.commit_staging(st).unwrap();
+        let mut got = Vec::new();
+        s.open_read(k(3, 2)).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
     }
 
     #[test]

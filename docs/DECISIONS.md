@@ -986,3 +986,25 @@ holds completely gets a Finish button that does the same on the host
 holding most of it. hf runs with the hub as its cache and HF_HOME, and the
 user's `~/.cache/huggingface/token` as HF_TOKEN_PATH when present.
 Progress is what the host holds of the repo against hf's size.
+
+## ADR-039 — Transfers into archive stores are paced (2026-09-28)
+
+**Context.** Offloading a 400 GB model to the NAS archive (an SMB share on
+raptor) made raptor crawl, with the kernel's CIFS flush thread at 100%.
+The ext4 → CIFS copy is buffered (`copy_file_range` refuses to cross
+filesystem types), nothing waited for the share, and on a host with 183 GB
+of RAM the kernel lets tens of GB of dirty pages build up before
+throttling, then flushes them through one SMB connection while everything
+else waits for memory. The source was read through the page cache too,
+evicting what raptor had cached.
+
+**Decision.** Archive and backup stores are opened paced
+(`ObjectStore::paced`, 64 MiB): `Staging::write_all_at` flushes the file
+(`fdatasync`) every 64 MiB written, with writers waiting meanwhile, and
+drops its pages (`POSIX_FADV_DONTNEED`), so a transfer never holds more
+than ~64 MiB unflushed. The buffered copy also drops the source's pages as
+it goes. Live stores on local NVMe are not paced.
+
+**Alternatives.** Mounting the share with `cache=none` (every client of the
+share loses its cache), or a lower global `vm.dirty_bytes` / a per-device
+`strict_limit` (host-wide knobs, root; still useful as belt and braces).

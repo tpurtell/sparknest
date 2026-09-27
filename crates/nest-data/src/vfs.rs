@@ -2611,8 +2611,7 @@ impl Vfs {
                 }
                 tokio::task::spawn_blocking(move || {
                     let g = st.lock();
-                    let f = g.as_ref().expect("staging open").file();
-                    f.write_all_at(&bytes, off)
+                    g.as_ref().expect("staging open").write_all_at(&bytes, off)
                 })
                 .await
                 .expect("blocking task")
@@ -2683,6 +2682,7 @@ impl Vfs {
                     ) {
                         use std::os::unix::fs::FileExt;
                         let mut buf = vec![0u8; 4 << 20];
+                        let mut since_drop = 0usize;
                         while (off_in as u64) < size {
                             let want = ((size - off_in as u64) as usize).min(buf.len());
                             let got = from.read_at(&mut buf[..want], off_in as u64)?;
@@ -2691,10 +2691,18 @@ impl Vfs {
                                     "short copy: {off_in} of {size} bytes"
                                 )));
                             }
-                            st.file().write_all_at(&buf[..got], off_out as u64)?;
+                            // Paced for archive stores (no dirty-page flood).
+                            st.write_all_at(&buf[..got], off_out as u64)?;
                             off_in += got as libc::loff_t;
                             off_out += got as libc::loff_t;
+                            // Read once: keep the host's page cache for others.
+                            since_drop += got;
+                            if since_drop >= 256 << 20 {
+                                nest_store::drop_cached(&from);
+                                since_drop = 0;
+                            }
                         }
+                        nest_store::drop_cached(&from);
                         break;
                     }
                     return Err(e);
