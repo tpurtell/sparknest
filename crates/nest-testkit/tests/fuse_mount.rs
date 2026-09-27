@@ -448,3 +448,36 @@ async fn refuses_a_nonempty_mountpoint() {
     let e = c.node(1).mount_at(d.path()).unwrap_err();
     assert!(format!("{e:#}").contains("not empty"), "{e:#}");
 }
+
+/// Files written into the bare mountpoint are moved aside, the mount goes
+/// ahead, and they reappear under /.lost+found/<run>/<host>/unmounted/.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rescues_files_written_while_unmounted() {
+    if !std::path::Path::new("/dev/fuse").exists() {
+        return;
+    }
+    let c = TestCluster::start(1).await;
+    let mp = c.state_dir(1).join("mnt-rescue");
+    std::fs::create_dir_all(mp.join("sub")).unwrap();
+    std::fs::write(mp.join("sub/while-unmounted.txt"), b"keep me").unwrap();
+    c.node(1).mount_with_rescue(&mp).unwrap();
+    let mp2 = mp.clone();
+    let found = blocking(move || {
+        for _ in 0..200 {
+            let lf = mp2.join(".lost+found");
+            if let Ok(runs) = std::fs::read_dir(&lf) {
+                for r in runs.flatten() {
+                    let p = r.path().join("n1/unmounted/sub/while-unmounted.txt");
+                    if let Ok(b) = std::fs::read(&p) {
+                        return Some(b);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        None
+    })
+    .await;
+    assert_eq!(found.as_deref(), Some(b"keep me".as_slice()));
+    c.node(1).unmount();
+}

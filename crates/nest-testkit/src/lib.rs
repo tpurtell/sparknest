@@ -129,6 +129,7 @@ impl TestCluster {
                 ttl_ms: 1000,
                 io_uring: true,
                 allow_nonempty: false,
+                rescue_unmounted: true,
             },
         }
     }

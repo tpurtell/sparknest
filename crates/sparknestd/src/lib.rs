@@ -8,5 +8,6 @@ pub mod offline;
 pub mod recovery;
 pub mod runstate;
 pub mod sdnotify;
+pub mod strays;
 
 pub use node::{Node, Tuning};

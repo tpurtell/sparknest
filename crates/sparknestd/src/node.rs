@@ -309,7 +309,7 @@ impl Node {
         {
             // The cluster keeps its copies here either way; only the local
             // mount waits for the problem to be fixed.
-            match node.mount_at(&mp) {
+            match node.mount_with_rescue(&mp) {
                 Ok(()) => crate::sdnotify::status(&format!("serving; mounted at {}", mp.display())),
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), "not mounted; will retry");
@@ -339,13 +339,36 @@ impl Node {
         };
         while self.retry_mount.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if self.mount_at(&mp).is_ok() {
+            if self.mount_with_rescue(&mp).is_ok() {
                 self.retry_mount
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 crate::sdnotify::status(&format!("serving; mounted at {}", mp.display()));
                 tracing::info!("mountpoint fixed: mounted");
             }
         }
+    }
+
+    /// Mount, first moving aside anything written into the bare mountpoint
+    /// and then importing it into `/.lost+found/<run>/<host>/unmounted/`.
+    pub fn mount_with_rescue(&self, mp: &std::path::Path) -> anyhow::Result<()> {
+        let rescued = if self.cfg.fuse.rescue_unmounted && !self.cfg.fuse.allow_nonempty {
+            let stamp = nest_data::fsck::stamp_now();
+            crate::strays::rescue(mp, &self.cfg.node.state_dir, &stamp)?.map(|d| (d, stamp))
+        } else {
+            None
+        };
+        self.mount_at(mp)?;
+        if let Some((dir, stamp)) = rescued {
+            let dst = format!("/.lost+found/{stamp}/{}/unmounted", self.cfg.node.name);
+            let job = self.placer.import(nest_place::import::ImportOptions {
+                src: dir,
+                dst: dst.clone(),
+                r#move: true,
+                seal: nest_place::import::SealMode::None,
+            });
+            tracing::warn!(job, to = %dst, "importing files written while sparknest was not mounted");
+        }
+        Ok(())
     }
 
     /// The RDMA fabric, once it is up.

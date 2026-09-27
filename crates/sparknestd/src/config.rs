@@ -95,6 +95,11 @@ pub struct FuseSection {
     /// hidden under the mount). Off: such a mount is refused and reported.
     #[serde(default)]
     pub allow_nonempty: bool,
+    /// Move files written into the bare mountpoint aside and import them into
+    /// /.lost+found/<run>/<host>/unmounted/ instead of refusing to mount
+    /// (up to 16 GiB / 200k entries).
+    #[serde(default = "default_true")]
+    pub rescue_unmounted: bool,
 }
 
 impl Default for FuseSection {
@@ -104,6 +109,7 @@ impl Default for FuseSection {
             ttl_ms: default_ttl_ms(),
             io_uring: true,
             allow_nonempty: false,
+            rescue_unmounted: true,
         }
     }
 }
