@@ -25,3 +25,19 @@ rebooted together; the cluster came back with its state intact.
 
 Not yet exercised: pulling a cable (a real partition; the in-process suite
 covers partitions) and a host reboot under load.
+
+## Second run, relaxed durability build (2026-09-27, 10 minutes, 100G)
+
+| | |
+|---|---|
+| Daemon SIGKILLs | 12 |
+| Files written / bytes | 12,097 / 69.1 GB |
+| Files read and verified / bytes | 11,616 / 65.5 GB |
+| Corrupt reads | 0 |
+| Files at the end, re-read from raptor and from moa | 9,583 each, 0 corrupt, 0 errors |
+
+Every restart found files the workers had written into the bare mountpoint
+while the daemon was dead; they were moved aside and imported into
+`/.lost+found/<run>/<host>/unmounted/`, and every host remounted by itself
+(the first run's build left such hosts unmounted). Delete errors (77) were
+all "transport endpoint is not connected" on the killed host's own mount.

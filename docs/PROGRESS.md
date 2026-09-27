@@ -3,6 +3,23 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-27 — M8: relaxed durability, automatic recovery, faster metadata
+
+- openraft 0.10 (alpha.35): leader replicates submitted entries, appends
+  merge; Raft log and metadata in WAL/NORMAL with our own ~1 s checkpoints;
+  votes fsynced (ADR-026). Metadata operations 3–5× faster on the cluster
+  (benchmarks/M8-RELAXED-DURABILITY.md); `nest rm -r` removes ~20k
+  entries/s.
+- File data stays durable: finalize fdatasyncs; application fsync/fdatasync
+  pass through plus a majority metadata barrier.
+- Crash detection (boot id), recovery fsck before serving, automatic
+  re-found after a full outage or a Raft-format upgrade, incarnations,
+  /.lost+found/<run>/<host>/<path> (ADR-027). The trial cluster upgraded
+  itself from format 1 in place.
+- Boot integration: sd_notify readiness and status, `nest wait-ready`,
+  mountpoint guard with automatic rescue, fabric re-probe.
+- Chaos soak on the new build: 12 kills, 69 GB written, zero corruption.
+
 ## 2026-09-27 — M8: io_uring, soak, disk-full reserve
 
 - FUSE over io_uring (ADR-025) on all hosts after the user enabled
