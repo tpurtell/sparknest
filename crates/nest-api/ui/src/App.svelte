@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, route, startPolling, runningJobs, leaderName, go, type View } from "./lib/state.svelte";
+  import { app, route, startLive, runningJobs, leaderName, go, type View } from "./lib/state.svelte";
   import { human } from "./lib/format";
   import Background from "./components/Background.svelte";
   import Icon from "./components/Icon.svelte";
@@ -39,7 +39,7 @@
   });
 
   onMount(() => {
-    if (app.authed) startPolling();
+    if (app.authed) startLive();
   });
 
   const serving = $derived(app.status?.nodes.filter((n) => n.info?.serving).length ?? 0);

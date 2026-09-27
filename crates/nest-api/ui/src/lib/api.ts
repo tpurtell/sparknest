@@ -17,13 +17,9 @@ export const hasToken = () => token !== "";
 export const downloadUrl = (path: string) =>
   `/v1/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(token)}`;
 export const authHeader = () => "Bearer " + token;
-/** The live update stream (an EventSource cannot send a header). */
-export const eventsUrl = () => `/v1/events?token=${encodeURIComponent(token)}`;
-/** A stream endpoint with the token in its query. */
-export const streamUrl = (path: string, q: URLSearchParams) => {
-  q.set("token", token);
-  return `${path}?${q}`;
-};
+/** The page's WebSocket (a WebSocket cannot send a header). */
+export const wsUrl = () =>
+  `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/ws?token=${encodeURIComponent(token)}`;
 export function setToken(t: string) {
   token = t.trim();
   try {
@@ -45,29 +41,20 @@ export class ApiError extends Error {
 /** Requests in flight and the age of the oldest, for the "API slow" pill. */
 export const net = { inflight: new Map<number, number>(), seq: 0 };
 
-/** Every request gives up after `timeoutMs`: a browser allows six
- * connections per server, and requests that never finish would otherwise
- * queue everything behind them until a reload. */
+type Transport = (method: string, path: string, body: unknown, timeoutMs: number) => Promise<{ status: number; body: any }>;
+let transport: Transport | null = null;
+/** Every API call travels over the page's WebSocket (state.svelte.ts). */
+export const setTransport = (t: Transport) => (transport = t);
+
 export async function api<T = any>(method: string, path: string, body?: unknown, timeoutMs = 20_000): Promise<T> {
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  if (!transport) throw new ApiError("not connected", 0);
   const id = ++net.seq;
   net.inflight.set(id, performance.now());
   try {
-    const r = await fetch(path, {
-      method,
-      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: ctl.signal,
-    });
-    const v = await r.json().catch(() => ({ error: r.statusText }));
-    if (!r.ok) throw new ApiError(v.error || r.statusText, r.status);
-    return v as T;
-  } catch (e) {
-    if ((e as Error).name === "AbortError") throw new ApiError(`${path.split("?")[0]} did not answer within ${timeoutMs / 1000} s`, 0);
-    throw e;
+    const r = await transport(method, path, body, timeoutMs);
+    if (r.status >= 400) throw new ApiError(r.body?.error || `HTTP ${r.status}`, r.status);
+    return r.body as T;
   } finally {
-    clearTimeout(timer);
     net.inflight.delete(id);
   }
 }

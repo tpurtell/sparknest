@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { streamUrl, type LogLine } from "../lib/api";
-  import { app, route } from "../lib/state.svelte";
+  import { type LogLine } from "../lib/api";
+  import { app, route, followLogs } from "../lib/state.svelte";
 
   const KEEP = 5000;
   let host = $state(route.params.get("host") ?? "");
@@ -11,25 +11,19 @@
   let lines = $state<LogLine[]>([]);
   let connected = $state(false);
 
-  // Live: the node streams recent lines, then each new one as it is logged.
+  // Live: over the page's socket, recent lines first, then each new one.
   $effect(() => {
-    const p = new URLSearchParams({ level, limit: "1000" });
-    if (host) p.set("host", host);
-    if (applied.trim()) p.set("q", applied.trim());
+    const q: Record<string, unknown> = { level, limit: 1000 };
+    if (host) q.host = host;
+    if (applied.trim()) q.q = applied.trim();
     if (!follow) return;
     lines = [];
-    const es = new EventSource(streamUrl("/v1/logs/stream", p));
-    es.addEventListener("lines", (e) => {
+    connected = false;
+    return followLogs(q, (fresh) => {
       connected = true;
-      const fresh: LogLine[] = JSON.parse((e as MessageEvent).data);
       if (!fresh.length) return;
       lines = [...fresh.reverse(), ...lines].slice(0, KEEP);
     });
-    es.onerror = () => (connected = false);
-    return () => {
-      es.close();
-      connected = false;
-    };
   });
   const t = (ms: number) => new Date(ms).toLocaleTimeString([], { hour12: false }) + "." + String(ms % 1000).padStart(3, "0");
 </script>

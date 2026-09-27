@@ -164,10 +164,9 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf/detail", get(hf_detail))
         .route("/v1/hf/import", post(hf_import))
         .route("/v1/logs", get(logs))
-        .route("/v1/logs/stream", get(events::log_stream))
         .route("/v1/space/tree", get(space_tree))
         .route("/v1/download", get(transfer::download))
-        .route("/v1/events", get(events::events))
+        .route("/v1/ws", get(events::ws))
         .route(
             "/v1/upload",
             put(transfer::upload).layer(axum::extract::DefaultBodyLimit::disable()),
@@ -193,9 +192,9 @@ pub async fn serve_tcp(api: Api, addr: std::net::SocketAddr) -> anyhow::Result<(
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.strip_prefix("Bearer ").is_some_and(|t| t == token))
-                    // A download is a plain link, which cannot send a
-                    // header: it may carry the token in its query.
-                    || (matches!(req.uri().path(), "/v1/download" | "/v1/events" | "/v1/logs/stream")
+                    // A download link and a WebSocket cannot send a
+                    // header: they may carry the token in the query.
+                    || (matches!(req.uri().path(), "/v1/download" | "/v1/ws")
                         && req.uri().query().is_some_and(|q| {
                             q.split('&').any(|kv| kv.strip_prefix("token=") == Some(token.as_str()))
                         }));

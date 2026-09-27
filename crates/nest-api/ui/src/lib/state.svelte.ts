@@ -1,7 +1,7 @@
 // Cluster state shared by every view, refreshed every 2 s while the page is
 // visible, plus routing and toasts.
 
-import { get, post, hasToken, ApiError, net, eventsUrl, type Status, type Store, type Job } from "./api";
+import { post, hasToken, ApiError, net, wsUrl, setTransport, type Status, type Store, type Job, type LogLine } from "./api";
 
 /** One run of `fn` at a time: a slow server gets one request of each kind,
  * never a growing pile. A call made meanwhile is not lost: it runs once
@@ -50,31 +50,11 @@ export const app = $state({
   slow: 0,
   /** Bumped when the namespace or placement changed: views refetch. */
   changed: 0,
-  /** The live stream is connected (else polling). */
+  /** The page's socket is open. */
   live: false,
 });
 
 const prev: Record<string, { t: number; r: number; s: number }> = {};
-
-export const poll = singleFlight(pollOnce);
-
-async function pollOnce() {
-  if (!app.authed) return;
-  try {
-    const [status, stores, jobs, groups] = await Promise.all([
-      get<Status>("/v1/status"),
-      get<{ stores: Store[] }>("/v1/stores").then((v) => v.stores),
-      get<{ jobs: Job[] }>("/v1/jobs").then((v) => v.jobs),
-      get<{ groups: { name: string; members: string[] }[] }>("/v1/groups").then((v) => v.groups),
-    ]);
-    apply(status, stores, jobs, groups);
-    // Without the stream, refetch views on every poll.
-    if (!app.live) app.changed++;
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 401) app.authed = false;
-    app.error = (e as Error).message;
-  }
-}
 
 let runningIds = new Set<number>();
 
@@ -111,47 +91,114 @@ function apply(status: Status, stores: Store[], jobs: Job[], groups: { name: str
 
 // ---------------------------------------------------------------- live
 
-let source: EventSource | null = null;
+let socket: WebSocket | null = null;
 let lastEvent = 0;
+let retry = 1000;
+let everOpen = false;
+let failures = 0;
+let logSub: Record<string, unknown> | null = null;
+let onLines: ((l: LogLine[]) => void) | null = null;
 
-/** Subscribe to the node's event stream; polling covers any gap. */
+// Calls over the socket: sent now if it is open, else when it opens.
+let callId = 0;
+const pending = new Map<number, { resolve: (v: { status: number; body: any }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+const unsent: { id: number; frame: string }[] = [];
+setTransport((method, path, body, timeoutMs) =>
+  new Promise((resolve, reject) => {
+    const id = ++callId;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      const i = unsent.findIndex((u) => u.id === id);
+      if (i >= 0) unsent.splice(i, 1);
+      reject(new ApiError(`${path.split("?")[0]} did not answer within ${timeoutMs / 1000} s`, 0));
+    }, timeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    const frame = JSON.stringify({ type: "call", id, method, path, body });
+    if (socket?.readyState === WebSocket.OPEN) socket.send(frame);
+    else unsent.push({ id, frame });
+  }),
+);
+
+/** One WebSocket per page carries every call and every live update. */
 function connect() {
-  source?.close();
-  source = new EventSource(eventsUrl());
-  source.addEventListener("state", (e) => {
-    lastEvent = performance.now();
+  socket?.close();
+  const ws = new WebSocket(wsUrl());
+  socket = ws;
+  ws.onopen = () => {
+    everOpen = true;
+    failures = 0;
+    retry = 1000;
     app.live = true;
-    try {
-      const v = JSON.parse((e as MessageEvent).data);
-      apply(v.status, v.stores, v.jobs, v.groups);
-    } catch {
-      /* a malformed frame: the next one replaces it */
-    }
-  });
-  source.addEventListener("changed", () => {
     lastEvent = performance.now();
-    app.changed++;
-  });
-  source.onerror = () => {
-    // EventSource reconnects by itself; until it does, polling fills in.
+    for (const u of unsent.splice(0)) ws.send(u.frame);
+    if (logSub) ws.send(JSON.stringify({ type: "logs", ...logSub }));
+  };
+  ws.onmessage = (e) => {
+    lastEvent = performance.now();
+    let m: any;
+    try {
+      m = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+    if (m.type === "reply") {
+      const p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id);
+      clearTimeout(p.timer);
+      p.resolve({ status: m.status, body: m.body });
+    } else if (m.type === "state") {
+      app.error = "";
+      apply(m.data.status, m.data.stores, m.data.jobs, m.data.groups);
+    } else if (m.type === "changed") app.changed++;
+    else if (m.type === "lines") onLines?.(m.lines);
+  };
+  ws.onclose = () => {
+    if (socket !== ws) return; // replaced on purpose
     app.live = false;
+    // Calls sent on this socket will not be answered.
+    for (const [id, p] of pending) {
+      if (unsent.some((u) => u.id === id)) continue;
+      clearTimeout(p.timer);
+      p.reject(new ApiError("connection to the node was lost", 0));
+      pending.delete(id);
+    }
+    // Refused before ever opening: most likely a wrong or old token.
+    if (!everOpen && ++failures >= 2) {
+      app.authed = false;
+      return;
+    }
+    app.error = "reconnecting…";
+    setTimeout(() => socket === ws && connect(), retry);
+    retry = Math.min(retry * 2, 15_000);
+  };
+}
+
+/** Follow logs over the page's socket until the returned function runs. */
+export function followLogs(q: Record<string, unknown>, handler: (l: LogLine[]) => void): () => void {
+  logSub = q;
+  onLines = handler;
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "logs", ...q }));
+  return () => {
+    if (onLines !== handler) return;
+    logSub = null;
+    onLines = null;
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "logs_off" }));
   };
 }
 
 let timer: ReturnType<typeof setInterval> | undefined;
-export function startPolling() {
+export function startLive() {
   clearInterval(timer);
-  poll();
+  everOpen = false;
+  failures = 0;
   connect();
   timer = setInterval(() => {
     const oldest = Math.min(Infinity, ...net.inflight.values());
     app.slow = isFinite(oldest) && performance.now() - oldest > 4000 ? Math.round((performance.now() - oldest) / 1000) : 0;
-    // State arrives when it changes; a silent stream for long is a dead one.
-    if (app.live && performance.now() - lastEvent > 45_000) {
-      app.live = false;
-      connect();
-    }
-    if (!app.live && document.visibilityState === "visible") poll();
+    // The node sends state at least every few seconds and pings every 20:
+    // a silent socket is a dead one.
+    if (app.live && performance.now() - lastEvent > 45_000) connect();
   }, 2000);
 }
 
@@ -192,7 +239,6 @@ export async function startJob(path: string, body: unknown, label: string) {
   try {
     await post(path, body);
     toast(label);
-    await poll();
   } catch (e) {
     toast((e as Error).message, true);
   }
@@ -202,7 +248,6 @@ export async function cancelJob(id: number) {
   try {
     await post(`/v1/jobs/${id}/cancel`);
     toast("Cancelling");
-    await poll();
   } catch (e) {
     toast((e as Error).message, true);
   }

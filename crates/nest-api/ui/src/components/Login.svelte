@@ -1,11 +1,11 @@
 <script lang="ts">
   import { setToken } from "../lib/api";
-  import { app, startPolling } from "../lib/state.svelte";
+  import { app, startLive } from "../lib/state.svelte";
   let tok = $state("");
   const go = () => {
     setToken(tok);
     app.authed = true;
-    startPolling();
+    startLive();
   };
 </script>
 

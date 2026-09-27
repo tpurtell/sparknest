@@ -708,3 +708,34 @@ credit old usage to new content.
 directory is wiped, and passthrough-heavy workloads show opens but few
 bytes. Plans remain proposals: reading never creates a replica (invariant
 2); a person applies a speedup plan.
+
+## ADR-029 — The web UI talks to its node over one WebSocket (2026-09-27)
+
+**Context.** The UI polled several endpoints every two seconds; later it
+held a Server-Sent Events stream. Over plain HTTP/1.1 a browser allows six
+connections per server across all its tabs. Unanswered polls, then a few
+tabs each holding an event stream, used them up, and every later request
+queued until those tabs closed: the page animated but nothing worked.
+
+**Decision.** Each page opens one WebSocket (`/v1/ws`, token in the query)
+and does everything over it:
+- API calls as `{type: "call", id, method, path, body}` frames, run through
+  the same axum router as the HTTP endpoints (so handlers exist once) and
+  answered as `reply` frames; calls run concurrently and time out on the
+  page;
+- pushed `state` (status, jobs, archive stores, groups, computed once per
+  node while any page is connected), debounced `changed` notices when the
+  namespace or placement changes (views refetch only then), and `lines`
+  while the page follows logs.
+
+Plain HTTP remains only for the page itself, file uploads and downloads
+(streamed bodies), and the CLI over the local Unix socket. There is no
+polling fallback: calls made while the socket reconnects wait for it.
+
+**Alternatives.** Polling (the failure above); SSE (holds one of the six
+connections per tab); HTTP/2 (needs TLS in browsers, so certificates on
+every node).
+
+**Consequences.** WebSockets do not count against the per-server
+connection limit, so tabs no longer starve each other. The HTTP endpoints
+stay for the CLI and scripts.

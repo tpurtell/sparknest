@@ -2,7 +2,7 @@
 // context menu, model details and the files list.
 
 import { post, api, type TreeNode, type Plan } from "./api";
-import { app, startJob, targets, toast, go, poll } from "./state.svelte";
+import { app, startJob, targets, toast, go } from "./state.svelte";
 import { pick, inform, openMenu, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
 import { download, remove as deletePath } from "./files.svelte";
@@ -45,7 +45,6 @@ export async function removeFrom(selector: string, hosts?: string[]) {
         `${n === 1 ? "That file is" : "Those files are"} the last copy anywhere in sparknest, so ${n === 1 ? "it stays" : "they stay"}. Copy ${selLabel(selector)} somewhere else (or offload it to an archive) first.`,
       );
     }
-    poll();
   } catch (e) {
     toast((e as Error).message, true);
   }
@@ -79,7 +78,6 @@ export async function consolidate(selector: string, host?: string) {
         `Moved what rules allow`,
         `Copies on ${pinnedHosts.join(", ")} stay: rule${rules.length > 1 ? "s" : ""} ${rules.map((r) => `"${r}"`).join(", ")} ${rules.length > 1 ? "keep" : "keeps"} them there. The rest is moving to ${target}.`,
       );
-    poll();
   } catch (e) {
     toast((e as Error).message, true);
   }

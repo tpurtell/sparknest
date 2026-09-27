@@ -2,7 +2,7 @@
 // treemap's context menu and anywhere a path is shown.
 
 import { authHeader, downloadUrl, post } from "./api";
-import { poll, toast } from "./state.svelte";
+import { toast } from "./state.svelte";
 import { confirm } from "./ui.svelte";
 import { human } from "./format";
 
@@ -29,7 +29,6 @@ export async function remove(path: string, dir: boolean): Promise<boolean> {
   try {
     const r = await post<{ files: number; dirs: number; errors: string[] }>("/v1/rm", { path, recursive: dir });
     toast(`Deleted ${r.files} files${r.dirs ? `, ${r.dirs} folders` : ""}${r.errors.length ? ` (${r.errors.length} errors)` : ""}`, r.errors.length > 0);
-    poll();
     return true;
   } catch (e) {
     toast((e as Error).message, true);

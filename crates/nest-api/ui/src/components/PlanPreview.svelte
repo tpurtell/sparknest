@@ -1,7 +1,7 @@
 <script lang="ts">
   import { post, type Plan } from "../lib/api";
   import { human, selLabel } from "../lib/format";
-  import { poll, toast } from "../lib/state.svelte";
+  import { toast } from "../lib/state.svelte";
   import { confirm } from "../lib/ui.svelte";
   import Icon from "./Icon.svelte";
 
@@ -17,7 +17,6 @@
     try {
       await post(`/v1/plans/${plan.id}/apply`);
       toast("Plan started");
-      poll();
       onapplied?.();
     } catch (e) {
       toast((e as Error).message, true);
