@@ -22,8 +22,10 @@ what is next. Keep entries short; link to benchmarks and ADRs.
 - I/O page: latency by kind and size over 10 s / 1 min / 10 min, readahead
   waste; Overview: tracked direct reads, crackling bubbles; Jobs across
   hosts; hf import safe to run on all hosts at once.
-- Next: a ds41rt round on this build; per-file readahead shared across
-  opens; Spark NVMe/CPU power settings (root checklist).
+- ds41rt from other hosts' copies only now matches a local copy: cold
+  117.02 (was 72.23), warm 136.75 (local 136–137), Fable 69.7 / 71.1.
+- Next: per-file readahead shared across opens; Spark NVMe/CPU power
+  settings (root checklist).
 
 ## 2026-09-27 — Usage, goal-based plans, space treemaps, hf import, a new UI
 

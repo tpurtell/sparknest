@@ -44,10 +44,20 @@ power states.
 | r5 warmup / r6 / r7 | network only, before ADR-032 | 49.16 / 72.12 / 122.13 (r7 128.04) | 40.63 |
 | r8 warmup / r9 | network only, ADR-032 | 75.63 / 130.87 | 53.74 |
 | r10 cold / r11 warm | + FUSE thread waiting (regressed) | 72.23 / 116.23 | 36.96 / 34.10 |
+| r12 cold / r13 warm | network only, ADR-034/035 | **117.02 / 136.75** | **69.71 / 71.08** |
 
 The second battery runs mostly from raptor's page cache; the cold runs are
-where the network path shows. ADR-034/035 (this file's last rows) have not
-been through a ds41rt round yet.
+where the network path shows. With ADR-034/035, network only matches a
+local copy: cold 117.02 against 115–118 (local, after a warmup), warm
+136.75 against 136.08–137.48. Loading was ~3× faster than r10, with ~9%
+readahead waste (the tails of the few unflagged files' streams; the 46
+flagged shards, 508 GB, are read exactly). All samples passed; acceptance
+67.7% / 69.4%. r13's natural JSON (135.85 against ~155) looks like noise.
+
+r12/r13 by category: code 178.93 / 187.83, code with reasoning 132.58 /
+151.84, math 137.77 / 170.47, Fable 69.71 / 71.08, hello 97.68 / 119.23,
+topic 92.37 / 110.85, natural JSON 128.26 / 135.85, schema JSON 144.45 /
+170.13, multilingual 85.47 / 110.24.
 
 ## Readahead waste
 
