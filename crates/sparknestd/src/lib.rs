@@ -7,5 +7,6 @@ mod node;
 pub mod offline;
 pub mod recovery;
 pub mod runstate;
+pub mod sdnotify;
 
 pub use node::{Node, Tuning};

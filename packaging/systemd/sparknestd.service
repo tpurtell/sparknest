@@ -6,9 +6,11 @@
 Description=sparknest node daemon (%N)
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=@BIN_DIR@ @STATE_DIR@
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=@BIN_DIR@/sparknestd --config @STATE_DIR@/node.toml
 # Unmount if the daemon dies so the mountpoint does not hang callers.
 ExecStopPost=-/usr/bin/fusermount3 -uz @MOUNT@

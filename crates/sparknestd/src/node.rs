@@ -58,7 +58,7 @@ pub struct Node {
     pub meta: Arc<MetaNode>,
     pub data: Arc<DataNode>,
     pub vfs: Arc<Vfs>,
-    pub fabric: Option<Arc<nest_fabric::Fabric>>,
+    fabric: Arc<parking_lot::Mutex<Option<Arc<nest_fabric::Fabric>>>>,
     pub placer: Arc<nest_place::Placer>,
     api_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     mounted: parking_lot::Mutex<Option<nest_fuse::Mounted>>,
@@ -219,7 +219,7 @@ impl Node {
                         anyhow::bail!("fabric.mode = rdma but no RoCE rail was found")
                     }
                     Ok(None) => {
-                        tracing::info!("no RoCE rail found; data path uses TCP");
+                        tracing::info!("no RoCE rail found yet; data path uses TCP meanwhile");
                         None
                     }
                     Err(e) if mode == crate::config::FabricMode::Rdma => return Err(e.into()),
@@ -230,6 +230,29 @@ impl Node {
                 }
             }
         };
+        let retry_fabric = fabric.is_none()
+            && cfg.fabric.mode == crate::config::FabricMode::Auto
+            && tuning.fabric.is_some();
+        let fabric = Arc::new(parking_lot::Mutex::new(fabric));
+        if retry_fabric {
+            // At boot the RoCE addresses may not be configured yet: keep
+            // looking for a while instead of staying on TCP until restart.
+            let (slot, rpc2, vfs2) = (Arc::downgrade(&fabric), rpc.clone(), vfs.clone());
+            let mut fc = tuning.fabric.clone().expect("checked");
+            fc.devices = cfg.fabric.devices.clone();
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    let Some(slot) = slot.upgrade() else { return };
+                    if let Ok(Some(f)) = nest_fabric::Fabric::start(id, fc.clone(), rpc2.clone()) {
+                        vfs2.attach_fabric(f.clone());
+                        *slot.lock() = Some(f);
+                        tracing::info!("RoCE rails appeared: RDMA data path enabled");
+                        return;
+                    }
+                }
+            });
+        }
         let mountpoint = cfg
             .node
             .mountpoint
@@ -281,7 +304,17 @@ impl Node {
         if tuning.mount
             && let Some(mp) = node.cfg.node.mountpoint.clone()
         {
-            node.mount_at(&mp)?;
+            // The cluster keeps its copies here either way; only the local
+            // mount waits for the problem to be fixed.
+            match node.mount_at(&mp) {
+                Ok(()) => crate::sdnotify::status(&format!("serving; mounted at {}", mp.display())),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "not mounted");
+                    crate::sdnotify::status(&format!("serving the cluster; NOT MOUNTED: {e:#}"));
+                }
+            }
+        } else {
+            crate::sdnotify::status("serving (no mountpoint)");
         }
         Ok(node)
     }
@@ -292,7 +325,26 @@ impl Node {
         self.mounted.lock().as_ref().map(|m| m.io_uring())
     }
 
+    /// The RDMA fabric, once it is up.
+    pub fn fabric(&self) -> Option<Arc<nest_fabric::Fabric>> {
+        self.fabric.lock().clone()
+    }
+
     pub fn mount_at(&self, mountpoint: &std::path::Path) -> anyhow::Result<()> {
+        // Files written into the bare directory (while sparknest was not
+        // mounted) would vanish under the mount: refuse unless allowed.
+        if !self.cfg.fuse.allow_nonempty
+            && let Ok(rd) = std::fs::read_dir(mountpoint)
+        {
+            let n = rd.count();
+            anyhow::ensure!(
+                n == 0,
+                "mountpoint {} is not empty ({n} entries): files written there while \
+                 sparknest was not mounted would be hidden. Move them away (or into \
+                 sparknest once mounted elsewhere), or set fuse.allow_nonempty",
+                mountpoint.display()
+            );
+        }
         let m = nest_fuse::mount(
             self.vfs.clone(),
             &nest_fuse::MountConfig {
@@ -324,6 +376,7 @@ impl Node {
         vfs: &Arc<Vfs>,
         orphans: nest_data::fsck::Orphans,
     ) -> anyhow::Result<nest_data::fsck::FsckReport> {
+        crate::sdnotify::status("recovering: catching up with the cluster");
         let mut waited = 0u64;
         while !data.wait_caught_up(Duration::from_secs(10)).await {
             waited += 10;
@@ -332,6 +385,7 @@ impl Node {
                 "recovery: still waiting to reach the cluster"
             );
         }
+        crate::sdnotify::status("recovering: checking this host's objects (fsck)");
         let report = vfs
             .fsck(&nest_data::fsck::FsckOptions {
                 repair: true,
@@ -358,7 +412,7 @@ impl Node {
             t.abort();
         }
         self.unmount();
-        if let Some(f) = &self.fabric {
+        if let Some(f) = self.fabric.lock().take() {
             f.shutdown();
         }
         self.data.shutdown();

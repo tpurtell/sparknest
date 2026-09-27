@@ -12,15 +12,22 @@
 Description=sparknest node daemon (%i)
 After=network-online.target
 Wants=network-online.target
+# The binary (Homebrew prefix) and the state directory must be mounted.
+RequiresMountsFor=@BIN_DIR@ @STATE_DIR@
 
 [Service]
-Type=simple
+# READY comes at once (boot never waits on the cluster); `systemctl status`
+# shows progress (recovering, serving, NOT MOUNTED ...). Services that need
+# the mount: After=sparknestd@%i.service plus ExecStartPre=nest wait-ready.
+Type=notify
+NotifyAccess=main
 User=@USER@
 Group=@GROUP@
 ExecStart=@BIN_DIR@/sparknestd --config @STATE_DIR@/node.toml
 # Raise kernel readahead for the FUSE mount (default 128 KiB caps cold
 # reads of sealed files); '+' runs this one step with full privileges.
-ExecStartPost=+/bin/sh -c 'for i in $(seq 120); do d=$(mountpoint -d @MOUNT@ 2>/dev/null) && echo 16384 > /sys/class/bdi/$d/read_ahead_kb && exit 0; sleep 1; done; exit 0'
+# In the background: after a crash the mount can take a while (recovery).
+ExecStartPost=+/bin/sh -c '( for i in $(seq 3600); do d=$(mountpoint -d @MOUNT@ 2>/dev/null) && echo 16384 > /sys/class/bdi/$d/read_ahead_kb && exit 0; sleep 1; done ) >/dev/null 2>&1 &'
 ExecStopPost=-/usr/bin/fusermount3 -uz @MOUNT@
 AmbientCapabilities=CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_SYS_ADMIN

@@ -128,6 +128,7 @@ impl TestCluster {
                 allow_other: false,
                 ttl_ms: 1000,
                 io_uring: true,
+                allow_nonempty: false,
             },
         }
     }

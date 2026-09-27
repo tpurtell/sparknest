@@ -427,6 +427,10 @@ pub async fn decide(
                 need,
                 "recovery: waiting for a majority of members before re-founding the cluster"
             );
+            crate::sdnotify::status(&format!(
+                "recovering: {} of {need} members needed are here; waiting",
+                here.len()
+            ));
             last_log = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(300)).await;

@@ -401,7 +401,10 @@ async fn crashed_minority_host_recovers_against_the_quorum() {
     assert!(matches!(retired.action, Action::Retired), "{retired:?}");
     // The deleted file's object went with the replayed delete.
     let k = nest_store::ObjectKey::new(doomed, Generation(1));
-    assert!(!n3.data.store().exists(k));
+    c.eventually("deleted object removed", Duration::from_secs(10), |c| {
+        !c.node(3).data.store().exists(k)
+    })
+    .await;
 
     // Host 3 agrees with the others and serves again.
     c.converge().await;

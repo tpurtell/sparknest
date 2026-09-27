@@ -435,3 +435,16 @@ async fn io_uring_serves_requests_when_the_kernel_offers_it() {
     );
     c.node(1).unmount();
 }
+
+/// Files in the bare mountpoint would be hidden by the mount: refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refuses_a_nonempty_mountpoint() {
+    if !std::path::Path::new("/dev/fuse").exists() {
+        return;
+    }
+    let c = TestCluster::start(1).await;
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("written-while-unmounted"), b"x").unwrap();
+    let e = c.node(1).mount_at(d.path()).unwrap_err();
+    assert!(format!("{e:#}").contains("not empty"), "{e:#}");
+}

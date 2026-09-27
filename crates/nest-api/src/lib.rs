@@ -204,6 +204,8 @@ async fn status(State(api): State<Api>) -> R<serde_json::Value> {
     let t = api.vfs.statfs().map(|(_, n)| n).unwrap_or(0);
     Ok(Json(json!({
         "me": d.id(),
+        // This host serves: caught up, admitted after any recovery, lease valid.
+        "serving": d.caught_up() && d.lease_valid(),
         "leader": d.meta().leader(),
         "applied": d.meta().applied_index(),
         "mountpoint": api.mountpoint,

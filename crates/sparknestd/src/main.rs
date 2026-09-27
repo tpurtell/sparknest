@@ -125,6 +125,10 @@ async fn main() -> Result<()> {
     }
     let secret = std::fs::read(&cfg.cluster.secret_file)
         .with_context(|| format!("reading {}", cfg.cluster.secret_file.display()))?;
+    // Ready at once: boot never waits on the cluster (a crashed host may
+    // wait minutes for a majority). Dependents use `nest wait-ready`.
+    sparknestd::sdnotify::notify("READY=1");
+    sparknestd::sdnotify::status("starting");
     let node = Node::start(cfg, secret, Tuning::default(), args.bootstrap).await?;
     tracing::info!("sparknestd running");
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -133,6 +137,7 @@ async fn main() -> Result<()> {
         _ = term.recv() => {}
     }
     tracing::info!("shutting down");
+    sparknestd::sdnotify::notify("STOPPING=1");
     node.shutdown().await;
     Ok(())
 }

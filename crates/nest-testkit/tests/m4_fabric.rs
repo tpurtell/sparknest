@@ -90,7 +90,7 @@ async fn sequential_remote_read_uses_rdma_with_readahead() {
         got.extend_from_slice(&b);
     }
     assert!(got == data, "content mismatch ({sink})");
-    let fab = c.node(2).fabric.as_ref().unwrap();
+    let fab = &c.node(2).fabric().unwrap();
     let reads = fab.stats.reads.load(Ordering::Relaxed);
     eprintln!(
         "{} MiB over the Vfs read path: {:.2} GB/s ({reads} fabric reads over both passes)",

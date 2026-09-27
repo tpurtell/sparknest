@@ -91,6 +91,10 @@ pub struct FuseSection {
     /// `fuse.enable_uring=1`); otherwise /dev/fuse, with a warning.
     #[serde(default = "default_true")]
     pub io_uring: bool,
+    /// Mount even if the mountpoint directory has files in it (they would be
+    /// hidden under the mount). Off: such a mount is refused and reported.
+    #[serde(default)]
+    pub allow_nonempty: bool,
 }
 
 impl Default for FuseSection {
@@ -99,6 +103,7 @@ impl Default for FuseSection {
             allow_other: true,
             ttl_ms: default_ttl_ms(),
             io_uring: true,
+            allow_nonempty: false,
         }
     }
 }

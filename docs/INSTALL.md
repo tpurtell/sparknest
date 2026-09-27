@@ -80,6 +80,20 @@ and for the system unit `@USER@`/`@GROUP@`):
   passthrough, which reads sealed files at local NVMe speed. The unit also
   raises the mount's readahead. Recommended.
 
+The unit reports ready at once, so boot never waits for the cluster;
+`systemctl status` shows what the daemon is doing (catching up, recovering,
+serving, or why it is not mounted). It refuses to mount over a mountpoint
+that has files in it, since those would be hidden (set
+`fuse.allow_nonempty` to override). A service that needs the mount should
+wait for it:
+
+```ini
+[Unit]
+After=sparknestd@main.service
+[Service]
+ExecStartPre=/home/linuxbrew/.linuxbrew/bin/nest wait-ready
+```
+
 `nest status` on any host shows every node; `nest ui` prints a link to the
 web UI with its token (`api_listen` must be set for the web UI).
 

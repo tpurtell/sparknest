@@ -53,6 +53,13 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Wait until this host serves and its mount is up (for services that
+    /// depend on it, e.g. `ExecStartPre=nest wait-ready`).
+    WaitReady {
+        /// Give up after this many seconds (0: wait forever).
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+    },
     /// Check this host's objects against the metadata; report by default.
     Fsck {
         /// Apply the standard resolutions (never deletes data that might be
@@ -616,6 +623,34 @@ async fn main() -> Result<()> {
             }
             if failed {
                 std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Cmd::WaitReady { timeout } => {
+            let start = std::time::Instant::now();
+            let mut last = String::new();
+            loop {
+                let why = match c.get("/v1/status").await {
+                    Err(_) => "the daemon is not answering yet".to_string(),
+                    Ok(v) if v["serving"] != true => {
+                        "not serving yet (recovering or catching up)".into()
+                    }
+                    Ok(v) => match v["mountpoint"].as_str() {
+                        Some(mp) if !is_sparknest_mount(mp) => format!("{mp} is not mounted yet"),
+                        _ => break,
+                    },
+                };
+                if why != last {
+                    eprintln!("waiting: {why}");
+                    last = why;
+                }
+                if *timeout > 0 && start.elapsed() > Duration::from_secs(*timeout) {
+                    bail!("not ready after {timeout}s: {last}");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            if !cli.json {
+                println!("ready");
             }
             return Ok(());
         }
@@ -1221,4 +1256,21 @@ fn print_human(v: &Value) {
     } else {
         println!("{v}");
     }
+}
+
+/// Whether `mp` is currently a sparknest FUSE mount.
+fn is_sparknest_mount(mp: &str) -> bool {
+    let mp = mp.trim_end_matches('/');
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|m| {
+            m.lines().any(|l| {
+                let f: Vec<&str> = l.split(' ').collect();
+                let sep = f.iter().position(|x| *x == "-");
+                f.get(4) == Some(&mp)
+                    && sep
+                        .and_then(|i| f.get(i + 1))
+                        .is_some_and(|t| t.starts_with("fuse"))
+            })
+        })
+        .unwrap_or(false)
 }
