@@ -222,19 +222,23 @@ impl ObjectStore {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
+        let flusher = match self.pace {
+            Some(pace) => Some(Flusher::start(file.try_clone()?, pace)),
+            None => None,
+        };
         Ok(Staging {
             key: k,
             path,
             file: Some(file),
-            pace: self.pace,
-            unflushed: std::sync::atomic::AtomicU64::new(0),
-            flushing: std::sync::Mutex::new(()),
+            flusher,
         })
     }
 
     /// Move a completely written staging file into place. The data is made
     /// durable first; after this returns the object survives a crash.
     pub fn commit_staging(&self, mut s: Staging) -> io::Result<ObjectKey> {
+        // Stop the background flusher first (commit syncs everything).
+        drop(s.flusher.take());
         let f = s.file.take().expect("staging file present until commit");
         f.sync_all()?;
         drop(f);
@@ -345,11 +349,103 @@ pub struct Staging {
     key: ObjectKey,
     path: PathBuf,
     file: Option<File>,
-    pace: Option<u64>,
-    /// Bytes written since the last flush.
-    unflushed: std::sync::atomic::AtomicU64,
-    /// Writers wait here while a flush runs: backpressure.
-    flushing: std::sync::Mutex<()>,
+    /// Paced stores: flushes the file behind the writers.
+    flusher: Option<Flusher>,
+}
+
+/// Flushes a paced transfer in the background: when a window of `pace`
+/// bytes is written, writers hand it to this thread and go on; they wait
+/// only while two windows are unflushed. The device writes one window while
+/// the next fills (flushing inline left it idle between windows: ~88 MB/s
+/// on a 150 MB/s disk), and a transfer never holds more than ~2 × pace.
+struct Flusher {
+    shared: std::sync::Arc<(std::sync::Mutex<FlushState>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pace: u64,
+}
+
+#[derive(Default)]
+struct FlushState {
+    /// Written since the last flush was requested.
+    dirty: u64,
+    requested: bool,
+    running: bool,
+    stop: bool,
+    error: Option<String>,
+}
+
+impl Flusher {
+    fn start(file: File, pace: u64) -> Flusher {
+        let shared = std::sync::Arc::new((
+            std::sync::Mutex::new(FlushState::default()),
+            std::sync::Condvar::new(),
+        ));
+        let s2 = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("nest-flush".into())
+            .spawn(move || {
+                let (m, cv) = &*s2;
+                loop {
+                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                    while !g.requested && !g.stop {
+                        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if !g.requested {
+                        return;
+                    }
+                    g.requested = false;
+                    g.running = true;
+                    drop(g);
+                    let r = file.sync_data();
+                    drop_cached(&file);
+                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                    g.running = false;
+                    if let Err(e) = r {
+                        g.error.get_or_insert(e.to_string());
+                    }
+                    cv.notify_all();
+                }
+            })
+            .ok();
+        Flusher {
+            shared,
+            thread,
+            pace,
+        }
+    }
+
+    /// `n` more bytes were written: request a flush per window, and wait
+    /// while the flusher is a window behind.
+    fn wrote(&self, n: u64) -> io::Result<()> {
+        let (m, cv) = &*self.shared;
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        g.dirty += n;
+        while g.dirty >= 2 * self.pace && (g.running || g.requested) && g.error.is_none() {
+            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        if let Some(e) = &g.error {
+            return Err(io::Error::other(e.clone()));
+        }
+        if g.dirty >= self.pace && !g.requested {
+            g.requested = true;
+            g.dirty = 0;
+            cv.notify_all();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        {
+            let (m, cv) = &*self.shared;
+            m.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+            cv.notify_all();
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl Staging {
@@ -362,24 +458,16 @@ impl Staging {
             .expect("staging file present until commit")
     }
 
-    /// Write at `off`. In a paced store, every `pace` bytes the file is
-    /// flushed (writers wait meanwhile) and its pages dropped from the
-    /// cache, so a transfer never holds more than about `pace` unflushed.
+    /// Write at `off`. In a paced store the file is flushed behind the
+    /// writers, a window at a time (see `Flusher`), and its pages dropped
+    /// from the cache.
     pub fn write_all_at(&self, buf: &[u8], off: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
-        use std::sync::atomic::Ordering::Relaxed;
-        let f = self.file();
-        let Some(pace) = self.pace else {
-            return f.write_all_at(buf, off);
-        };
-        let _turn = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
-        f.write_all_at(buf, off)?;
-        if self.unflushed.fetch_add(buf.len() as u64, Relaxed) + buf.len() as u64 >= pace {
-            f.sync_data()?;
-            self.unflushed.store(0, Relaxed);
-            drop_cached(f);
+        self.file().write_all_at(buf, off)?;
+        match &self.flusher {
+            Some(f) => f.wrote(buf.len() as u64),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -580,4 +668,42 @@ mod tests {
     }
 
     use std::os::unix::fs::FileExt;
+}
+
+#[cfg(test)]
+mod pace_bench {
+    use super::*;
+
+    /// `NEST_PACE_BENCH=DIR cargo test -p nest-store pace_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn paced_write_rate() {
+        let Some(dir) = std::env::var_os("NEST_PACE_BENCH") else {
+            return;
+        };
+        let dir = std::path::Path::new(&dir).join(format!("pace-bench-{}", std::process::id()));
+        let s = ObjectStore::open_with_staging(&dir, "staging-b")
+            .unwrap()
+            .paced(64 << 20);
+        let buf = vec![0x5au8; 4 << 20];
+        let total: u64 = 4 << 30;
+        let t = std::time::Instant::now();
+        let st = s
+            .begin_staging(ObjectKey::new(FileId(1), Generation(1)))
+            .unwrap();
+        let mut off = 0;
+        while off < total {
+            st.write_all_at(&buf, off).unwrap();
+            off += buf.len() as u64;
+        }
+        s.commit_staging(st).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!(
+            "paced write: {:.0} MB/s ({:.1} s for {} GiB)",
+            total as f64 / secs / 1e6,
+            secs,
+            total >> 30
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
