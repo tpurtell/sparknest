@@ -3,6 +3,28 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-09-27 — Reads from other hosts made fast (ADR-030…035)
+
+- Spread reads (ADR-030): local first, rendezvous stripes, capped by
+  measured disk rates; 39.6 GB/s aggregate when all seven hosts load a
+  model at once (21.9 local only).
+- Fixed: fabric reads were not cancellation-safe (a reused landing slot
+  took a late answer: short reads, wrong bytes); unmount hung 90 s.
+- Scattered reads (ADR-031/033): files whose readahead goes unused are read
+  directly, recorded with the file, back to readahead only for long runs.
+- Fabric (ADR-032/034/035): slot tiers (4 KiB / 128 KiB / 4 MiB), a byte
+  budget, protocol 2; every served read through io_uring on the completion
+  thread; readers of scattered files reply to FUSE from it; rendezvous
+  affinity per 1 MiB region; only the RDMA functions a port needs; threads
+  awake while hot. Cold 4 KiB rows from other hosts: 128 µs median with one
+  reader (was 620+), 66k/s with 32; tensor loads 7.2 GiB/s
+  (benchmarks/M9-FABRIC-READS.md).
+- I/O page: latency by kind and size over 10 s / 1 min / 10 min, readahead
+  waste; Overview: tracked direct reads, crackling bubbles; Jobs across
+  hosts; hf import safe to run on all hosts at once.
+- Next: a ds41rt round on this build; per-file readahead shared across
+  opens; Spark NVMe/CPU power settings (root checklist).
+
 ## 2026-09-27 — Usage, goal-based plans, space treemaps, hf import, a new UI
 
 - **Usage statistics (ADR-028).** Every host records per file and day:
