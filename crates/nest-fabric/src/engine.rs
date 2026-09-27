@@ -7,9 +7,10 @@
 //!   take bytes from the in-flight budget
 //!   acquire landing slot (smallest tier that fits; remote-writable)
 //!   SEND ReadReq{slot, file, gen, off, len, addr, rkey}  ->
-//!                                        acquire staging slot (tiered too)
-//!                                        small: source.try_read_now, right here
-//!                                        else:  source.read_into (checks generation)
+//!                                        the object: open_now (cached) or open
+//!                                        (checked off-thread, once in a while)
+//!                                        queue until a staging slot is free
+//!                                        io_uring read into it, on this thread
 //!                 <- RDMA WRITE_WITH_IMM(staging -> addr), imm = slot id
 //!                    (the length is the completion's byte count)
 //!                 <- or SEND ReadErr{slot, code}
@@ -95,31 +96,33 @@ impl Default for FabricConfig {
 /// 2: imm carries the whole slot id, the length is the completion's count.
 const PROTOCOL: u32 = 2;
 
-/// Supplies file bytes for requests this node serves. Implemented by the
-/// data service so generation fencing and serving rules stay in one place.
-pub trait ReadSource: Send + Sync + 'static {
-    /// Serve a small read at once, on the fabric's completion thread, when
-    /// that costs no more than one small file read: `None` sends it down the
-    /// async path (`read_into`). Must not wait on locks held across I/O,
-    /// the network, or metadata writes.
-    fn try_read_now(
-        &self,
-        _file: FileId,
-        _generation: Generation,
-        _offset: u64,
-        _dst: &mut [u8],
-    ) -> Option<Result<usize, NestError>> {
-        None
-    }
+/// An object opened for serving, and what must stay held while a read of
+/// it is in flight (the data layer's in-flight count, which fencing and
+/// eviction wait on).
+pub struct ServeFile {
+    pub file: Arc<std::fs::File>,
+    pub guard: Box<dyn Send>,
+}
 
-    fn read_into(
+/// Supplies the objects this node serves. Implemented by the data service
+/// so generation fencing and serving rules stay in one place; the fabric
+/// reads them itself, through io_uring on its completion thread.
+pub trait ReadSource: Send + Sync + 'static {
+    /// The object holding `generation` of `file` if it is already known to
+    /// be servable: no queries, no I/O (runs on the completion thread).
+    /// `None`: check it with `open`.
+    fn open_now(
         &self,
         file: FileId,
         generation: Generation,
-        offset: u64,
-        len: usize,
-        buf: Slot,
-    ) -> BoxFuture<'static, (Slot, Result<usize, NestError>)>;
+    ) -> Option<Result<ServeFile, NestError>>;
+
+    /// Check that this host may serve `generation` of `file`, and open it.
+    fn open(
+        &self,
+        file: FileId,
+        generation: Generation,
+    ) -> BoxFuture<'static, Result<ServeFile, NestError>>;
 }
 
 /// A completed read: the bytes live in a landing slot until dropped.
@@ -147,12 +150,14 @@ const RING_SLOT: usize = 128;
 const KIND_READ: u8 = 1;
 const KIND_ERR: u8 = 2;
 
-/// Reads up to this size may be served on the completion thread
-/// (`ReadSource::try_read_now`); larger ones go to the async path. The
-/// largest FUSE request is 128 KiB.
-const FAST_SERVE_MAX: usize = 128 << 10;
-/// How long `read_now` spins for its answer before parking.
-const READ_NOW_SPIN: Duration = Duration::from_micros(50);
+/// The largest read a `Reservation` makes (a FUSE request is at most
+/// 128 KiB); larger reads use `read`.
+const RESERVE_MAX: usize = 128 << 10;
+/// Serving: reads in flight in one device's io_uring.
+const SERVE_DEPTH: usize = 256;
+/// A read the reader still waits for after this is failed (and its lane
+/// retired), as `read` does.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Unit of the in-flight byte budget.
 const BUDGET_UNIT: usize = 4 << 10;
 
@@ -234,6 +239,104 @@ struct Device {
     landing: Tiers,
     staging: Tiers,
     mtu: u32,
+    /// Serving: the io_uring reads go through, and requests waiting for a
+    /// slot or ring room. Only the device's poller thread submits.
+    serve: Mutex<ServeRing>,
+    /// Requests whose object was checked off-thread, back for the poller.
+    resolved: Mutex<Vec<Resolved>>,
+    /// Wakes the poller: io_uring completions (registered) and `resolved`.
+    wake: std::fs::File,
+}
+
+impl Device {
+    fn wake(&self) {
+        use std::io::Write;
+        let _ = (&self.wake).write(&1u64.to_ne_bytes());
+    }
+
+    fn clear_wake(&self) {
+        use std::io::Read;
+        let mut b = [0u8; 8];
+        let _ = (&self.wake).read(&mut b);
+    }
+}
+
+struct Resolved {
+    lane: Arc<Lane>,
+    req: ReadReq,
+    file: Result<ServeFile, NestError>,
+    at: std::time::Instant,
+}
+
+struct Waiting {
+    lane: Arc<Lane>,
+    req: ReadReq,
+    file: ServeFile,
+    at: std::time::Instant,
+}
+
+/// A served read in the ring.
+struct ServeOp {
+    lane: Arc<Lane>,
+    req: ReadReq,
+    slot: Slot,
+    file: ServeFile,
+    done: usize,
+    want: usize,
+    at: std::time::Instant,
+    submitted: std::time::Instant,
+}
+
+struct ServeRing {
+    ring: io_uring::IoUring,
+    ops: Vec<Option<ServeOp>>,
+    free: Vec<usize>,
+    waiting: std::collections::VecDeque<Waiting>,
+}
+
+impl ServeRing {
+    fn new(wake: &std::fs::File) -> std::io::Result<ServeRing> {
+        use std::os::fd::AsRawFd;
+        let ring = io_uring::IoUring::new(SERVE_DEPTH as u32)?;
+        ring.submitter().register_eventfd(wake.as_raw_fd())?;
+        Ok(ServeRing {
+            ring,
+            ops: (0..SERVE_DEPTH).map(|_| None).collect(),
+            free: (0..SERVE_DEPTH).rev().collect(),
+            waiting: Default::default(),
+        })
+    }
+
+    /// Queue the (rest of the) read of op `idx`. Returns false if the
+    /// submission queue is full (it is sized for every op, so never).
+    fn push(&mut self, idx: usize) -> bool {
+        use std::os::fd::AsRawFd;
+        let Some(op) = self.ops[idx].as_ref() else {
+            return false;
+        };
+        let e = io_uring::opcode::Read::new(
+            io_uring::types::Fd(op.file.file.as_raw_fd()),
+            op.slot.ptr().wrapping_add(op.done),
+            (op.want - op.done) as u32,
+        )
+        .offset(op.req.offset + op.done as u64)
+        .build()
+        .user_data(idx as u64);
+        // SAFETY: the buffer is op's staging slot and the fd its open
+        // object, both owned by `ops[idx]` until this read's completion is
+        // reaped (and leaked with the ring if it never is, see Drop).
+        unsafe { self.ring.submission().push(&e) }.is_ok()
+    }
+}
+
+impl Drop for ServeRing {
+    fn drop(&mut self) {
+        // Reads still in the kernel may write into their slots: never
+        // return those to the pool.
+        for op in self.ops.drain(..).flatten() {
+            std::mem::forget(op.slot);
+        }
+    }
 }
 
 /// One queue pair to one peer on one rail pair.
@@ -244,7 +347,7 @@ struct Lane {
     local: Rail,
     ring: Region,
     /// Our outstanding requests on this lane.
-    window: Semaphore,
+    window: Arc<Semaphore>,
     peer: NodeId,
     dead: AtomicBool,
 }
@@ -258,21 +361,17 @@ struct Waiter {
     lane: u32,
     slot: Slot,
     tx: Notify,
+    since: std::time::Instant,
 }
 
 type Answer = Result<(usize, Slot), NestError>;
 
-/// How the reader waits: a task (`read`), or a thread that sent the request
-/// itself and parks until the completion thread hands it the answer
-/// (`read_now`: one wake instead of a trip through the runtime).
+/// How the reader learns the answer: a task waiting (`read`), or a
+/// callback run on the completion thread (`Reservation::send`: no thread
+/// waits at all).
 enum Notify {
     Task(oneshot::Sender<Answer>),
-    Thread(Arc<ThreadWait>),
-}
-
-struct ThreadWait {
-    answer: Mutex<Option<Answer>>,
-    thread: std::thread::Thread,
+    Call(Box<dyn FnOnce(Answer) + Send>),
 }
 
 impl Notify {
@@ -281,12 +380,24 @@ impl Notify {
             Notify::Task(tx) => {
                 let _ = tx.send(a);
             }
-            Notify::Thread(w) => {
-                *w.answer.lock() = Some(a);
-                w.thread.unpark();
-            }
+            Notify::Call(f) => f(a),
         }
     }
+}
+
+/// What a `Reservation`'s reader is handed: the bytes, or why not.
+pub type ReadDone = Box<dyn FnOnce(Result<&[u8], NestError>) + Send>;
+
+/// Everything a small read needs, taken without waiting: a link lane,
+/// budget, a landing slot and window room. `send` it, or drop it to give
+/// them back.
+pub struct Reservation {
+    fabric: Arc<Fabric>,
+    lane: Arc<Lane>,
+    slot: Slot,
+    budget: tokio::sync::OwnedSemaphorePermit,
+    window: tokio::sync::OwnedSemaphorePermit,
+    len: usize,
 }
 
 impl Waiter {
@@ -374,9 +485,9 @@ pub struct Stats {
     /// Serving: waiting for a staging slot, and reading the bytes.
     pub serve_slot_wait_ns: AtomicU64,
     pub serve_read_ns: AtomicU64,
-    /// Reads answered on the completion thread (`try_read_now`).
+    /// Reads served through the io_uring path (all of them now).
     pub served_fast: AtomicU64,
-    /// Reads made on the calling thread (`read_now`).
+    /// Reads made through a `Reservation` (answered by callback).
     pub read_now: AtomicU64,
 }
 
@@ -420,6 +531,16 @@ impl Fabric {
                     .collect::<Vec<_>>(),
                 false,
             )?;
+            // SAFETY: eventfd returns a new descriptor or -1.
+            let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if efd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: a fresh descriptor, owned from here on.
+            let wake = std::fs::File::from(unsafe {
+                <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(efd)
+            });
+            let serve = Mutex::new(ServeRing::new(&wake)?);
             devices.push(Arc::new(Device {
                 id: devices.len() as u32,
                 ctx,
@@ -427,6 +548,9 @@ impl Fabric {
                 landing,
                 staging,
                 mtu,
+                serve,
+                resolved: Mutex::new(Vec::new()),
+                wake,
             }));
         }
         let _ = me;
@@ -464,6 +588,16 @@ impl Fabric {
             std::thread::Builder::new()
                 .name(format!("nf-poll-{}", d.ctx.name))
                 .spawn(move || poller(weak, dev, stop))?;
+        }
+        {
+            let weak = Arc::downgrade(&fabric);
+            fabric.rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let Some(f) = weak.upgrade() else { return };
+                    f.expire();
+                }
+            });
         }
         let weak = Arc::downgrade(&fabric);
         rpc.register(
@@ -561,7 +695,7 @@ impl Fabric {
             qp,
             local: rail.clone(),
             ring,
-            window: Semaphore::new(self.cfg.window as usize),
+            window: Arc::new(Semaphore::new(self.cfg.window as usize)),
             peer,
             dead: AtomicBool::new(false),
         });
@@ -791,6 +925,7 @@ impl Fabric {
                 lane: lane.id,
                 slot,
                 tx: Notify::Task(tx),
+                since: std::time::Instant::now(),
             },
         );
         // SAFETY: inline send copies the message at post time.
@@ -837,22 +972,11 @@ impl Fabric {
         }
     }
 
-    /// A small read done on the calling thread, which parks until the
-    /// completion thread hands it the answer: for a FUSE thread serving a
-    /// page fault, one wake instead of a round trip through the runtime.
-    /// `None` when it cannot start at once (no link yet, no free slot,
-    /// budget or window room, or too large): use `read`. Never call it on
-    /// an async executor thread.
-    pub fn read_now(
-        &self,
-        peer: NodeId,
-        file: FileId,
-        generation: Generation,
-        offset: u64,
-        dst: &mut [u8],
-    ) -> Option<Result<usize, NestError>> {
-        let len = dst.len();
-        if len > FAST_SERVE_MAX {
+    /// Take what a small read needs without waiting (see `Reservation`);
+    /// `None` when any of it is not free right now, or no link is up yet:
+    /// use `read`.
+    pub fn reserve(self: &Arc<Self>, peer: NodeId, len: usize) -> Option<Reservation> {
+        if len > RESERVE_MAX {
             return None;
         }
         let link = self
@@ -864,88 +988,48 @@ impl Fabric {
         let lane = link.lanes
             [link.next.fetch_add(1, Ordering::Relaxed) as usize % link.lanes.len()]
         .clone();
-        let t0 = std::time::Instant::now();
-        let _cap = self
+        let budget = self
             .inflight
-            .try_acquire_many(len.div_ceil(BUDGET_UNIT).max(1) as u32)
+            .clone()
+            .try_acquire_many_owned(len.div_ceil(BUDGET_UNIT).max(1) as u32)
             .ok()?;
         let slot = lane.dev.landing.try_acquire(len)?;
-        let _permit = lane.window.try_acquire().ok()?;
-        let key = (lane.dev.id, slot.id());
-        let mut msg = [0u8; MSG_SIZE];
-        ReadReq {
-            slot: slot.id(),
-            file: file.0,
-            generation: generation.0,
-            offset,
-            len: len as u32,
-            addr: slot.addr(),
-            rkey: slot.rkey(),
-        }
-        .encode(&mut msg);
-        let wait = Arc::new(ThreadWait {
-            answer: Mutex::new(None),
-            thread: std::thread::current(),
-        });
-        self.pending.lock().insert(
-            key,
-            Waiter {
-                lane: lane.id,
-                slot,
-                tx: Notify::Thread(wait.clone()),
-            },
-        );
-        // SAFETY: inline send copies the message at post time.
-        let posted = unsafe {
-            lane.qp.post_send(
-                wr(WR_SEND, lane.id, 0),
-                msg.as_mut_ptr(),
-                MSG_SIZE as u32,
-                0,
-                true,
-            )
-        };
-        if let Err(e) = posted {
-            drop(self.pending.lock().remove(&key));
-            self.fail_lane(&lane);
-            return Some(Err(NestError::Unavailable(e.to_string())));
-        }
-        // Spin briefly (the answer usually comes within a disk read), then
-        // park; the completion thread unparks us.
-        let answer = loop {
-            if let Some(a) = wait.answer.lock().take() {
-                break a;
-            }
-            let waited = t0.elapsed();
-            if waited < READ_NOW_SPIN {
-                std::hint::spin_loop();
-                continue;
-            }
-            if waited > Duration::from_secs(30) {
-                match self.pending.lock().remove(&key) {
-                    Some(w) => {
-                        // As in `read`: the slot may still be written.
-                        std::mem::forget(w.slot);
-                        self.fail_lane(&lane);
-                        return Some(Err(NestError::Unavailable("RDMA read timed out".into())));
-                    }
-                    // Answered just now: take it.
-                    None => continue,
+        let window = lane.window.clone().try_acquire_owned().ok()?;
+        Some(Reservation {
+            fabric: self.clone(),
+            lane,
+            slot,
+            budget,
+            window,
+            len,
+        })
+    }
+
+    /// Fail reads made with `Reservation::send` that have waited past
+    /// `READ_TIMEOUT` (their lane is retired, as `read` does on a timeout).
+    fn expire(&self) {
+        let now = std::time::Instant::now();
+        let old: Vec<(u32, u32)> = self
+            .pending
+            .lock()
+            .iter()
+            .filter(|(_, w)| {
+                matches!(w.tx, Notify::Call(_)) && now.duration_since(w.since) > READ_TIMEOUT
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in old {
+            let w = self.pending.lock().remove(&k);
+            if let Some(w) = w {
+                let lane = self.lanes.lock().get(&w.lane).cloned();
+                let Waiter { slot, tx, .. } = w;
+                std::mem::forget(slot);
+                if let Some(l) = lane {
+                    self.fail_lane(&l);
                 }
+                tx.send(Err(NestError::Unavailable("RDMA read timed out".into())));
             }
-            std::thread::park_timeout(Duration::from_millis(10));
-        };
-        self.stats
-            .read_rtt_ns
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Some(answer.map(|(n, slot)| {
-            dst[..n].copy_from_slice(slot.as_slice(n));
-            self.record(crate::iostats::Kind::Fabric, len, t0.elapsed());
-            self.stats.reads.fetch_add(1, Ordering::Relaxed);
-            self.stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
-            self.stats.read_now.fetch_add(1, Ordering::Relaxed);
-            n
-        }))
+        }
     }
 
     /// Take a lane out of service: the QP enters the error state (so the
@@ -955,19 +1039,21 @@ impl Fabric {
             tracing::warn!(peer = %lane.peer, rail = %lane.local.addr, "RDMA lane failed");
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
             lane.qp.set_error();
-            let mut p = self.pending.lock();
-            let keys: Vec<_> = p
-                .iter()
-                .filter(|(_, w)| w.lane == lane.id)
-                .map(|(k, _)| *k)
-                .collect();
-            for k in keys {
-                if let Some(w) = p.remove(&k) {
-                    // As on a timeout: a write may still land in the slot.
-                    let Waiter { slot, tx, .. } = w;
-                    std::mem::forget(slot);
-                    tx.send(Err(NestError::Unavailable("RDMA link failed".into())));
-                }
+            let failed: Vec<Waiter> = {
+                let mut p = self.pending.lock();
+                let keys: Vec<_> = p
+                    .iter()
+                    .filter(|(_, w)| w.lane == lane.id)
+                    .map(|(k, _)| *k)
+                    .collect();
+                keys.into_iter().filter_map(|k| p.remove(&k)).collect()
+            };
+            // Answered outside the lock: a callback may reply to FUSE.
+            for w in failed {
+                // As on a timeout: a write may still land in the slot.
+                let Waiter { slot, tx, .. } = w;
+                std::mem::forget(slot);
+                tx.send(Err(NestError::Unavailable("RDMA link failed".into())));
             }
         }
     }
@@ -1029,69 +1115,172 @@ impl Fabric {
 
     // ------------------------------------------------------------ server
 
+    /// A read request arrived (on this device's poller thread). Every
+    /// served read takes one path: the object (already open, or checked
+    /// off-thread first), a queue until a staging slot is free, an io_uring
+    /// read into the slot, and the RDMA write when it completes, all on
+    /// this thread with no hand-offs; the disk sees many reads at once.
     fn serve(self: &Arc<Self>, lane: Arc<Lane>, req: ReadReq) {
-        let len = (req.len as usize).min(self.cfg.chunk);
-        // Small reads (a lookup table's rows, a page fault) are answered
-        // right here: every hop to a task or the blocking pool costs a
-        // thread wake, which on the Sparks' deep idle states took several
-        // times the disk read itself.
-        let mut spare = None;
-        if len <= FAST_SERVE_MAX
-            && let Some(src) = self.source.lock().as_ref().and_then(|w| w.upgrade())
-            && let Some(mut slot) = lane.dev.staging.try_acquire(len)
-        {
-            let t = std::time::Instant::now();
-            match src.try_read_now(
-                FileId(req.file),
-                Generation(req.generation),
-                req.offset,
-                slot.as_mut_slice(len),
-            ) {
-                Some(r) => {
-                    self.stats
-                        .serve_read_ns
-                        .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    self.record(crate::iostats::Kind::Served, len, t.elapsed());
-                    self.stats.served_fast.fetch_add(1, Ordering::Relaxed);
-                    self.answer(&lane, &req, r.map(|n| (slot, n)));
-                    return;
-                }
-                None => spare = Some(slot),
+        let at = std::time::Instant::now();
+        let Some(src) = self.source.lock().as_ref().and_then(|w| w.upgrade()) else {
+            return self.answer(
+                &lane,
+                &req,
+                Err(NestError::Unavailable("not serving yet".into())),
+            );
+        };
+        let (file, generation) = (FileId(req.file), Generation(req.generation));
+        match src.open_now(file, generation) {
+            Some(Ok(f)) => {
+                lane.dev.serve.lock().waiting.push_back(Waiting {
+                    lane: lane.clone(),
+                    req,
+                    file: f,
+                    at,
+                });
+                self.pump(&lane.dev);
+            }
+            Some(Err(e)) => self.answer(&lane, &req, Err(e)),
+            None => {
+                self.rt.spawn(async move {
+                    let f = src.open(file, generation).await;
+                    let dev = lane.dev.clone();
+                    dev.resolved.lock().push(Resolved {
+                        lane,
+                        req,
+                        file: f,
+                        at,
+                    });
+                    dev.wake();
+                });
             }
         }
-        let me = self.clone();
-        self.rt.spawn(async move {
-            let source = me.source.lock().as_ref().and_then(|w| w.upgrade());
-            let result = match source {
-                None => Err(NestError::Unavailable("not serving yet".into())),
-                Some(src) => {
-                    let t0 = std::time::Instant::now();
-                    let slot = match spare {
-                        Some(s) => s,
-                        None => lane.dev.staging.acquire(len).await,
-                    };
-                    let t1 = std::time::Instant::now();
-                    let (slot, r) = src
-                        .read_into(
-                            FileId(req.file),
-                            Generation(req.generation),
-                            req.offset,
-                            len,
-                            slot,
-                        )
-                        .await;
-                    me.stats
-                        .serve_slot_wait_ns
-                        .fetch_add(t1.duration_since(t0).as_nanos() as u64, Ordering::Relaxed);
-                    me.stats
-                        .serve_read_ns
-                        .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    me.record(crate::iostats::Kind::Served, len, t1.elapsed());
-                    r.map(|n| (slot, n))
-                }
+    }
+
+    /// Serving work for the poller: requests checked off-thread, finished
+    /// reads, and waiting requests that can start. Returns whether anything
+    /// happened.
+    fn serve_work(&self, dev: &Arc<Device>) -> bool {
+        let resolved = std::mem::take(&mut *dev.resolved.lock());
+        let mut busy = !resolved.is_empty();
+        for r in resolved {
+            match r.file {
+                Ok(f) => dev.serve.lock().waiting.push_back(Waiting {
+                    lane: r.lane,
+                    req: r.req,
+                    file: f,
+                    at: r.at,
+                }),
+                Err(e) => self.answer(&r.lane, &r.req, Err(e)),
+            }
+        }
+        busy |= self.reap(dev);
+        self.pump(dev);
+        busy
+    }
+
+    /// Start waiting reads that have a staging slot and ring room.
+    fn pump(&self, dev: &Device) {
+        let mut g = dev.serve.lock();
+        let s = &mut *g;
+        let mut started = false;
+        let mut i = 0;
+        while i < s.waiting.len() && !s.free.is_empty() {
+            let len = (s.waiting[i].req.len as usize).min(self.cfg.chunk);
+            let Some(slot) = dev.staging.try_acquire(len) else {
+                i += 1;
+                continue;
             };
-            me.answer(&lane, &req, result);
-        });
+            let w = s.waiting.remove(i).expect("in range");
+            let idx = s.free.pop().expect("checked");
+            s.ops[idx] = Some(ServeOp {
+                lane: w.lane,
+                req: w.req,
+                slot,
+                file: w.file,
+                done: 0,
+                want: len,
+                at: w.at,
+                submitted: std::time::Instant::now(),
+            });
+            started |= s.push(idx);
+        }
+        if started {
+            let _ = s.ring.submit();
+        }
+    }
+
+    /// Finished io_uring reads: continue short ones, answer the rest.
+    fn reap(&self, dev: &Device) -> bool {
+        let mut finished = Vec::new();
+        {
+            let mut g = dev.serve.lock();
+            let s = &mut *g;
+            let cqes: Vec<(u64, i32)> = s
+                .ring
+                .completion()
+                .map(|c| (c.user_data(), c.result()))
+                .collect();
+            if cqes.is_empty() {
+                return false;
+            }
+            let mut again = false;
+            for (ud, res) in cqes {
+                let idx = ud as usize;
+                let Some(op) = s.ops.get_mut(idx).and_then(|o| o.as_mut()) else {
+                    continue;
+                };
+                if res == -libc::EINTR || res == -libc::EAGAIN {
+                    again |= s.push(idx);
+                    continue;
+                }
+                if res > 0 {
+                    op.done += res as usize;
+                    // A short read mid-file is not the end: read the rest
+                    // (taking it for EOF once truncated a reader's file).
+                    if op.done < op.want {
+                        again |= s.push(idx);
+                        continue;
+                    }
+                }
+                let op = s.ops[idx].take().expect("present");
+                s.free.push(idx);
+                let r = if res < 0 {
+                    Err(NestError::Io(
+                        std::io::Error::from_raw_os_error(-res).to_string(),
+                    ))
+                } else {
+                    Ok(op.done)
+                };
+                finished.push((op, r));
+            }
+            if again {
+                let _ = s.ring.submit();
+            }
+        }
+        for (op, r) in finished {
+            let ServeOp {
+                lane,
+                req,
+                slot,
+                file,
+                at,
+                submitted,
+                ..
+            } = op;
+            self.stats.serve_slot_wait_ns.fetch_add(
+                submitted.duration_since(at).as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            self.stats
+                .serve_read_ns
+                .fetch_add(submitted.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.stats.served_fast.fetch_add(1, Ordering::Relaxed);
+            self.record(crate::iostats::Kind::Served, req.len as usize, at.elapsed());
+            self.answer(&lane, &req, r.map(|n| (slot, n)));
+            drop(file);
+        }
+        true
     }
 
     /// Send a read's answer: the bytes (an RDMA write into the client's
@@ -1139,9 +1328,83 @@ impl Fabric {
     }
 }
 
+impl Reservation {
+    /// Ask for `len` bytes of `generation` of `file` at `offset`. `done`
+    /// runs on the completion thread when the answer arrives (or the lane
+    /// fails, or `READ_TIMEOUT` passes): no thread waits for it.
+    pub fn send(self, file: FileId, generation: Generation, offset: u64, done: ReadDone) {
+        let Reservation {
+            fabric,
+            lane,
+            slot,
+            budget,
+            window,
+            len,
+        } = self;
+        let t0 = std::time::Instant::now();
+        let key = (lane.dev.id, slot.id());
+        let mut msg = [0u8; MSG_SIZE];
+        ReadReq {
+            slot: slot.id(),
+            file: file.0,
+            generation: generation.0,
+            offset,
+            len: len as u32,
+            addr: slot.addr(),
+            rkey: slot.rkey(),
+        }
+        .encode(&mut msg);
+        let f = fabric.clone();
+        let call = Box::new(move |a: Answer| {
+            let _held = (budget, window);
+            match a {
+                Ok((n, slot)) => {
+                    f.stats.reads.fetch_add(1, Ordering::Relaxed);
+                    f.stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    f.stats.read_now.fetch_add(1, Ordering::Relaxed);
+                    f.stats
+                        .read_rtt_ns
+                        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    f.record(crate::iostats::Kind::Fabric, len, t0.elapsed());
+                    done(Ok(slot.as_slice(n)));
+                }
+                Err(e) => done(Err(e)),
+            }
+        });
+        fabric.pending.lock().insert(
+            key,
+            Waiter {
+                lane: lane.id,
+                slot,
+                tx: Notify::Call(call),
+                since: t0,
+            },
+        );
+        // SAFETY: inline send copies the message at post time.
+        let posted = unsafe {
+            lane.qp.post_send(
+                wr(WR_SEND, lane.id, 0),
+                msg.as_mut_ptr(),
+                MSG_SIZE as u32,
+                0,
+                true,
+            )
+        };
+        if let Err(e) = posted {
+            let w = fabric.pending.lock().remove(&key);
+            fabric.fail_lane(&lane);
+            if let Some(w) = w {
+                // Never sent: nothing will write the slot.
+                w.fail(NestError::Unavailable(e.to_string()));
+            }
+        }
+    }
+}
+
 /// Completion loop for one device: spin briefly, then sleep on the
-/// completion channel.
+/// completion channel and the serving ring's eventfd.
 fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
+    use std::os::fd::AsRawFd;
     let mut wcs = [nf_wc::default(); 32];
     let fd = dev.cq.fd();
     let mut idle_spins = 0u32;
@@ -1154,12 +1417,14 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
                 return;
             }
         };
-        if n > 0 {
+        let Some(f) = weak.upgrade() else { return };
+        for wc in &wcs[..n] {
+            f.on_completion(&dev, wc);
+        }
+        let served = f.serve_work(&dev);
+        drop(f);
+        if n > 0 || served {
             idle_spins = 0;
-            let Some(f) = weak.upgrade() else { return };
-            for wc in &wcs[..n] {
-                f.on_completion(&dev, wc);
-            }
             continue;
         }
         idle_spins += 1;
@@ -1176,16 +1441,28 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
             armed = true;
             continue;
         }
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: valid pollfd for the duration of the call.
-        let r = unsafe { libc::poll(&mut pfd, 1, 50) };
+        let mut pfd = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: dev.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: valid pollfds for the duration of the call.
+        let r = unsafe { libc::poll(pfd.as_mut_ptr(), 2, 50) };
         if r > 0 {
-            let _ = dev.cq.take_event();
-            armed = false;
+            if pfd[0].revents != 0 {
+                let _ = dev.cq.take_event();
+                armed = false;
+            }
+            if pfd[1].revents != 0 {
+                dev.clear_wake();
+            }
         }
         idle_spins = 0;
     }

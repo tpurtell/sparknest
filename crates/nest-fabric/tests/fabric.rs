@@ -3,45 +3,66 @@
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use nest_fabric::{Fabric, FabricConfig, ReadSource, Slot};
+use nest_fabric::{Fabric, FabricConfig, ReadSource, ServeFile};
 use nest_rpc::{Rpc, RpcConfig};
 use nest_types::{FileId, Generation, NestError, NodeId};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-
-/// Serves a synthetic 256 MiB "file" 7, generation 3: byte i = f(i).
-struct Synthetic;
 
 fn byte(i: u64) -> u8 {
     (i.wrapping_mul(2654435761) >> 13) as u8
 }
 
-const SIZE: u64 = 256 << 20;
+const SIZE: u64 = 64 << 20;
 
-impl ReadSource for Synthetic {
-    fn read_into(
+/// A 64 MiB file of `byte(i)` (written once, reused: the fabric serves
+/// real files through io_uring).
+fn pattern_file() -> &'static PathBuf {
+    static P: OnceLock<PathBuf> = OnceLock::new();
+    P.get_or_init(|| {
+        let p = std::env::temp_dir().join("nest-fabric-pattern-v1-64m.bin");
+        if std::fs::metadata(&p).map(|m| m.len()).ok() != Some(SIZE) {
+            let tmp = p.with_extension(format!("{}.tmp", std::process::id()));
+            let data: Vec<u8> = (0..SIZE).map(byte).collect();
+            std::fs::write(&tmp, data).unwrap();
+            std::fs::rename(&tmp, &p).unwrap();
+        }
+        p
+    })
+}
+
+fn open_pattern(file: FileId, generation: Generation) -> Result<ServeFile, NestError> {
+    if file != FileId(7) {
+        return Err(NestError::NotFound);
+    }
+    if generation != Generation(3) {
+        return Err(NestError::Stale);
+    }
+    Ok(ServeFile {
+        file: Arc::new(std::fs::File::open(pattern_file()).unwrap()),
+        guard: Box::new(()),
+    })
+}
+
+/// Serves "file" 7, generation 3 from the pattern file, already open.
+struct Pattern;
+
+impl ReadSource for Pattern {
+    fn open_now(
         &self,
         file: FileId,
         generation: Generation,
-        offset: u64,
-        len: usize,
-        mut buf: Slot,
-    ) -> BoxFuture<'static, (Slot, Result<usize, NestError>)> {
-        async move {
-            if file != FileId(7) {
-                return (buf, Err(NestError::NotFound));
-            }
-            if generation != Generation(3) {
-                return (buf, Err(NestError::Stale));
-            }
-            let n = (SIZE.saturating_sub(offset) as usize).min(len);
-            let dst = buf.as_mut_slice(n);
-            for (k, b) in dst.iter_mut().enumerate() {
-                *b = byte(offset + k as u64);
-            }
-            (buf, Ok(n))
-        }
-        .boxed()
+    ) -> Option<Result<ServeFile, NestError>> {
+        Some(open_pattern(file, generation))
+    }
+
+    fn open(
+        &self,
+        file: FileId,
+        generation: Generation,
+    ) -> BoxFuture<'static, Result<ServeFile, NestError>> {
+        async move { open_pattern(file, generation) }.boxed()
     }
 }
 
@@ -79,7 +100,7 @@ async fn read_protocol_over_loopback() {
     let (rpc2, f2) = node(2, cfg).await.unwrap();
     rpc2.set_peer(NodeId(1), rpc1.local_addr());
     rpc1.set_peer(NodeId(2), rpc2.local_addr());
-    let src: Arc<dyn ReadSource> = Arc::new(Synthetic);
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
     f1.set_source(Arc::downgrade(&src));
 
     // Exact bytes at assorted offsets and lengths, including the tail.
@@ -153,23 +174,23 @@ async fn read_protocol_over_loopback() {
     f2.shutdown();
 }
 
-/// Like `Synthetic`, but every answer takes a while (a busy disk).
+/// Nothing is open: every request is checked off-thread first, slowly (a
+/// busy metadata store), before its io_uring read.
 struct Slow;
 
 impl ReadSource for Slow {
-    fn read_into(
+    fn open_now(&self, _: FileId, _: Generation) -> Option<Result<ServeFile, NestError>> {
+        None
+    }
+
+    fn open(
         &self,
         file: FileId,
         generation: Generation,
-        offset: u64,
-        len: usize,
-        buf: Slot,
-    ) -> BoxFuture<'static, (Slot, Result<usize, NestError>)> {
+    ) -> BoxFuture<'static, Result<ServeFile, NestError>> {
         async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            Synthetic
-                .read_into(file, generation, offset, len, buf)
-                .await
+            open_pattern(file, generation)
         }
         .boxed()
     }
@@ -236,44 +257,10 @@ async fn cancelled_reads_never_answer_later_ones() {
     }
 }
 
-/// Answers small reads at once (as a host does for objects it already has
-/// open) and anything else on the async path.
-struct Quick;
-
-impl ReadSource for Quick {
-    fn try_read_now(
-        &self,
-        file: FileId,
-        generation: Generation,
-        offset: u64,
-        dst: &mut [u8],
-    ) -> Option<Result<usize, NestError>> {
-        if file != FileId(7) || generation != Generation(3) {
-            return None; // errors come from the async path
-        }
-        let n = (SIZE.saturating_sub(offset) as usize).min(dst.len());
-        for (k, b) in dst[..n].iter_mut().enumerate() {
-            *b = byte(offset + k as u64);
-        }
-        Some(Ok(n))
-    }
-
-    fn read_into(
-        &self,
-        file: FileId,
-        generation: Generation,
-        offset: u64,
-        len: usize,
-        buf: Slot,
-    ) -> BoxFuture<'static, (Slot, Result<usize, NestError>)> {
-        Synthetic.read_into(file, generation, offset, len, buf)
-    }
-}
-
-/// Small reads are served on the completion thread with the same bytes,
-/// lengths and errors as the async path; large ones still take it.
+/// Every read is served through the io_uring path: bursts of page-sized
+/// reads (their own staging tier), the tail, errors, and chunks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn small_reads_take_the_fast_path() {
+async fn reads_are_served_through_io_uring() {
     let cfg = FabricConfig {
         chunk: 4 << 20,
         client_slots: 16,
@@ -288,7 +275,7 @@ async fn small_reads_take_the_fast_path() {
     let (rpc2, f2) = node(2, cfg).await.unwrap();
     rpc2.set_peer(NodeId(1), rpc1.local_addr());
     rpc1.set_peer(NodeId(2), rpc2.local_addr());
-    let src: Arc<dyn ReadSource> = Arc::new(Quick);
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
     f1.set_source(Arc::downgrade(&src));
     let fast = || {
         f1.stats
@@ -350,7 +337,14 @@ async fn small_reads_take_the_fast_path() {
         .await
         .unwrap();
     assert_eq!(b.len(), 4 << 20);
-    assert_eq!(fast(), n, "a large read took the fast path");
+    assert!(
+        b.as_slice()
+            .iter()
+            .enumerate()
+            .step_by(4099)
+            .all(|(k, v)| *v == byte(k as u64))
+    );
+    assert_eq!(fast(), n + 1);
 }
 
 /// Page reads, kernel-sized reads and chunks at once: each takes its tier,
@@ -384,7 +378,7 @@ async fn mixed_sizes_share_the_tiers() {
     let (rpc2, f2) = node(2, cfg).await.unwrap();
     rpc2.set_peer(NodeId(1), rpc1.local_addr());
     rpc1.set_peer(NodeId(2), rpc2.local_addr());
-    let src: Arc<dyn ReadSource> = Arc::new(Quick);
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
     f1.set_source(Arc::downgrade(&src));
     let mut tasks = Vec::new();
     for i in 0..600u64 {
@@ -427,74 +421,63 @@ async fn mixed_sizes_share_the_tiers() {
     assert_eq!(b.len(), 0);
 }
 
-/// `read_now` from plain threads (as FUSE threads call it): right bytes and
-/// lengths, the file's tail, and `None` before a link exists.
+/// A reservation's read answers through its callback, on the completion
+/// thread: right bytes and lengths, the tail, errors; `None` before a link
+/// exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn read_now_from_a_plain_thread() {
+async fn reservations_answer_by_callback() {
     let Some((rpc1, f1)) = node(1, FabricConfig::default()).await else {
         return;
     };
     let (rpc2, f2) = node(2, FabricConfig::default()).await.unwrap();
     rpc2.set_peer(NodeId(1), rpc1.local_addr());
     rpc1.set_peer(NodeId(2), rpc2.local_addr());
-    let src: Arc<dyn ReadSource> = Arc::new(Quick);
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
     f1.set_source(Arc::downgrade(&src));
-    // No link yet: the caller must use the async path.
-    let f = f2.clone();
-    let none = std::thread::spawn(move || {
-        let mut b = [0u8; 4096];
-        f.read_now(NodeId(1), FileId(7), Generation(3), 0, &mut b)
-            .is_none()
-    })
-    .join()
-    .unwrap();
-    assert!(none);
+    assert!(f2.reserve(NodeId(1), 4096).is_none(), "no link yet");
     f2.read(NodeId(1), FileId(7), Generation(3), 0, 16)
         .await
         .unwrap();
-    let threads: Vec<_> = (0..8u64)
-        .map(|t| {
-            let f = f2.clone();
-            std::thread::spawn(move || {
-                for i in 0..200u64 {
-                    let off = ((t * 1000 + i) * 104_729) % (SIZE - 8192);
-                    let mut b = vec![0u8; 4096];
-                    let n = f
-                        .read_now(NodeId(1), FileId(7), Generation(3), off, &mut b)
-                        .expect("link and slots available")
-                        .unwrap();
-                    assert_eq!(n, 4096);
-                    assert!(
-                        b.iter()
-                            .enumerate()
-                            .all(|(k, v)| *v == byte(off + k as u64))
-                    );
-                }
-            })
-        })
-        .collect();
-    for t in threads {
-        t.join().unwrap();
+    async fn get(
+        f: &Arc<Fabric>,
+        generation: u64,
+        off: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, NestError> {
+        let r = f
+            .reserve(NodeId(1), len)
+            .expect("link, slots and budget free");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        r.send(
+            FileId(7),
+            Generation(generation),
+            off,
+            Box::new(move |res| {
+                let _ = tx.send(res.map(|b| b.to_vec()));
+            }),
+        );
+        rx.await.unwrap()
     }
-    let f = f2.clone();
-    let tail = std::thread::spawn(move || {
-        let mut b = [0u8; 4096];
-        f.read_now(NodeId(1), FileId(7), Generation(3), SIZE - 5, &mut b)
-            .unwrap()
-            .unwrap()
-    })
-    .join()
-    .unwrap();
-    assert_eq!(tail, 5);
-    let f = f2.clone();
-    let stale = std::thread::spawn(move || {
-        let mut b = [0u8; 16];
-        f.read_now(NodeId(1), FileId(7), Generation(2), 0, &mut b)
-            .unwrap()
-            .err()
-    })
-    .join()
-    .unwrap();
-    assert_eq!(stale, Some(NestError::Stale));
-    assert!(f2.stats.read_now.load(std::sync::atomic::Ordering::Relaxed) >= 1600);
+    let mut tasks = Vec::new();
+    for t in 0..8u64 {
+        let f = f2.clone();
+        tasks.push(tokio::spawn(async move {
+            for i in 0..200u64 {
+                let off = ((t * 1000 + i) * 104_729) % (SIZE - 8192);
+                let b = get(&f, 3, off, 4096).await.unwrap();
+                assert_eq!(b.len(), 4096);
+                assert!(
+                    b.iter()
+                        .enumerate()
+                        .all(|(k, v)| *v == byte(off + k as u64))
+                );
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(get(&f2, 3, SIZE - 5, 4096).await.unwrap().len(), 5);
+    assert_eq!(get(&f2, 2, 0, 16).await.err(), Some(NestError::Stale));
+    assert!(f2.stats.read_now.load(std::sync::atomic::Ordering::Relaxed) >= 1601);
 }

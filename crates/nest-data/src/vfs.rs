@@ -409,6 +409,48 @@ impl Vfs {
         h.count(src, n);
     }
 
+    /// A scattered read with no copy here, ready to send without waiting:
+    /// the frontend starts it and replies from `done`, which runs on the
+    /// fabric's completion thread (no thread waits for the answer, and no
+    /// trip through the runtime). `None`: use `read`.
+    pub fn prepare_scattered(&self, fh: u64, offset: u64, size: u32) -> Option<ScatteredRead> {
+        let h = self.handle(fh).ok()?;
+        let a = self.fast_attr(&h)?;
+        if a.gen_state != GenState::Stable
+            || !self.patterns.is_random(h.file)
+            || self.own_read_source(&a).is_some()
+        {
+            return None;
+        }
+        let fab = self.fabric()?;
+        let route = self.route(&h, &a)?;
+        let peers: Vec<crate::balance::Source> = route
+            .sources
+            .iter()
+            .copied()
+            .filter(|s| matches!(s, crate::balance::Source::Peer(_)))
+            .collect();
+        if peers.is_empty() {
+            return None;
+        }
+        let len = a.size.saturating_sub(offset).min(size as u64) as usize;
+        let ticket = self
+            .balancer
+            .pick_affine(&peers, region_key(h.file, offset));
+        let crate::balance::Source::Peer(node) = ticket.source() else {
+            return None;
+        };
+        let reservation = fab.reserve(node, len.max(1))?;
+        Some(ScatteredRead {
+            vfs: self.arc(),
+            h,
+            generation: a.generation,
+            offset,
+            reservation,
+            ticket,
+        })
+    }
+
     /// Attributes for a fast-path read: cached on the handle for STABLE
     /// generations (no query per page fault), else read.
     fn fast_attr(&self, h: &Handle) -> Option<FileAttr> {
@@ -1830,7 +1872,9 @@ impl Vfs {
                     .filter(|s| matches!(s, crate::balance::Source::Peer(_)))
                     .collect();
                 if !peers.is_empty() {
-                    let ticket = self.balancer.pick_least_busy(&peers);
+                    let ticket = self
+                        .balancer
+                        .pick_affine(&peers, region_key(h.file, offset));
                     let crate::balance::Source::Peer(node) = ticket.source() else {
                         unreachable!("peers only")
                     };
@@ -2068,45 +2112,6 @@ impl Vfs {
                 }
             }
             return Some(r);
-        }
-        // Scattered, no copy here: fetch exactly this range from the least
-        // busy copy on this thread, parked until the answer arrives (a page
-        // fault served without a trip through the runtime).
-        if scattered && a.gen_state == GenState::Stable {
-            let fab = self.fabric()?;
-            let route = self.route(&h, &a)?;
-            let peers: Vec<crate::balance::Source> = route
-                .sources
-                .iter()
-                .copied()
-                .filter(|s| matches!(s, crate::balance::Source::Peer(_)))
-                .collect();
-            if peers.is_empty() {
-                return None;
-            }
-            let n = a.size.saturating_sub(offset).min(size as u64) as usize;
-            let mut buf = vec![0u8; n];
-            let ticket = self.balancer.pick_least_busy(&peers);
-            let crate::balance::Source::Peer(node) = ticket.source() else {
-                return None;
-            };
-            let _t = self.track(h.file);
-            return match fab.read_now(node, h.file, a.generation, offset, &mut buf) {
-                Some(Ok(got)) => {
-                    ticket.finish(got as u64);
-                    buf.truncate(got);
-                    self.count_read(&h, crate::usage::Source::Remote, got as u64);
-                    self.note_direct(&h, offset, got as u64);
-                    Some(from_readahead(buf))
-                }
-                // Let the async path handle it (and its retries).
-                Some(Err(_)) => {
-                    ticket.fail();
-                    *h.stable_attr.lock() = None;
-                    None
-                }
-                None => None,
-            };
         }
         // Only STABLE generations are cached ahead: their bytes never change.
         if a.gen_state != GenState::Stable || scattered {
@@ -2782,66 +2787,62 @@ const SERVE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 const SERVE_FILES_MAX: usize = 4096;
 
 impl nest_fabric::ReadSource for Vfs {
-    /// Small reads of objects already open for serving: one pread, on the
-    /// fabric's completion thread, no queries (the first read of an object
-    /// takes the async path and opens it).
-    fn try_read_now(
+    /// Objects already open for serving: the lease and fences are checked,
+    /// nothing else (the fabric's completion thread calls this).
+    fn open_now(
         &self,
         file: FileId,
         generation: Generation,
-        offset: u64,
-        dst: &mut [u8],
-    ) -> Option<Result<usize, NestError>> {
+    ) -> Option<Result<nest_fabric::ServeFile, NestError>> {
         let f = self.cached_serve_file(ObjectKey::new(file, generation))?;
-        let _t = self.track(file);
-        let mut done = 0;
-        Some(loop {
-            if done == dst.len() {
-                break Ok(done);
-            }
-            match f.read_at(&mut dst[done..], offset + done as u64) {
-                Ok(0) => break Ok(done),
-                Ok(n) => done += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => break Err(io(e)),
-            }
-        })
+        Some(Ok(nest_fabric::ServeFile {
+            file: f,
+            guard: Box::new(self.arc().track_owned(file)),
+        }))
     }
 
-    fn read_into(
+    /// The full check (metadata, live replica) and open, off the fabric's
+    /// thread; the object stays open for later reads.
+    fn open(
         &self,
         file: FileId,
         generation: Generation,
-        offset: u64,
-        len: usize,
-        mut slot: nest_fabric::Slot,
-    ) -> futures::future::BoxFuture<'static, (nest_fabric::Slot, Result<usize, NestError>)> {
+    ) -> futures::future::BoxFuture<'static, Result<nest_fabric::ServeFile, NestError>> {
         let me = self.arc();
         Box::pin(async move {
-            let _t = me.track(file);
-            let f = match me.serve_file(file, generation) {
-                Ok(f) => f,
-                Err(e) => return (slot, Err(e)),
-            };
-            tokio::task::spawn_blocking(move || {
-                let buf = slot.as_mut_slice(len);
-                let mut done = 0;
-                let r = loop {
-                    if done == buf.len() {
-                        break Ok(done);
-                    }
-                    match f.read_at(&mut buf[done..], offset + done as u64) {
-                        Ok(0) => break Ok(done),
-                        Ok(n) => done += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(e) => break Err(io(e)),
-                    }
-                };
-                (slot, r)
+            let guard = me.clone().track_owned(file);
+            let me2 = me.clone();
+            let f = tokio::task::spawn_blocking(move || me2.serve_file(file, generation))
+                .await
+                .map_err(|e| NestError::Io(e.to_string()))??;
+            Ok(nest_fabric::ServeFile {
+                file: f,
+                guard: Box::new(guard),
             })
-            .await
-            .expect("blocking task")
         })
+    }
+}
+
+/// `Inflight` for reads that outlive a borrow (served through the fabric's
+/// ring).
+struct InflightOwned {
+    vfs: Arc<Vfs>,
+    file: FileId,
+}
+
+impl Drop for InflightOwned {
+    fn drop(&mut self) {
+        drop(Inflight {
+            vfs: &self.vfs,
+            file: self.file,
+        });
+    }
+}
+
+impl Vfs {
+    fn track_owned(self: Arc<Self>, file: FileId) -> InflightOwned {
+        *self.inflight.lock().entry(file).or_default() += 1;
+        InflightOwned { vfs: self, file }
     }
 }
 
@@ -2920,5 +2921,57 @@ async fn roll_io_stats(io: std::sync::Weak<nest_fabric::iostats::IoStats>) {
         tick.tick().await;
         let Some(io) = io.upgrade() else { return };
         io.roll();
+    }
+}
+
+/// The rendezvous key of a scattered read: its file and 1 MiB region, so a
+/// region is always asked of the same holder (ADR-034).
+fn region_key(file: FileId, offset: u64) -> u64 {
+    file.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (offset >> 20)
+}
+
+/// A scattered read from another host, reserved and ready to send (see
+/// `Vfs::prepare_scattered`).
+pub struct ScatteredRead {
+    vfs: Arc<Vfs>,
+    h: Arc<Handle>,
+    generation: Generation,
+    offset: u64,
+    reservation: nest_fabric::Reservation,
+    ticket: crate::balance::Ticket,
+}
+
+impl ScatteredRead {
+    /// Send it; `done` gets the bytes (or an error, after which the caller
+    /// should retry through `Vfs::read`, which refreshes and reroutes).
+    pub fn start(self, done: nest_fabric::ReadDone) {
+        let ScatteredRead {
+            vfs,
+            h,
+            generation,
+            offset,
+            reservation,
+            ticket,
+        } = self;
+        let file = h.file;
+        reservation.send(
+            file,
+            generation,
+            offset,
+            Box::new(move |r| {
+                match &r {
+                    Ok(b) => {
+                        ticket.finish(b.len() as u64);
+                        vfs.count_read(&h, crate::usage::Source::Remote, b.len() as u64);
+                        vfs.note_direct(&h, offset, b.len() as u64);
+                    }
+                    Err(_) => {
+                        ticket.fail();
+                        *h.stable_attr.lock() = None;
+                    }
+                }
+                done(r);
+            }),
+        );
     }
 }

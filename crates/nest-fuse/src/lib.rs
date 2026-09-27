@@ -512,6 +512,24 @@ impl Filesystem for Fs {
             Some(Err(e)) => return reply.error(errno(&e)),
             None => {}
         }
+        // A scattered file with no copy here (page faults on a lookup
+        // table): send the fabric read and return; the fabric's completion
+        // thread replies. On an error, retry the ordinary way.
+        if let Some(r) = self.vfs.prepare_scattered(fh.0, offset, size) {
+            let (vfs, rt) = (self.vfs.clone(), self.rt.clone());
+            r.start(Box::new(move |res| match res {
+                Ok(b) => reply.data(b),
+                Err(_) => {
+                    rt.spawn(async move {
+                        match vfs.read(fh.0, offset, size).await {
+                            Ok(b) => reply.data(&b),
+                            Err(e) => reply.error(errno(&e)),
+                        }
+                    });
+                }
+            }));
+            return;
+        }
         let vfs = self.vfs.clone();
         self.spawn(async move {
             match vfs.read(fh.0, offset, size).await {

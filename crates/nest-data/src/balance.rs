@@ -59,6 +59,8 @@ const PRIOR_LOCAL: Duration = Duration::from_micros(1500);
 const PRIOR_PEER: Duration = Duration::from_micros(2500);
 /// How fast a high latency sample decays back.
 const DECAY: Duration = Duration::from_secs(2);
+/// A source's latency fades back toward its prior over this, while idle.
+const STALE: Duration = Duration::from_secs(5);
 /// Window for the byte rates `nest io` shows.
 const WINDOW: Duration = Duration::from_secs(10);
 
@@ -116,8 +118,28 @@ impl Stat {
         }
     }
 
-    fn score(&self) -> f64 {
-        self.latency * (self.in_flight as f64 + 1.0)
+    fn prior(&self, src: Source) -> f64 {
+        match src {
+            Source::Local => PRIOR_LOCAL,
+            Source::Peer(_) => PRIOR_PEER,
+        }
+        .as_secs_f64()
+    }
+
+    /// Latency as of now: a source not heard from for a while fades back
+    /// toward its prior, so one slow sample cannot keep it unused (and
+    /// unmeasured) for good.
+    fn latency_now(&self, src: Source, now: Instant) -> f64 {
+        let prior = self.prior(src);
+        if !self.measured || self.latency <= prior || self.in_flight > 0 {
+            return self.latency;
+        }
+        let idle = now.duration_since(self.last).as_secs_f64();
+        prior + (self.latency - prior) * (-idle / STALE.as_secs_f64()).exp()
+    }
+
+    fn score(&self, src: Source, now: Instant) -> f64 {
+        self.latency_now(src, now) * (self.in_flight as f64 + 1.0)
     }
 }
 
@@ -219,28 +241,37 @@ impl Balancer {
         ranked.truncate(keep.max(1));
     }
 
-    /// Pick whichever of `candidates` (non-empty) answers soonest by its
-    /// load, for a small scattered read: no stripes, no cap (ADR-031).
-    pub fn pick_least_busy(self: &Arc<Self>, candidates: &[Source]) -> Ticket {
+    /// Pick the holder for a small scattered read of region `key` among
+    /// `candidates` (non-empty): the first ranked by rendezvous hash of
+    /// (file, region) unless clearly busier than the best. The same region
+    /// goes to the same holder, so each holder's page cache keeps its own
+    /// part of a large table and rows this host evicted are often still
+    /// cached there. No cap (ADR-034).
+    pub fn pick_affine(self: &Arc<Self>, candidates: &[Source], key: u64) -> Ticket {
+        let now = Instant::now();
         let mut st = self.stats.lock();
-        let src = *candidates
-            .iter()
-            .min_by(|a, b| {
-                let sa = st
-                    .get(a)
-                    .map_or_else(|| Stat::new(**a).score(), |x| x.score());
-                let sb = st
-                    .get(b)
-                    .map_or_else(|| Stat::new(**b).score(), |x| x.score());
-                sa.total_cmp(&sb)
+        let score = |s: &Source| {
+            st.get(s)
+                .map_or_else(|| Stat::new(*s).score(*s, now), |x| x.score(*s, now))
+        };
+        let mut ranked: Vec<Source> = candidates.to_vec();
+        ranked.sort_by_key(|s| {
+            std::cmp::Reverse(match s {
+                Source::Peer(n) => weight(key, *n),
+                Source::Local => u64::MAX,
             })
+        });
+        let best = ranked.iter().map(&score).fold(f64::INFINITY, f64::min);
+        let src = *ranked
+            .iter()
+            .find(|s| score(s) <= best * SLACK)
             .expect("non-empty");
         st.entry(src).or_insert_with(|| Stat::new(src)).in_flight += 1;
         drop(st);
         Ticket {
             b: self.clone(),
             src,
-            start: Instant::now(),
+            start: now,
             done: false,
         }
     }
@@ -248,10 +279,11 @@ impl Balancer {
     /// Pick the source for the next chunk of stripe `key` among
     /// `candidates` (non-empty) and count it in flight.
     pub fn pick(self: &Arc<Self>, candidates: &[Source], key: u64) -> Ticket {
+        let now = Instant::now();
         let mut st = self.stats.lock();
         let score = |s: &Source| {
             st.get(s)
-                .map_or_else(|| Stat::new(*s).score(), |x| x.score())
+                .map_or_else(|| Stat::new(*s).score(*s, now), |x| x.score(*s, now))
         };
         let best = candidates.iter().map(&score).fold(f64::INFINITY, f64::min);
         let src = if candidates.contains(&Source::Local) && score(&Source::Local) <= best * SLACK {
@@ -311,7 +343,7 @@ impl Balancer {
                     .sum();
                 SourceReport {
                     source: *src,
-                    latency_us: (s.latency * 1e6) as u64,
+                    latency_us: (s.latency_now(*src, now) * 1e6) as u64,
                     measured: s.measured,
                     in_flight: s.in_flight,
                     bytes_per_s: recent / WINDOW.as_secs(),
@@ -474,5 +506,45 @@ mod tests {
             "decays after a few seconds: {}",
             s.latency
         );
+    }
+
+    #[test]
+    fn a_stale_slow_source_fades_back_into_use() {
+        let mut s = Stat::new(A);
+        let t0 = Instant::now();
+        s.sample(0.036, 1 << 20, t0);
+        let fresh = s.latency_now(A, t0);
+        let later = s.latency_now(A, t0 + Duration::from_secs(20));
+        assert!((fresh - 0.036).abs() < 1e-9);
+        assert!(later < PRIOR_PEER.as_secs_f64() * 1.5, "{later}");
+        // Busy (in flight) sources keep what they measured.
+        s.in_flight = 1;
+        assert!((s.latency_now(A, t0 + Duration::from_secs(20)) - 0.036).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scattered_regions_stick_to_a_holder_unless_it_is_busy() {
+        let b = Arc::new(Balancer::default());
+        let peers = [A, B, Source::Peer(NodeId(9))];
+        // The same region goes to the same holder, and regions spread.
+        let mut seen = std::collections::HashSet::new();
+        for key in 0..64u64 {
+            let t1 = b.pick_affine(&peers, key);
+            let first = t1.source();
+            drop(t1);
+            let t2 = b.pick_affine(&peers, key);
+            assert_eq!(t2.source(), first);
+            seen.insert(first);
+        }
+        assert_eq!(seen.len(), 3);
+        // A holder with a long queue sheds its regions.
+        let key = (0..64u64)
+            .find(|k| {
+                let t = b.pick_affine(&peers, *k);
+                t.source() == A
+            })
+            .unwrap();
+        let _busy: Vec<Ticket> = (0..8).map(|_| b.pick_affine(&[A], key)).collect();
+        assert_ne!(b.pick_affine(&peers, key).source(), A);
     }
 }

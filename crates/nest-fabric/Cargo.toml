@@ -19,6 +19,7 @@ serde.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 futures.workspace = true
+io-uring.workspace = true
 bytes.workspace = true
 
 [build-dependencies]

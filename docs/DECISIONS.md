@@ -869,3 +869,39 @@ readahead only when its runs (at least 4, 256 MiB in all) average 64 MiB
 or more, well past readahead's window. Short sequential runs stay direct,
 where the kernel's own readahead requests (up to 128 KiB) pipeline them
 without waste.
+
+## ADR-034 — One serve path through io_uring; readers never wait on a thread; scattered reads keep cache affinity (2026-09-27)
+
+**Context.** Serving small reads inline (ADR-032) did each cold disk read
+on the completion thread, one at a time per device: under load (a model
+loading from other hosts) 150–330 µs disk reads became ~730 µs round
+trips, while the drive could have run dozens at once. On the reader, a FUSE
+thread that waited for its row (to save thread hops) blocked the other page
+faults queued on its CPU's ring: one reader got faster, Fable's concurrent
+faults got slower (53.7 → 34.1). Scattered reads went to the least busy
+holder, so no holder kept any part of a table cached. And a holder whose
+latency was measured high once was never tried, so never re-measured (dodo
+sat unused at 36 ms).
+
+**Decision.**
+- Serving has one path: the object (open already, or checked off-thread
+  once and reopened every 2 s), a queue until a staging slot is free, an
+  io_uring read into the slot submitted from the device's completion
+  thread, and the RDMA write when the read completes, on that same thread.
+  No hand-offs, and the drive sees every read in flight. Short reads are
+  continued, never taken for end of file. The poller sleeps on both the
+  RDMA completion channel and an eventfd registered with the ring.
+- A reader of a scattered file with no local copy reserves a lane, budget,
+  a landing slot and window room without waiting (`Fabric::reserve`),
+  sends, and returns; the completion thread runs its callback, which
+  replies to FUSE. Reads that fail are retried through the ordinary path;
+  unanswered ones fail after 30 s like any other.
+- Scattered reads choose their holder by rendezvous hash of (file, 1 MiB
+  region), falling to the next only when it is clearly busier, so each
+  holder's page cache keeps its own part of a table.
+- A source's latency fades back toward its prior while it is idle, so a
+  slow sample cannot bench it for good.
+
+**Consequences.** One serve path to reason about and measure; the async
+serve and inline reads are gone. The fabric tests serve a real file.
+Readahead's 4 MiB chunks still use the awaiting `read`.
