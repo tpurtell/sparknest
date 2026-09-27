@@ -7,7 +7,8 @@
 
   let { plan, onapplied }: { plan: Plan; onapplied?: () => void } = $props();
   const moved = $derived(plan.steps.reduce((a, s) => a + s.bytes, 0));
-  const label = (k: string) => (k === "evict" ? "Remove redundant copies" : k === "offload" ? "Offload sole copies" : "Copy");
+  const label = (s: Plan["steps"][number]) =>
+    s.kind === "evict" ? (s.requires !== undefined ? "Remove moved copies" : "Remove redundant copies") : s.kind === "offload" ? "Offload sole copies" : "Copy";
 
   async function apply() {
     const n = plan.steps.reduce((a, s) => a + s.copies.length, 0);
@@ -48,7 +49,7 @@
         <details class="step panel" open={i === 0 && plan.steps.length < 4}>
           <summary>
             <span class="k {s.kind}">{s.kind === "replicate" ? "+" : s.kind === "offload" ? "⧉" : "−"}</span>
-            <span>{label(s.kind)} {s.kind === "replicate" ? "to" : "from"} <b>{s.host}</b>{#if s.kind === "offload"} into <b>{s.store}</b>{/if}</span>
+            <span>{label(s)} {s.kind === "replicate" ? "to" : "from"} <b>{s.host}</b>{#if s.kind === "offload"} into <b>{s.store}</b>{/if}</span>
             <span class="spacer"></span>
             <span class="mono small">{s.copies.length} files · {human(s.bytes)}</span>
           </summary>

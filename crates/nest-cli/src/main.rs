@@ -120,7 +120,9 @@ enum Cmd {
     Plan {
         #[command(subcommand)]
         cmd: Option<PlanCmd>,
-        /// HOST_OR_@GROUP=SIZE (repeatable); a bare number is GiB (600 = 600 GiB)
+        /// HOST_OR_@GROUP=SIZE: target free space (repeatable; a bare number is
+        /// GiB). Above a host's free space it sheds; below, the host may take
+        /// sole copies other hosts shed (room granted), before any archive.
         #[arg(long)]
         free: Vec<String>,
         /// Remove copies not opened on their host within this window (1d, 7d, 30d, 1w, 1m).
@@ -243,8 +245,9 @@ enum Cmd {
 
 const PLAN_EXAMPLES: &str = "\
 Examples:
-  Make room; sole copies may go to the nas archive:
-    nest plan --free raptor=800GiB --free @sparks=400GiB --to nas
+  Make room on raptor; its only copies move to ostrich (may fill to 200 GiB
+  free), then to the nas archive:
+    nest plan --free raptor=800GiB --free ostrich=200GiB --to nas
   Tidy copies nobody opened on their host for a week:
     nest plan --tidy 7d
     nest plan --tidy 1m --host dodo --to nas
@@ -1094,6 +1097,16 @@ async fn main() -> Result<()> {
                     } else {
                         String::new()
                     };
+                    if target == 0 {
+                        // Goals other than free space set no target.
+                        println!(
+                            "  {:<9} free {} -> {}{gain}",
+                            h["host"].as_str().unwrap_or(""),
+                            human(now),
+                            human(after)
+                        );
+                        continue;
+                    }
                     let mark = if after >= target { "ok" } else { "SHORT" };
                     println!(
                         "  {:<9} free {} -> {}{gain}, target {}  {mark}",

@@ -2,11 +2,14 @@
 //! copies live, show why each one is proposed, and apply them on approval.
 //!
 //! Goals:
-//! - **Free**: reach desired free space on hosts. Redundant copies go first
-//!   (another copy exists elsewhere, including an archive, and no rule needs
-//!   it here), least recently opened on that host first; then sole copies
-//!   are offloaded into the archive stores the caller chose, filled in the
-//!   order given. With no archive chosen only redundant copies are removed.
+//! - **Free**: a target free space per host. Above what a host has now, it
+//!   sheds: redundant copies first (another copy exists elsewhere, including
+//!   an archive, and no rule needs it here), least recently opened there
+//!   first; then its sole copies move to hosts whose target is *below* what
+//!   they have now (room the user granted), most room first; then into the
+//!   archive stores the caller chose, in order. A moved copy is removed
+//!   from its source only once the receiver holds it (checked when
+//!   applying).
 //! - **Tidy**: remove copies not opened on their host within a window (and
 //!   not written within it), oldest use first, down to one copy anywhere;
 //!   sole copies move to a chosen archive or stay.
@@ -484,6 +487,14 @@ fn make_free(
             want.insert(h.node, *bytes);
         }
     }
+    // Room granted: hosts asked to keep less free than they have.
+    let mut rooms: BTreeMap<NodeId, u64> = want
+        .iter()
+        .filter_map(|(n, t)| {
+            let now = w.free_now.get(n).copied().unwrap_or(0);
+            (*t < now).then(|| (*n, now - *t))
+        })
+        .collect();
     let mut steps = Vec::new();
     for (&node, &target) in &want {
         let host = w.host(node);
@@ -534,6 +545,55 @@ fn make_free(
                 requires: None,
             });
         }
+        // Sole copies move to hosts with room granted, most room first.
+        if deficit > 0 && !only.is_empty() {
+            let mut moved: BTreeMap<NodeId, Vec<Copy>> = BTreeMap::new();
+            let mut left = Vec::new();
+            for mut cp in only.drain(..) {
+                if deficit == 0 {
+                    left.push(cp);
+                    continue;
+                }
+                let to = rooms
+                    .iter()
+                    .filter(|(r, room)| **r != node && **room >= cp.size)
+                    .max_by_key(|(_, room)| **room)
+                    .map(|(r, _)| *r);
+                match to {
+                    Some(r) => {
+                        *rooms.get_mut(&r).expect("present") -= cp.size;
+                        deficit = deficit.saturating_sub(cp.size);
+                        *w.projected.entry(node).or_default() += cp.size;
+                        let pr = w.projected.entry(r).or_default();
+                        *pr = pr.saturating_sub(cp.size);
+                        cp.why = format!(
+                            "only copy; {}; moved to {} (room granted there)",
+                            cp.why,
+                            w.host(r)
+                        );
+                        moved.entry(r).or_default().push(cp);
+                    }
+                    None => left.push(cp),
+                }
+            }
+            only = left;
+            for (r, copies) in moved {
+                let bytes = copies.iter().map(|c| c.size).sum();
+                steps.push(Step::Replicate {
+                    host: w.host(r),
+                    node: r,
+                    bytes,
+                    copies: copies.clone(),
+                });
+                steps.push(Step::Evict {
+                    host: host.clone(),
+                    node,
+                    bytes,
+                    copies,
+                    requires: Some(r),
+                });
+            }
+        }
         if deficit > 0 && !only.is_empty() {
             let before: u64 = only.iter().map(|c| c.size).sum();
             only = w.offload(node, only, Some(deficit), &mut steps);
@@ -548,9 +608,9 @@ fn make_free(
             let stuck: u64 = only.iter().map(|c| c.size).sum();
             if stuck > 0 {
                 let archive_why = if w.dest.iter().any(|d| d.reachable) {
-                    "the chosen archive stores have no room for them"
+                    "no host was granted room for them and the chosen archive stores have none"
                 } else {
-                    "no archive store was chosen to offload them into"
+                    "no host was granted room for them (drag another host's handle toward less free) and no archive store was chosen"
                 };
                 why += &format!("; {} here are only copies and {archive_why}", human(stuck));
             }

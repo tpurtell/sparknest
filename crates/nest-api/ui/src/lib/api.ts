@@ -195,7 +195,7 @@ export interface Copy {
   why: string;
 }
 export type Step =
-  | { kind: "evict"; host: string; bytes: number; copies: Copy[] }
+  | { kind: "evict"; host: string; bytes: number; copies: Copy[]; requires?: number }
   | { kind: "offload"; host: string; store: string; bytes: number; copies: Copy[] }
   | { kind: "replicate"; host: string; bytes: number; copies: Copy[] };
 export interface Plan {

@@ -349,3 +349,64 @@ async fn consolidate_moves_a_selection_to_where_it_is_used() {
     c.converge().await;
     assert_eq!(holders(&c, f), [3]);
 }
+
+/// Make room: a sole copy moves to a host granted room (a target below its
+/// free space) rather than staying put or needing an archive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn make_room_moves_sole_copies_to_hosts_granted_room() {
+    let c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    let f = write(&c, "only", 8 * MIB).await;
+    let free = |n: &str| {
+        let st = futures::executor::block_on(p.status()).unwrap();
+        st.iter()
+            .find(|s| s.name == n)
+            .unwrap()
+            .info
+            .as_ref()
+            .unwrap()
+            .free_bytes
+    };
+    let (f1, f2) = (free("n1"), free("n2"));
+    // n1 wants 4 MiB more free; nobody granted room: blocked.
+    let plan = p
+        .plan(Goal::Free {
+            free: vec![("n1".into(), f1 + 4 * MIB)],
+            archives: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(!plan.feasible && plan.steps.is_empty(), "{plan:?}");
+    assert!(
+        plan.blocked[0].contains("no host was granted room"),
+        "{:?}",
+        plan.blocked
+    );
+    // n2 may fill up to 64 MiB less free: the sole copy moves there.
+    let plan = p
+        .plan(Goal::Free {
+            free: vec![("n1".into(), f1 + 4 * MIB), ("n2".into(), f2 - 64 * MIB)],
+            archives: vec![],
+        })
+        .await
+        .unwrap();
+    // (Feasibility is not asserted: test nodes share one real disk whose
+    // free space other tests move meanwhile.)
+    let kinds: Vec<(&str, String)> = plan
+        .steps
+        .iter()
+        .map(|s| match s {
+            Step::Replicate { host, .. } => ("add", host.clone()),
+            Step::Evict { host, requires, .. } => {
+                assert!(requires.is_some());
+                ("drop", host.clone())
+            }
+            Step::Offload { host, .. } => ("offload", host.clone()),
+        })
+        .collect();
+    assert_eq!(kinds, [("add", "n2".to_string()), ("drop", "n1".into())]);
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    assert_eq!(holders(&c, f), [2]);
+}

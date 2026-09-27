@@ -75,8 +75,11 @@
     if (!n) return;
     const r = drag.el.getBoundingClientRect();
     const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-    // Never ask for less free space than there is now.
-    want[drag.host] = Math.max(n.free_bytes, n.total_bytes * (1 - f));
+    // Left of today's free space: shed; right of it: room granted for other
+    // hosts' files. Snap to "as now" near the current mark.
+    let t = n.total_bytes * (1 - f);
+    if (Math.abs(t - n.free_bytes) < n.total_bytes * 0.005) t = n.free_bytes;
+    want[drag.host] = t;
     schedule();
   }
   function up() {
@@ -95,7 +98,7 @@
 <div class="stack">
   <div class="goals">
     <button class="goal panel" class:on={goal === "free"} onclick={() => (goal = "free")}>
-      <Icon name="space" size={22} /><div><b>Make room</b><div class="small muted">Drag a host's handle to the space you want free</div></div>
+      <Icon name="space" size={22} /><div><b>Make room</b><div class="small muted">Set how much each host keeps free: shed, move, or take more</div></div>
     </button>
     <button class="goal panel" class:on={goal === "tidy"} onclick={() => (goal = "tidy")}>
       <Icon name="broom" size={22} /><div><b>Tidy up</b><div class="small muted">Remove copies nobody opened lately</div></div>
@@ -107,7 +110,7 @@
 
   <div class="panel pad stack">
     {#if goal === "free"}
-      <div class="row"><h3>Desired free space</h3><span class="small muted">Removes redundant copies least recently used first; sole copies go to the archives you pick.</span></div>
+      <div class="row"><h3>Target free space</h3><span class="small muted">Drag left to make room on a host, right to let it take more. A host that must shed drops redundant copies first (least recently used), then moves its only copies to hosts you let take more, then to the archives you pick. A moved file leaves its source only once it has arrived.</span></div>
       <div class="bars">
         {#each hosts as h (h.name)}
           {@const i = h.info!}
@@ -120,17 +123,27 @@
             <div class="track" class:set={w !== undefined}>
               <i class="other" style="width:{pct(other, i.total_bytes)}%"></i>
               <i class="ours" style="left:{pct(other, i.total_bytes)}%;width:{pct(i.object_bytes, i.total_bytes)}%"></i>
-              {#if p && w !== undefined}
+              {#if w !== undefined && w < i.free_bytes}
+                <i class="grant" style="left:{pct(i.total_bytes - i.free_bytes, i.total_bytes)}%;width:{pct(i.free_bytes - w, i.total_bytes)}%"></i>
+                {#if p && p.projected_free < i.free_bytes}
+                  <i class="take" style="left:{pct(i.total_bytes - i.free_bytes, i.total_bytes)}%;width:{pct(i.free_bytes - p.projected_free, i.total_bytes)}%"></i>
+                {/if}
+              {/if}
+              {#if p && w !== undefined && w > i.free_bytes}
                 <i class="gain" style="left:{pct(i.total_bytes - p.projected_free, i.total_bytes)}%;width:{pct(p.projected_free - i.free_bytes, i.total_bytes)}%"></i>
                 {#if p.projected_free < p.target}<i class="short" style="left:{pct(i.total_bytes - p.target, i.total_bytes)}%;width:{pct(p.target - p.projected_free, i.total_bytes)}%"></i>{/if}
               {/if}
               <button class="handle" style="left:{pct(i.total_bytes - target, i.total_bytes)}%" aria-label="free space target for {h.name}"
                 onpointerdown={(e) => down(e, h.name)}
-                onkeydown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { want[h.name] = Math.max(i.free_bytes, Math.min(i.total_bytes, target + (e.key === "ArrowLeft" ? 1 : -1) * i.total_bytes * 0.01)); schedule(); } }}></button>
+                onkeydown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { want[h.name] = Math.max(0, Math.min(i.total_bytes, target + (e.key === "ArrowLeft" ? 1 : -1) * i.total_bytes * 0.01)); schedule(); } }}></button>
             </div>
             <div class="hv mono small">
-              {#if w !== undefined}
-                want <b>{human(w)}</b>
+              {#if w !== undefined && w < i.free_bytes}
+                may take <b>{human(i.free_bytes - w)}</b>
+                {#if p}<div class="tiny muted">{p.projected_free < i.free_bytes ? `takes ${human(i.free_bytes - p.projected_free)}` : "nothing needs it"}</div>{/if}
+                <button class="btn sm ghost" onclick={() => reset(h.name)}>reset</button>
+              {:else if w !== undefined && w > i.free_bytes}
+                want <b>{human(w)}</b> free
                 {#if p}<div class="tiny" class:ok={p.projected_free >= p.target} class:bad={p.projected_free < p.target}>{p.projected_free >= p.target ? "✓ reachable" : `short ${human(p.target - p.projected_free)}`}</div>{/if}
                 <button class="btn sm ghost" onclick={() => reset(h.name)}>reset</button>
               {:else}<span class="faint">drag ◂</span>{/if}
@@ -184,7 +197,7 @@
       <PlanPreview {plan} onapplied={() => { want = {}; plan = null; }} />
     </div>
   {:else if goal === "free"}
-    <div class="panel empty">Drag a handle to the left to ask for more free space on that host.</div>
+    <div class="panel empty">Drag a handle left to make room on that host, or right to let it take files from others.</div>
   {/if}
 </div>
 
@@ -202,6 +215,8 @@
   .track .other { left: 0; background: #2c3a52; border-radius: 7px 0 0 7px; }
   .track .ours { background: linear-gradient(90deg, var(--spark-2), var(--spark)); box-shadow: 0 0 12px rgba(56, 232, 255, 0.5); }
   .track .gain { background: repeating-linear-gradient(45deg, rgba(61, 255, 197, 0.55) 0 6px, rgba(61, 255, 197, 0.25) 6px 12px); box-shadow: 0 0 14px rgba(61, 255, 197, 0.5); }
+  .track .grant { background: repeating-linear-gradient(-45deg, rgba(155, 123, 255, 0.35) 0 6px, rgba(155, 123, 255, 0.12) 6px 12px); border-left: 1px solid var(--violet); }
+  .track .take { background: rgba(155, 123, 255, 0.75); box-shadow: 0 0 14px rgba(155, 123, 255, 0.6); }
   .track .short { background: repeating-linear-gradient(45deg, rgba(255, 79, 123, 0.5) 0 6px, transparent 6px 12px); }
   .handle { position: absolute; top: -6px; bottom: -6px; width: 14px; margin-left: -7px; border-radius: 6px; border: 1px solid var(--spark); background: #031018; cursor: ew-resize; box-shadow: 0 0 14px var(--spark); padding: 0; }
   .handle::after { content: ""; position: absolute; left: 5px; right: 5px; top: 6px; bottom: 6px; border-left: 1px solid var(--spark); border-right: 1px solid var(--spark); }
