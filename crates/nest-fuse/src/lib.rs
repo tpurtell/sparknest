@@ -848,6 +848,23 @@ pub struct Mounted {
     session: Option<fuser::BackgroundSession>,
     stop_notify: std::sync::mpsc::Sender<Inval>,
     uring: Arc<uring::Stats>,
+    mountpoint: std::path::PathBuf,
+}
+
+/// How long unmounting waits for the FUSE threads before giving up on them
+/// (the process exits anyway, which ends the connection).
+const UNMOUNT_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether `mp` is still a sparknest mount, from /proc/self/mountinfo.
+fn still_mounted(mp: &std::path::Path) -> bool {
+    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let mp = mp.to_string_lossy();
+    info.lines().any(|l| {
+        let f: Vec<&str> = l.split(' ').collect();
+        f.get(4) == Some(&mp.as_ref()) && l.contains(" - fuse.sparknest ")
+    })
 }
 
 impl Mounted {
@@ -863,12 +880,45 @@ impl Mounted {
         self.do_unmount();
     }
 
+    /// Unmount and stop the FUSE threads, within `UNMOUNT_WAIT`. With
+    /// auto_unmount, fuser's unmount only closes its socket to the
+    /// fusermount3 helper and leaves the unmount to it; when the helper does
+    /// not (seen on every trial restart), the threads wait on /dev/fuse
+    /// forever and systemd kills the daemon after 90 s. So: lazily unmount
+    /// ourselves if the mount is still there, and stop waiting after a while.
     fn do_unmount(&mut self) {
         let _ = self.stop_notify.send(Inval::Stop);
-        if let Some(s) = self.session.take()
-            && let Err(e) = s.umount_and_join()
-        {
-            tracing::warn!(error = %e, "unmount failed");
+        let Some(s) = self.session.take() else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(s.umount_and_join());
+        });
+        let start = std::time::Instant::now();
+        let mut detached = false;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(())) => return,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "unmount failed");
+                    return;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if !detached && start.elapsed() > Duration::from_secs(1) {
+                detached = true;
+                if still_mounted(&self.mountpoint) {
+                    tracing::info!(mountpoint = %self.mountpoint.display(), "still mounted: detaching it");
+                    let _ = std::process::Command::new("fusermount3")
+                        .arg("-uz")
+                        .arg(&self.mountpoint)
+                        .status();
+                }
+            }
+            if start.elapsed() > UNMOUNT_WAIT {
+                tracing::warn!("FUSE threads did not stop; exiting without them");
+                return;
+            }
         }
     }
 }
@@ -993,6 +1043,7 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
         session: Some(session),
         stop_notify: tx,
         uring: inner.uring_stats.clone(),
+        mountpoint: cfg.mountpoint.clone(),
     })
 }
 
