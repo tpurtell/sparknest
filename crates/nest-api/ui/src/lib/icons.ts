@@ -13,6 +13,7 @@ export const icons: Record<string, string> = {
   archive: "M3 4h18v5H3zM5 9v11h14V9M10 13h4",
   pin: "M12 17v5M5 17h14l-2-5V4H7v8z",
   zoom: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM21 21l-4.3-4.3",
+  download: "M12 4v11M7 10l5 5 5-5M5 20h14",
   up: "M12 19V5M5 12l7-7 7 7",
   info: "M12 8h.01M11 12h1v5h1M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z",
   x: "M6 6l12 12M18 6 6 18",

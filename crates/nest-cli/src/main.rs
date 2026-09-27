@@ -366,6 +366,35 @@ enum HfCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Download a repo from the Hub to a host
+    ///
+    /// What the cluster already has of it is copied to the host first; hf
+    /// then fetches the rest into sparknest's hub through that host's mount
+    /// (with the token from ~/.cache/huggingface/token, if any). Also
+    /// finishes a repo no host holds completely.
+    Download {
+        /// org/name (or a huggingface.co URL).
+        repo: String,
+        /// The host to download to (default: this one).
+        #[arg(long)]
+        host: Option<String>,
+        /// It is a dataset.
+        #[arg(long)]
+        dataset: bool,
+        #[arg(long)]
+        revision: Option<String>,
+        /// Follow the job until it finishes.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Search the Hub (most downloaded first)
+    Search {
+        query: String,
+        #[arg(long)]
+        dataset: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1652,6 +1681,59 @@ async fn main() -> Result<()> {
         },
         Cmd::Hf {
             cmd:
+                HfCmd::Download {
+                    repo,
+                    host,
+                    dataset,
+                    revision,
+                    wait,
+                },
+        } => {
+            let v = c
+                .post(
+                    "/v1/hf/download",
+                    json!({
+                        "repo": repo,
+                        "host": host.clone().unwrap_or_default(),
+                        "kind": if *dataset { "dataset" } else { "model" },
+                        "revision": revision,
+                        "hf": which("hf"),
+                    }),
+                )
+                .await?;
+            let jid = v["job"].as_u64().unwrap_or(0);
+            if *wait { wait_job(&c, jid).await? } else { v }
+        }
+        Cmd::Hf {
+            cmd:
+                HfCmd::Search {
+                    query,
+                    dataset,
+                    limit,
+                },
+        } => {
+            let v = c
+                .get(&format!(
+                    "/v1/hf/search?q={}&kind={}&limit={limit}",
+                    urlencode(query),
+                    if *dataset { "dataset" } else { "model" }
+                ))
+                .await?;
+            if !cli.json {
+                for r in v["results"].as_array().into_iter().flatten() {
+                    println!(
+                        "{:<60} {:>12} downloads  {}",
+                        r["id"].as_str().unwrap_or(""),
+                        r["downloads"].as_u64().unwrap_or(0),
+                        r["pipeline_tag"].as_str().unwrap_or("")
+                    );
+                }
+                return Ok(());
+            }
+            v
+        }
+        Cmd::Hf {
+            cmd:
                 HfCmd::Rm {
                     repos,
                     dry_run,
@@ -1914,4 +1996,16 @@ fn io_window_table(w: &Value) {
             100.0 * (1.0 - used as f64 / dropped as f64)
         );
     }
+}
+
+/// Percent-encode a query-string value.
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }

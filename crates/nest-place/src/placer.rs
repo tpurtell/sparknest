@@ -1080,6 +1080,174 @@ impl Placer {
         })
     }
 
+    /// Download a Hugging Face repo to this node (see `hfimport::download`):
+    /// first a copy of what the cluster already has of it, then `hf
+    /// download` for the rest (nothing, or what was never finished).
+    /// Progress is what this node holds of the repo against hf's size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hf_download(
+        self: &Arc<Self>,
+        hf: std::path::PathBuf,
+        hub: String,
+        mount_hub: std::path::PathBuf,
+        repo: String,
+        kind: String,
+        revision: Option<String>,
+    ) -> u64 {
+        let what = format!("hf download {repo}");
+        tracing::info!(%repo, %kind, "hf download started");
+        let me = self.clone();
+        self.local_job(what, move |_vfs, progress, notes| async move {
+            let repo_type = if kind.starts_with("dataset") {
+                "dataset"
+            } else {
+                "model"
+            };
+            let sel = Selector::Hf {
+                hub,
+                repo: repo.clone(),
+                revision: None,
+                repo_type: repo_type.into(),
+            };
+            let here = me.vfs.data().id();
+            let name = me
+                .nodes()?
+                .into_iter()
+                .find(|h| h.node == here)
+                .map(|h| h.name)
+                .unwrap_or_default();
+            // 1. What the cluster has, here.
+            if me.manifest(&sel).await.is_ok_and(|m| !m.entries.is_empty()) {
+                let jid = me.replicate(sel.clone(), vec![name], 4).await?;
+                loop {
+                    if progress.lock().cancelled {
+                        let _ = me.cancel_job(jid).await;
+                    }
+                    match me.job(jid) {
+                        Some(j) if j.finished => {
+                            if let Some(e) = j.error {
+                                notes
+                                    .lock()
+                                    .push(format!("copying what the cluster had: {e}"));
+                            }
+                            break;
+                        }
+                        None => break,
+                        _ => tokio::time::sleep(Duration::from_millis(500)).await,
+                    }
+                }
+            }
+            // 2. How big it is.
+            match crate::hfimport::download_size(&hf, &mount_hub, &repo, &kind, revision.as_deref())
+                .await
+            {
+                Ok((files, bytes)) => {
+                    let mut p = progress.lock();
+                    p.total_files = files;
+                    p.total_bytes = bytes;
+                }
+                Err(e) => notes.lock().push(e.to_string()),
+            }
+            // 3. hf fetches the rest; progress is what this node holds.
+            let prog = progress.clone();
+            let (h, m, r, k, v) = (
+                hf.clone(),
+                mount_hub.clone(),
+                repo.clone(),
+                kind.clone(),
+                revision.clone(),
+            );
+            let dl = tokio::spawn(async move {
+                crate::hfimport::download(&h, &m, &r, &k, v.as_deref(), || prog.lock().cancelled)
+                    .await
+            });
+            let store = here.live_store();
+            let held = |m: &Manifest| -> (u64, u64) {
+                let Ok(c) = me.conn() else { return (0, 0) };
+                m.entries
+                    .iter()
+                    .filter(|e| {
+                        e.stable
+                            && query::has_live_replica(&c, e.file, e.generation, store)
+                                .unwrap_or(false)
+                    })
+                    .fold((0, 0), |(n, b), e| (n + 1, b + e.size))
+            };
+            while !dl.is_finished() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Ok(m) = me.manifest(&sel).await {
+                    let (n, b) = held(&m);
+                    let mut p = progress.lock();
+                    p.files = n;
+                    p.copied_bytes = b;
+                }
+            }
+            let r = dl.await.map_err(|e| NestError::Io(e.to_string()))?;
+            if let Ok(m) = me.manifest(&sel).await {
+                let (n, b) = held(&m);
+                let mut p = progress.lock();
+                p.files = n;
+                p.copied_bytes = b;
+            }
+            r
+        })
+    }
+
+    /// Start `hf_download` on `host` (this node when it is this node's name
+    /// or empty); returns the job id (listed with every host's jobs).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hf_download_on(
+        self: &Arc<Self>,
+        host: &str,
+        hf: Option<String>,
+        hub: String,
+        repo: String,
+        kind: String,
+        revision: Option<String>,
+    ) -> NestResult<u64> {
+        let here = self.vfs.data().id();
+        let target = if host.is_empty() {
+            here
+        } else {
+            self.resolve_hosts(&[host.to_string()])?
+                .first()
+                .map(|h| h.node)
+                .ok_or(NestError::NotFound)?
+        };
+        if target == here {
+            let mount_hub = self
+                .admin
+                .mountpoint
+                .as_ref()
+                .map(|m| std::path::Path::new(m).join(hub.trim_start_matches('/')))
+                .ok_or_else(|| NestError::Invalid("this host has no mount".into()))?;
+            let hf = hf
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_file())
+                .or_else(crate::hfimport::find_hf)
+                .ok_or_else(|| NestError::Invalid("hf is not installed on this host".into()))?;
+            return Ok(self.hf_download(hf, hub, mount_hub, repo, kind, revision));
+        }
+        match admin::call(
+            self.rpc(),
+            target,
+            &AdminReq::HfDownload {
+                repo,
+                kind,
+                revision,
+                hub,
+                hf: None,
+            },
+            Duration::from_secs(10),
+        )
+        .await?
+        {
+            AdminResp::JobStarted(id) => Ok(id),
+            AdminResp::Err(e) => Err(NestError::Invalid(e)),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
+    }
+
     /// Delete Hugging Face repos from the hub through `hf cache rm` (see
     /// `hfimport::remove`), as a job whose note is hf's summary.
     pub fn hf_remove(
@@ -1250,6 +1418,7 @@ impl Placer {
                 "apply plan ",
                 "import ",
                 "hf import ",
+                "hf download ",
             ]
             .iter()
             .any(|k| j.what.starts_with(k))

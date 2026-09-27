@@ -165,6 +165,9 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf/detail", get(hf_detail))
         .route("/v1/hf/import", post(hf_import))
         .route("/v1/hf/remove", post(hf_remove))
+        .route("/v1/hf/search", get(hf_search))
+        .route("/v1/hf/size", get(hf_size))
+        .route("/v1/hf/download", post(hf_download))
         .route("/v1/logs", get(logs))
         .route("/v1/space/tree", get(space_tree))
         .route("/v1/download", get(transfer::download))
@@ -749,6 +752,96 @@ async fn hf_remove(State(api): State<Api>, Json(r): Json<HfRemoveReq>) -> R<serd
     Ok(Json(
         json!({ "job": api.placer.hf_remove(hf, mount_hub, r.targets) }),
     ))
+}
+
+fn mount_hub(api: &Api) -> Result<std::path::PathBuf, ApiError> {
+    api.mountpoint
+        .as_ref()
+        .map(|m| std::path::Path::new(m).join(api.hub.trim_start_matches('/')))
+        .ok_or_else(|| ApiError(StatusCode::CONFLICT, "this node has no mount".into()))
+}
+
+fn hf_program(given: Option<String>) -> Result<std::path::PathBuf, ApiError> {
+    given
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(nest_place::hfimport::find_hf)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::CONFLICT,
+                "hf is not installed on this node".into(),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+struct HfSearchQ {
+    q: String,
+    #[serde(default)]
+    kind: String,
+    limit: Option<u32>,
+}
+
+/// Search the Hub through hf (most downloaded first).
+async fn hf_search(State(_api): State<Api>, Query(q): Query<HfSearchQ>) -> R<serde_json::Value> {
+    let hf = hf_program(None)?;
+    let v =
+        nest_place::hfimport::search(&hf, &q.kind, &q.q, q.limit.unwrap_or(20).min(100)).await?;
+    Ok(Json(json!({ "results": v })))
+}
+
+#[derive(Deserialize)]
+struct HfSizeQ {
+    repo: String,
+    #[serde(default)]
+    kind: String,
+    revision: Option<String>,
+}
+
+/// Files and bytes of a repo on the Hub (hf's dry run).
+async fn hf_size(State(api): State<Api>, Query(q): Query<HfSizeQ>) -> R<serde_json::Value> {
+    let hf = hf_program(None)?;
+    let (files, bytes) = nest_place::hfimport::download_size(
+        &hf,
+        &mount_hub(&api)?,
+        &q.repo,
+        &q.kind,
+        q.revision.as_deref(),
+    )
+    .await?;
+    Ok(Json(json!({ "files": files, "bytes": bytes })))
+}
+
+#[derive(Deserialize)]
+struct HfDownloadReq {
+    repo: String,
+    #[serde(default)]
+    kind: String,
+    /// The host to download to (default: this one).
+    #[serde(default)]
+    host: String,
+    revision: Option<String>,
+    hf: Option<String>,
+}
+
+/// Download a repo to a host: what the cluster has is copied there first,
+/// hf fetches the rest. Returns the job (on that host).
+async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<serde_json::Value> {
+    let repo = r
+        .repo
+        .trim()
+        .trim_start_matches("https://huggingface.co/")
+        .trim_start_matches("hf:")
+        .trim_matches('/')
+        .to_string();
+    if repo.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "no repo given".into()));
+    }
+    let job = api
+        .placer
+        .hf_download_on(&r.host, r.hf, api.hub.clone(), repo, r.kind, r.revision)
+        .await?;
+    Ok(Json(json!({ "job": job })))
 }
 
 async fn cluster(State(api): State<Api>) -> R<serde_json::Value> {

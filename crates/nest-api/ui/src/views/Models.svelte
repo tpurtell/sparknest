@@ -7,6 +7,24 @@
   import Drawer from "../components/Drawer.svelte";
   import ModelDetail from "./ModelDetail.svelte";
   import Icon from "../components/Icon.svelte";
+  import DownloadDialog from "../components/DownloadDialog.svelte";
+  import { pick } from "../lib/ui.svelte";
+
+  let downloading = $state(false);
+
+  // No host holds all of it: download the rest to one (the host holding
+  // most of it first), after copying there what the cluster has.
+  const complete = (r: Repo) => r.hosts?.some((h) => h.ready && !app.stores.some((s) => s.name === h.host));
+  async function finishOn(r: Repo) {
+    const held = (h: Readiness) => h.bytes - h.missing_bytes;
+    const opts = (r.hosts ?? [])
+      .filter((h) => !app.stores.some((s) => s.name === h.host))
+      .sort((a, b) => held(b) - held(a))
+      .map((h) => ({ name: h.host, kind: "host", note: `${human(held(h))} of ${human(h.bytes)} here` }));
+    const got = await pick(`Finish ${r.repo} on…`, opts, false);
+    if (!got?.[0]) return;
+    await startJob("/v1/hf/download", { repo: r.repo, kind: r.kind, host: got[0] }, `Finishing ${r.repo} on ${got[0]}`);
+  }
 
   let repos = $state<Repo[]>([]);
   let hub = $state("");
@@ -74,6 +92,7 @@
   const cellW = $derived(Math.max(20, Math.min(46, Math.floor(720 / Math.max(1, cols.length)))));
 </script>
 
+<DownloadDialog bind:open={downloading} />
 <div class="stack">
   <div class="panel pad head">
     <div class="row">
@@ -81,6 +100,7 @@
       <span class="small muted">{shown.length} repo{shown.length === 1 ? "" : "s"} in {hub}</span>
       <span class="spacer"></span>
       <input type="search" placeholder="filter…" bind:value={q} style="width:200px" />
+      <button class="btn primary" onclick={() => (downloading = true)}><Icon name="download" size={15} /> Download…</button>
     </div>
     <div class="row">
       <div class="chips">
@@ -115,6 +135,7 @@
       {@const byHost = Object.fromEntries(r.hosts?.map((h) => [h.host, h]) ?? [])}
       {@const lastHost = Object.entries(r.usage ?? {}).sort((a, b) => b[1].last_open_ms - a[1].last_open_ms)[0]}
       <div class="repo panel">
+        <div class="namebox">
         <button class="name" onclick={() => go("models", r.selector)}>
           <div class="title">
             <span class="org">{splitRepo(r.repo)[0]}</span><b>{splitRepo(r.repo)[1]}</b>
@@ -126,6 +147,10 @@
             · {r.last_open_ms ? `used ${ago(r.last_open_ms)}${lastHost ? " on " + lastHost[0] : ""}` : "unused in 30 days"}
           </div>
         </button>
+        {#if !r.error && !r.writing && !complete(r)}
+          <button class="btn sm finish" onclick={() => finishOn(r)} title="No host holds all of it: copy what the cluster has to one host, then download the rest"><Icon name="download" size={13} /> Finish</button>
+        {/if}
+        </div>
         {#if r.error}
           <div class="muted small">{r.error}</div>
         {:else}
@@ -182,6 +207,9 @@
   .ch { width: var(--cw); height: 64px; position: relative; }
   .ch span { position: absolute; left: 50%; bottom: 2px; transform-origin: left bottom; transform: rotate(-50deg); white-space: nowrap; font-size: 11px; color: var(--muted); }
   .repo { padding: 10px 14px; transition: border-color 0.15s; }
+  .namebox { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .namebox .name { min-width: 0; flex: 1; }
+  .finish { flex: none; color: var(--warn, #ffd36e); border-color: rgba(255, 211, 110, 0.4); }
   .repo:hover { border-color: rgba(110, 220, 255, 0.3); }
   .name { background: none; border: 0; text-align: left; cursor: pointer; min-width: 0; padding: 0; }
   .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }

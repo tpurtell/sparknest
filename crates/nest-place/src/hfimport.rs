@@ -744,9 +744,16 @@ pub fn find_hf() -> Option<PathBuf> {
 }
 
 /// A repo target for `hf cache rm`: `model/org/name`, `dataset/org/name`
-/// (also accepts `hf:org/name`, `org/name`, `datasets/org/name`).
+/// (also accepts the selectors `hf:org/name` and `hf-dataset:org/name`,
+/// `org/name`, `datasets/org/name`; a `@revision` is dropped: the repo
+/// goes).
 pub fn rm_target(t: &str) -> String {
-    let t = t.trim().trim_start_matches("hf:");
+    let t = t.trim();
+    let t = t.split_once('@').map_or(t, |(r, _)| r);
+    if let Some(rest) = t.strip_prefix("hf-dataset:") {
+        return format!("dataset/{rest}");
+    }
+    let t = t.trim_start_matches("hf:");
     for (plural, single) in [
         ("models/", "model/"),
         ("datasets/", "dataset/"),
@@ -766,6 +773,182 @@ pub fn rm_target(t: &str) -> String {
     }
 }
 
+/// What every hf run gets: the hub (through this node's mount) as its
+/// cache and HF_HOME, and the user's token where hf found it before HF_HOME
+/// moved into sparknest.
+fn hf_env(cmd: &mut tokio::process::Command, mount_hub: &Path) {
+    if let Some(home) = mount_hub.parent() {
+        cmd.env("HF_HOME", home);
+    }
+    cmd.env("HF_HUB_CACHE", mount_hub)
+        .env("HF_HUB_DISABLE_TELEMETRY", "1")
+        .env("HF_HUB_DISABLE_PROGRESS_BARS", "1");
+    if std::env::var_os("HF_TOKEN_PATH").is_none()
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        let t = PathBuf::from(home).join(".cache/huggingface/token");
+        if t.is_file() {
+            cmd.env("HF_TOKEN_PATH", t);
+        }
+    }
+}
+
+/// Run hf; its last JSON line, or the error it printed.
+async fn hf_json(mut cmd: tokio::process::Command, what: &str) -> NestResult<serde_json::Value> {
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| NestError::Io(format!("running hf: {e}")))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err
+            .lines()
+            .chain(stdout.lines())
+            .rfind(|l| !l.trim().is_empty())
+            .unwrap_or("failed");
+        return Err(NestError::Invalid(format!("{what}: {}", msg.trim())));
+    }
+    Ok(stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .unwrap_or(serde_json::Value::Null))
+}
+
+/// `model` or `dataset` for hf's --repo-type.
+fn repo_type(kind: &str) -> &'static str {
+    if kind.starts_with("dataset") {
+        "dataset"
+    } else {
+        "model"
+    }
+}
+
+/// Search the Hub (most downloaded first).
+pub async fn search(hf: &Path, kind: &str, q: &str, limit: u32) -> NestResult<serde_json::Value> {
+    let mut cmd = tokio::process::Command::new(hf);
+    cmd.arg(if repo_type(kind) == "dataset" {
+        "datasets"
+    } else {
+        "models"
+    })
+    .args([
+        "ls",
+        "--search",
+        q,
+        "--sort",
+        "downloads",
+        "--json",
+        "--limit",
+    ])
+    .arg(limit.to_string())
+    .env("HF_HUB_DISABLE_TELEMETRY", "1");
+    hf_json(cmd, "hf search").await
+}
+
+/// "548.1M" (hf's human sizes, decimal) in bytes.
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('K') => (&s[..s.len() - 1], 1e3),
+        Some('M') => (&s[..s.len() - 1], 1e6),
+        Some('G') => (&s[..s.len() - 1], 1e9),
+        Some('T') => (&s[..s.len() - 1], 1e12),
+        Some('P') => (&s[..s.len() - 1], 1e15),
+        _ => (s, 1.0),
+    };
+    (num.parse::<f64>().unwrap_or(0.0) * mult) as u64
+}
+
+/// Files and bytes a download of `repo` would fetch in all (hf's dry run).
+pub async fn download_size(
+    hf: &Path,
+    mount_hub: &Path,
+    repo: &str,
+    kind: &str,
+    revision: Option<&str>,
+) -> NestResult<(u64, u64)> {
+    let mut cmd = tokio::process::Command::new(hf);
+    cmd.args([
+        "download",
+        repo,
+        "--repo-type",
+        repo_type(kind),
+        "--dry-run",
+        "--json",
+    ])
+    .arg("--cache-dir")
+    .arg(mount_hub);
+    if let Some(r) = revision {
+        cmd.args(["--revision", r]);
+    }
+    hf_env(&mut cmd, mount_hub);
+    let v = hf_json(cmd, "hf download --dry-run").await?;
+    let files = v.as_array().cloned().unwrap_or_default();
+    let bytes = files
+        .iter()
+        .map(|f| parse_size(f["size"].as_str().unwrap_or("0")))
+        .sum();
+    Ok((files.len() as u64, bytes))
+}
+
+/// Run `hf download` into the hub through this node's mount (so the files
+/// are written here first); `stop` is polled to cancel.
+pub async fn download(
+    hf: &Path,
+    mount_hub: &Path,
+    repo: &str,
+    kind: &str,
+    revision: Option<&str>,
+    stop: impl Fn() -> bool,
+) -> NestResult<()> {
+    let mut cmd = tokio::process::Command::new(hf);
+    cmd.args(["download", repo, "--repo-type", repo_type(kind)])
+        .arg("--cache-dir")
+        .arg(mount_hub)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(r) = revision {
+        cmd.args(["--revision", r]);
+    }
+    hf_env(&mut cmd, mount_hub);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| NestError::Io(format!("running hf: {e}")))?;
+    let mut stderr = child.stderr.take();
+    let tail = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(e) = stderr.as_mut() {
+            use tokio::io::AsyncReadExt;
+            let _ = e.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let status = loop {
+        tokio::select! {
+            s = child.wait() => break s.map_err(|e| NestError::Io(e.to_string()))?,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                if stop() {
+                    let _ = child.kill().await;
+                    return Err(NestError::Io("cancelled; what finished stays".into()));
+                }
+            }
+        }
+    };
+    let err = tail.await.unwrap_or_default();
+    if status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&err);
+    let msg = err
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .unwrap_or("failed");
+    Err(NestError::Invalid(format!("hf download: {}", msg.trim())))
+}
+
 /// Run `hf cache rm` on sparknest's hub (through this node's mount, so the
 /// files go on every host and archive), with HF_HOME pointing at it: hf
 /// knows which of the hub's shared blobs other repos still use. Returns
@@ -783,11 +966,8 @@ pub async fn remove(
         .arg("--cache-dir")
         .arg(mount_hub)
         .arg("--json")
-        .arg(if dry_run { "--dry-run" } else { "--yes" })
-        .env("HF_HUB_DISABLE_TELEMETRY", "1");
-    if let Some(home) = mount_hub.parent() {
-        cmd.env("HF_HOME", home);
-    }
+        .arg(if dry_run { "--dry-run" } else { "--yes" });
+    hf_env(&mut cmd, mount_hub);
     let out = cmd
         .output()
         .await
@@ -837,6 +1017,14 @@ mod rm_tests {
     }
 
     #[test]
+    fn hf_sizes_parse() {
+        assert_eq!(super::parse_size("548.1M"), 548_100_000);
+        assert_eq!(super::parse_size("445.0"), 445);
+        assert_eq!(super::parse_size("8.1K"), 8_100);
+        assert_eq!(super::parse_size("1.5T"), 1_500_000_000_000);
+    }
+
+    #[test]
     fn targets_are_what_hf_expects() {
         use super::rm_target;
         assert_eq!(rm_target("hf:Qwen/Qwen3-8B"), "model/Qwen/Qwen3-8B");
@@ -844,5 +1032,7 @@ mod rm_tests {
         assert_eq!(rm_target("gpt2"), "model/gpt2");
         assert_eq!(rm_target("datasets/cais/mmlu"), "dataset/cais/mmlu");
         assert_eq!(rm_target("dataset/cais/mmlu"), "dataset/cais/mmlu");
+        assert_eq!(rm_target("hf-dataset:cais/mmlu"), "dataset/cais/mmlu");
+        assert_eq!(rm_target("hf:org/m@main"), "model/org/m");
     }
 }

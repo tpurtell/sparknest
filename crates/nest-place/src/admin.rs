@@ -171,6 +171,15 @@ pub(crate) enum AdminReq {
     CancelOwnJob {
         job: u64,
     },
+    /// Download a Hugging Face repo to this node (`Placer::hf_download`),
+    /// through its mount's `hub`.
+    HfDownload {
+        repo: String,
+        kind: String,
+        revision: Option<String>,
+        hub: String,
+        hf: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,6 +211,7 @@ pub(crate) enum AdminResp {
     Usage(Vec<nest_data::usage::FileUsage>),
     Dropped(Result<String, String>),
     Jobs(Vec<crate::placer::ClusterJob>),
+    JobStarted(u64),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -241,7 +251,7 @@ pub async fn drop_caches_here() -> Result<String, String> {
 pub struct Admin {
     pub(crate) vfs: Arc<Vfs>,
     pub(crate) name: String,
-    mountpoint: Option<String>,
+    pub(crate) mountpoint: Option<String>,
     jobs: Mutex<HashMap<u64, Arc<Mutex<JobProgress>>>>,
     /// The node's placer, for the requests about its own jobs.
     pub(crate) placer: std::sync::OnceLock<std::sync::Weak<crate::placer::Placer>>,
@@ -518,6 +528,31 @@ impl Handler for AdminService {
                     Some(p) => AdminResp::Jobs(p.jobs()),
                     None => AdminResp::Jobs(Vec::new()),
                 },
+                AdminReq::HfDownload {
+                    repo,
+                    kind,
+                    revision,
+                    hub,
+                    hf,
+                } => {
+                    let placer = a.placer.get().and_then(|p| p.upgrade());
+                    let mount_hub = a
+                        .mountpoint
+                        .as_ref()
+                        .map(|m| std::path::Path::new(m).join(hub.trim_start_matches('/')));
+                    let hf = hf
+                        .map(std::path::PathBuf::from)
+                        .filter(|p| p.is_file())
+                        .or_else(crate::hfimport::find_hf);
+                    match (placer, mount_hub, hf) {
+                        (Some(p), Some(m), Some(hf)) => {
+                            AdminResp::JobStarted(p.hf_download(hf, hub, m, repo, kind, revision))
+                        }
+                        (_, None, _) => AdminResp::Err("this host has no mount".into()),
+                        (_, _, None) => AdminResp::Err("hf is not installed on this host".into()),
+                        _ => AdminResp::Err("no placer on this node".into()),
+                    }
+                }
                 AdminReq::CancelOwnJob { job } => match a.placer.get().and_then(|p| p.upgrade()) {
                     Some(p) => match p.cancel_own_job(job).await {
                         Ok(()) => AdminResp::Started,

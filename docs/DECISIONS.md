@@ -968,3 +968,21 @@ The UI's model detail and `nest hf rm REPO... [--dry-run]` preview with hf's
 dry run, then delete as a job. The daemon looks for `hf` on PATH, then in
 Homebrew's and `~/.local/bin` (its system unit has a minimal PATH). Deleting
 paths from the Files page stays as it is.
+
+## ADR-038 — Downloads from the Hub, by hf, on the chosen host (2026-09-27)
+
+**Context.** Models were only brought in by importing caches. Adding one
+meant running hf by hand on some host with the right environment, and a
+repo no host held completely (an unfinished download, files spread over
+hosts) had no one-step fix.
+
+**Decision.** `nest hf download REPO [--host H]` and the Models page's
+Download dialog (search through `hf models ls` / `hf datasets ls`, or a
+pasted id; size from `hf download --dry-run`; host defaulting to the most
+free space) start a job on the chosen host that first copies there what
+the cluster already has of the repo, then runs `hf download` into the hub
+through that host's mount, so new files are written there. A repo no host
+holds completely gets a Finish button that does the same on the host
+holding most of it. hf runs with the hub as its cache and HF_HOME, and the
+user's `~/.cache/huggingface/token` as HF_TOKEN_PATH when present.
+Progress is what the host holds of the repo against hf's size.
