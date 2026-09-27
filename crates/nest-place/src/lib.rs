@@ -18,6 +18,7 @@ pub mod logs;
 pub mod placer;
 pub mod plan;
 pub mod selector;
+pub mod space;
 pub mod spec;
 
 pub use placer::Placer;

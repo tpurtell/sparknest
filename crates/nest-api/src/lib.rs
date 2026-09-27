@@ -15,7 +15,7 @@ use nest_meta::{SealPolicy, query};
 use nest_place::import::{ImportOptions, SealMode};
 use nest_place::selector::{self, Manifest};
 use nest_place::{Placer, RuleSpec, Selector};
-use nest_types::{FileKind, GenState, NestError};
+use nest_types::{FileKind, GenState, NestError, StoreId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -147,7 +147,9 @@ pub fn router(api: Api) -> Router {
         .route("/v1/backups/{id}", axum::routing::delete(backup_delete))
         .route("/v1/backups/meta", post(meta_snapshot))
         .route("/v1/hf", get(hf_repos))
+        .route("/v1/hf/detail", get(hf_detail))
         .route("/v1/logs", get(logs))
+        .route("/v1/space/tree", get(space_tree))
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/remove", post(cluster_remove))
@@ -642,8 +644,195 @@ async fn offload(State(api): State<Api>, Json(r): Json<OffloadReq>) -> R<serde_j
 }
 
 /// Every Hugging Face repo in the hub with where it is complete.
+/// Usage summed over `files`, per host name: opens, last open, bytes read
+/// locally and over the network (other hosts or archives).
+fn usage_by_host(
+    usage: &HashMap<nest_types::NodeId, HashMap<nest_types::FileId, nest_data::usage::FileUsage>>,
+    names: &HashMap<nest_types::NodeId, String>,
+    files: &std::collections::HashSet<nest_types::FileId>,
+) -> HashMap<String, serde_json::Value> {
+    let mut out = HashMap::new();
+    for (node, per) in usage {
+        let (mut opens, mut last, mut local, mut net) = (0u64, 0u64, 0u64, 0u64);
+        for f in files {
+            if let Some(u) = per.get(f) {
+                opens += u.opens;
+                last = last.max(u.last_open_ms);
+                local += u.local_bytes;
+                net += u.remote_bytes + u.archive_bytes;
+            }
+        }
+        if let Some(n) = names.get(node) {
+            out.insert(
+                n.clone(),
+                json!({ "opens": opens, "last_open_ms": last, "local_bytes": local, "net_bytes": net }),
+            );
+        }
+    }
+    out
+}
+
+const MONTH_MS: u64 = 30 * 86_400_000;
+
+#[derive(Deserialize)]
+struct DetailQ {
+    selector: String,
+}
+
+/// Everything about one Hugging Face repo: its files as the snapshots name
+/// them and where each lives, revisions and the refs pointing at them, the
+/// rules that place it, and per-host usage over the last 30 days.
+async fn hf_detail(State(api): State<Api>, Query(q): Query<DetailQ>) -> R<serde_json::Value> {
+    let sel = Selector::parse(&q.selector, &api.hub).map_err(bad)?;
+    let Selector::Hf {
+        repo, repo_type, ..
+    } = &sel
+    else {
+        return Err(bad("expected hf:org/name or hf-dataset:org/name"));
+    };
+    let dir = format!(
+        "{}/{}--{}",
+        api.hub.trim_end_matches('/'),
+        if repo_type == "dataset" {
+            "datasets"
+        } else {
+            "models"
+        },
+        repo.replace('/', "--")
+    );
+    let (_m, ready) = api.placer.readiness(&sel, &[]).await?;
+    // Files and where they live, from the space tree's models shape.
+    let nodes = api.placer.nodes()?;
+    let mut store_names: HashMap<StoreId, String> = nodes
+        .iter()
+        .map(|h| (h.node.live_store(), h.name.clone()))
+        .collect();
+    store_names.extend(
+        api.placer
+            .archive_stores()?
+            .into_iter()
+            .map(|(id, n, _)| (id, n)),
+    );
+    let req = nest_place::space::TreeReq {
+        store: None,
+        weight: nest_place::space::Weight::Logical,
+        models: true,
+        root: "/".into(),
+        depth: 1,
+        max_children: 100_000,
+        hub: api.hub.clone(),
+        store_names,
+    };
+    let c = api.conn()?;
+    let want = sel.describe();
+    let tree = tokio::task::spawn_blocking(move || nest_place::space::tree(&c, &req))
+        .await
+        .map_err(|e| bad(e.to_string()))??;
+    let node = tree
+        .children
+        .into_iter()
+        .find(|n| n.selector.as_deref() == Some(want.as_str()))
+        .unwrap_or_default();
+    // Revisions and refs.
+    let mut revisions: Vec<serde_json::Value> = Vec::new();
+    let mut refs: Vec<(String, nest_types::FileId)> = Vec::new();
+    {
+        let c = api.conn()?;
+        if let Ok((sid, _)) = selector::resolve_path(&c, &format!("{dir}/snapshots")) {
+            for (_, e) in query::readdir(&c, sid, 0, 1000).map_err(|e| bad(e.to_string()))? {
+                let name = String::from_utf8_lossy(&e.name).into_owned();
+                if name != "." && name != ".." {
+                    revisions.push(json!({ "commit": name, "refs": [] }));
+                }
+            }
+        }
+        if let Ok((rid, _)) = selector::resolve_path(&c, &format!("{dir}/refs")) {
+            for (_, e) in query::readdir(&c, rid, 0, 1000).map_err(|e| bad(e.to_string()))? {
+                let name = String::from_utf8_lossy(&e.name).into_owned();
+                if name != "." && name != ".." {
+                    refs.push((name, e.id));
+                }
+            }
+        }
+    }
+    for (name, id) in refs {
+        let Ok((fh, _)) = api.vfs.open(id, 0).await else {
+            continue;
+        };
+        let body = api.vfs.read(fh, 0, 256).await.unwrap_or_default();
+        api.vfs.release(fh, None).await;
+        let commit = String::from_utf8_lossy(&body).trim().to_string();
+        if let Some(r) = revisions
+            .iter_mut()
+            .find(|r| r["commit"] == commit.as_str())
+        {
+            r["refs"].as_array_mut().expect("array").push(json!(name));
+        }
+    }
+    let rules: Vec<_> = api
+        .placer
+        .rules()?
+        .into_iter()
+        .filter(|(_, spec, _)| matches!(&spec.selector, Selector::Hf { repo: r, repo_type: t, .. } if r == repo && t == repo_type))
+        .map(|(name, spec, _)| json!({ "name": name, "hosts": spec.hosts, "auto": spec.auto }))
+        .collect();
+    // Usage per host, for the repo and per file.
+    let names: HashMap<_, _> = nodes.iter().map(|h| (h.node, h.name.clone())).collect();
+    let usage = api
+        .placer
+        .usage(nest_data::usage::now_ms().saturating_sub(MONTH_MS))
+        .await
+        .unwrap_or_default();
+    fn leaves(n: &nest_place::space::TreeNode, out: &mut Vec<nest_types::FileId>) {
+        out.extend(n.file);
+        for c in &n.children {
+            leaves(c, out);
+        }
+    }
+    let mut ids = Vec::new();
+    leaves(&node, &mut ids);
+    let all: std::collections::HashSet<_> = ids.iter().copied().collect();
+    let per_file: HashMap<String, HashMap<String, serde_json::Value>> = ids
+        .iter()
+        .map(|f| {
+            (
+                f.0.to_string(),
+                usage_by_host(&usage, &names, &[*f].into_iter().collect())
+                    .into_iter()
+                    .filter(|(_, v)| {
+                        v["opens"].as_u64() != Some(0) || v["net_bytes"].as_u64() != Some(0)
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(Json(json!({
+        "repo": repo,
+        "kind": repo_type,
+        "selector": want,
+        "path": dir,
+        "hosts": ready,
+        "tree": node,
+        "revisions": revisions,
+        "rules": rules,
+        "usage": usage_by_host(&usage, &names, &all),
+        "file_usage": per_file,
+    })))
+}
+
 async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
     let hub = api.hub.clone();
+    let names: HashMap<_, _> = api
+        .placer
+        .nodes()?
+        .into_iter()
+        .map(|h| (h.node, h.name))
+        .collect();
+    let usage = api
+        .placer
+        .usage(nest_data::usage::now_ms().saturating_sub(MONTH_MS))
+        .await
+        .unwrap_or_default();
     let c = api.conn()?;
     let (hub_id, _) = match selector::resolve_path(&c, &hub) {
         Ok(x) => x,
@@ -687,16 +876,27 @@ async fn hf_repos(State(api): State<Api>) -> R<serde_json::Value> {
                 .unwrap_or(0)
         };
         match api.placer.readiness(&sel, &[]).await {
-            Ok((m, ready)) => out.push(json!({
-                "repo": repo,
-                "kind": kind,
-                "selector": sel.describe(),
-                "files": m.entries.len(),
-                "bytes": m.bytes(),
-                "writing": m.entries.iter().filter(|e| !e.stable).count(),
-                "revisions": revisions,
-                "hosts": ready,
-            })),
+            Ok((m, ready)) => {
+                let files = m.entries.iter().map(|e| e.file).collect();
+                let used = usage_by_host(&usage, &names, &files);
+                let last = used
+                    .values()
+                    .filter_map(|u| u["last_open_ms"].as_u64())
+                    .max()
+                    .unwrap_or(0);
+                out.push(json!({
+                    "repo": repo,
+                    "kind": kind,
+                    "selector": sel.describe(),
+                    "files": m.entries.len(),
+                    "bytes": m.bytes(),
+                    "writing": m.entries.iter().filter(|e| !e.stable).count(),
+                    "revisions": revisions,
+                    "hosts": ready,
+                    "usage": used,
+                    "last_open_ms": last,
+                }))
+            }
             Err(e) => out.push(json!({ "repo": repo, "kind": kind, "error": e.to_string() })),
         }
     }
@@ -787,6 +987,78 @@ enum PlanReq {
         #[serde(default)]
         archives: Vec<String>,
     },
+}
+
+#[derive(Deserialize)]
+struct TreeQ {
+    /// A host or archive store name; the whole cluster when absent.
+    scope: Option<String>,
+    /// `logical` (default) or `copies` (size times copies).
+    weight: Option<String>,
+    /// `models` (default) or `path`.
+    shape: Option<String>,
+    root: Option<String>,
+    depth: Option<u32>,
+    max: Option<usize>,
+}
+
+/// A size-weighted tree of what sparknest holds, for treemaps, plus the
+/// free space of the stores in scope.
+async fn space_tree(State(api): State<Api>, Query(q): Query<TreeQ>) -> R<serde_json::Value> {
+    let nodes = api.placer.nodes()?;
+    let archives = api.placer.archive_stores()?;
+    let mut names: HashMap<StoreId, String> = nodes
+        .iter()
+        .map(|h| (h.node.live_store(), h.name.clone()))
+        .collect();
+    names.extend(archives.iter().map(|(id, n, _)| (*id, n.clone())));
+    let scope = q.scope.filter(|s| !s.is_empty() && s != "all");
+    let store = match &scope {
+        None => None,
+        Some(s) => Some(
+            names
+                .iter()
+                .find(|(_, n)| *n == s)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| bad(format!("no host or archive store named {s}")))?,
+        ),
+    };
+    let req = nest_place::space::TreeReq {
+        store,
+        weight: if q.weight.as_deref() == Some("copies") {
+            nest_place::space::Weight::Copies
+        } else {
+            nest_place::space::Weight::Logical
+        },
+        models: q.shape.as_deref() != Some("path"),
+        root: q.root.unwrap_or_else(|| "/".into()),
+        depth: q.depth.unwrap_or(6).min(32),
+        max_children: q.max.unwrap_or(150).clamp(2, 2000),
+        hub: api.hub.clone(),
+        store_names: names,
+    };
+    let c = api.conn()?;
+    let tree = tokio::task::spawn_blocking(move || nest_place::space::tree(&c, &req))
+        .await
+        .map_err(|e| bad(e.to_string()))??;
+    // Free space of what is in scope: hosts from their status, archives
+    // through a healthy gateway.
+    let mut free = Vec::new();
+    for s in api.placer.status().await? {
+        if scope.as_ref().is_none_or(|x| *x == s.name)
+            && let Some(i) = &s.info
+        {
+            free.push(json!({ "name": s.name, "kind": "host", "free": i.free_bytes, "total": i.total_bytes, "held": i.object_bytes }));
+        }
+    }
+    for st in api.placer.stores().await? {
+        if scope.as_ref().is_none_or(|x| *x == st.name)
+            && let Some((_, h)) = st.gateways.iter().find(|(_, h)| h.healthy)
+        {
+            free.push(json!({ "name": st.name, "kind": "archive", "free": h.free_bytes, "total": h.total_bytes, "held": h.object_bytes }));
+        }
+    }
+    Ok(Json(json!({ "tree": tree, "stores": free })))
 }
 
 #[derive(Deserialize)]

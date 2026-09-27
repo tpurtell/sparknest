@@ -26,6 +26,12 @@ pub struct NodeInfo {
     pub leader: Option<NodeId>,
     pub applied: u64,
     pub version: String,
+    /// Cumulative bytes this host read from others / served to others over
+    /// the fabric (rates come from differences between polls).
+    #[serde(default)]
+    pub fabric_read_bytes: u64,
+    #[serde(default)]
+    pub fabric_served_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,15 +186,35 @@ impl Admin {
             .statfs()
             .map(|(c, n)| (Some(c), n))
             .unwrap_or((None, 0));
-        let objs = d.store().scan().unwrap_or_default();
+        // From the metadata, not a directory scan: the UI polls this.
+        let (objects, object_bytes) = d
+            .meta()
+            .open_reader()
+            .ok()
+            .and_then(|c| nest_meta::query::store_usage(&c, d.id().live_store()).ok())
+            .unwrap_or((0, 0));
+        let fab = self.vfs.fabric();
+        let (fabric_read_bytes, fabric_served_bytes) = fab
+            .as_ref()
+            .map(|f| {
+                (
+                    f.stats
+                        .read_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    f.stats
+                        .served_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
         NodeInfo {
             node: d.id(),
             name: self.name.clone(),
             mountpoint: self.mountpoint.clone(),
             total_bytes: cap.map(|c| c.total).unwrap_or(0),
             free_bytes: cap.map(|c| c.free).unwrap_or(0),
-            objects: objs.len() as u64,
-            object_bytes: objs.iter().map(|o| o.size).sum(),
+            objects,
+            object_bytes,
             rails: self
                 .vfs
                 .fabric()
@@ -203,6 +229,8 @@ impl Admin {
             leader: d.meta().leader(),
             applied: d.meta().applied_index(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            fabric_read_bytes,
+            fabric_served_bytes,
         }
     }
 

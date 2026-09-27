@@ -188,3 +188,102 @@ async fn usage_is_counted_per_host_and_drives_speedup_and_tidy() {
     assert_eq!(holders(&c, hot), [1, 3]);
     assert_eq!(holders(&c, cold).len(), 1);
 }
+
+/// The space tree credits shared blobs to the repo whose snapshot names
+/// them, and weighs by copies when asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn space_tree_groups_by_model_and_weighs_copies() {
+    use nest_place::space::{TreeReq, Weight, tree};
+    let c = ready(2).await;
+    let v = c.node(1).vfs.clone();
+    let mk = |parent: FileId, name: &'static str| {
+        let v = v.clone();
+        async move { v.mkdir(parent, name.as_bytes(), 0o755).await.unwrap().id }
+    };
+    let file = |parent: FileId, name: &'static str, size: usize| {
+        let v = v.clone();
+        async move {
+            let (a, fh, _) = v
+                .create(parent, name.as_bytes(), 0o644, oflags::WRONLY)
+                .await
+                .unwrap();
+            v.write(fh, 0, vec![1u8; size]).await.unwrap();
+            v.release(fh, None).await;
+            a.id
+        }
+    };
+    // /hub/blobs/ab/abc (shared, 3 MiB), /hub/models--org--m/{blobs/cfg,
+    // snapshots/r1/{model.bin -> shared, config.json -> ../../blobs/cfg}},
+    // /data/x (1 MiB).
+    let hub = mk(FileId::ROOT, "hub").await;
+    let blobs = mk(hub, "blobs").await;
+    let ab = mk(blobs, "ab").await;
+    let shared = file(ab, "abc", 3 << 20).await;
+    let repo = mk(hub, "models--org--m").await;
+    let rb = mk(repo, "blobs").await;
+    let cfg = file(rb, "cfg", 1000).await;
+    let snaps = mk(repo, "snapshots").await;
+    let r1 = mk(snaps, "r1").await;
+    v.symlink(r1, b"model.bin", b"../../../blobs/ab/abc")
+        .await
+        .unwrap();
+    v.symlink(r1, b"config.json", b"../../blobs/cfg")
+        .await
+        .unwrap();
+    let data = mk(FileId::ROOT, "data").await;
+    let x = file(data, "x", 1 << 20).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        [shared, cfg, x].iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|a| a.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    let p = c.node(1).placer.clone();
+    let j = p
+        .replicate(
+            Selector::parse("/hub", "/hub").unwrap(),
+            vec!["n2".into()],
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(wait_job(&c, j).await.error.is_none());
+    c.converge().await;
+
+    let req = |weight, models, store| TreeReq {
+        store,
+        weight,
+        models,
+        root: "/".into(),
+        depth: 8,
+        max_children: 50,
+        hub: "/hub".into(),
+        store_names: [
+            (StoreId(1), "n1".to_string()),
+            (StoreId(2), "n2".to_string()),
+        ]
+        .into(),
+    };
+    let conn = c.node(1).meta.open_reader().unwrap();
+    let t = tree(&conn, &req(Weight::Logical, true, None)).unwrap();
+    let repo = t.children.iter().find(|n| n.kind == "repo").expect("repo");
+    assert_eq!(repo.name, "org/m");
+    assert_eq!(repo.selector.as_deref(), Some("hf:org/m"));
+    assert_eq!(repo.bytes, (3 << 20) + 1000);
+    let names: Vec<&str> = repo.children.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(names, ["model.bin", "config.json"]);
+    assert_eq!(repo.children[0].hosts, ["n1", "n2"]);
+    let other = t.children.iter().find(|n| n.name == "other files").unwrap();
+    assert_eq!(other.bytes, 1 << 20, "only /data/x is left for other");
+    assert_eq!(t.bytes, (4 << 20) + 1000);
+
+    // Copies: the hub is on both hosts, /data/x only on n1.
+    let t = tree(&conn, &req(Weight::Copies, true, None)).unwrap();
+    assert_eq!(t.bytes, 2 * ((3 << 20) + 1000) + (1 << 20));
+    // One host's view: n2 holds only the hub.
+    let t = tree(&conn, &req(Weight::Logical, false, Some(StoreId(2)))).unwrap();
+    assert_eq!(t.bytes, (3 << 20) + 1000);
+    assert_eq!(t.children.len(), 1);
+    assert_eq!(t.children[0].name, "hub");
+}
