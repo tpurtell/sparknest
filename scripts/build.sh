@@ -13,10 +13,26 @@ fi
 [ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH"
 command -v cargo >/dev/null || { echo "cargo not found (see docs/TOOLING.md)" >&2; exit 1; }
 
+# The web UI (crates/nest-api/ui, Svelte) builds to one self-contained
+# crates/nest-api/web/index.html that the daemon embeds. It is committed, so
+# building without node works; with node, it is rebuilt when sources change.
+ui=crates/nest-api/ui
+web_ui() {
+  command -v npm >/dev/null || return 0
+  [ -d "$ui/node_modules" ] || npm --prefix "$ui" ci --no-audit --no-fund
+  if [ -n "$(find "$ui/src" "$ui/index.html" "$ui/package.json" "$ui/vite.config.ts" -newer crates/nest-api/web/index.html -print -quit 2>/dev/null)" ]; then
+    npm --prefix "$ui" run build
+  fi
+}
+
 mode=release
 case "${1:-}" in
   --debug) mode=debug ;;
   --check)
+    if command -v npm >/dev/null; then
+      web_ui
+      npm --prefix "$ui" run check
+    fi
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
@@ -25,6 +41,7 @@ case "${1:-}" in
   *) echo "usage: $0 [--debug|--check]" >&2; exit 2 ;;
 esac
 
+web_ui
 arch=$(uname -m)
 flags=()
 [ "$mode" = release ] && flags+=(--release)
