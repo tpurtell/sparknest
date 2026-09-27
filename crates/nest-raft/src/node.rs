@@ -100,7 +100,15 @@ impl Handler for MetaService {
             let stale_leader = {
                 let m = raft.metrics();
                 let m = m.borrow_watched();
+                // A sole voter is its own quorum (and its ack time is not
+                // refreshed while idle).
+                let others = m
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .any(|v| v != m.id);
                 m.state == openraft::ServerState::Leader
+                    && others
                     && m.last_quorum_acked
                         .is_none_or(|t| t.into_inner().elapsed() > Duration::from_millis(lease_ms))
             };
