@@ -18,6 +18,7 @@ async fn fabric_cluster(n: u64) -> Option<TestCluster> {
         server_slots: 16,
         window: 16,
         devices: vec![],
+        max_inflight: 16,
     });
     let c = TestCluster::start_with(n, t).await;
     c.eventually("serving", Duration::from_secs(8), |c| {

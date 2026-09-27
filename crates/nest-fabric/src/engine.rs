@@ -40,6 +40,11 @@ pub struct FabricConfig {
     pub server_slots: u32,
     /// Outstanding requests per lane (per direction).
     pub window: u32,
+    /// Remote reads this host has outstanding at once, over all peers: the
+    /// incast cap. Many hosts answering one reader at the same moment
+    /// overflow switch buffers, and every dropped packet then costs a
+    /// retransmit timeout (the fabric is lossy without PFC).
+    pub max_inflight: u32,
     /// Optional device/netdev/address filter.
     pub devices: Vec<String>,
 }
@@ -51,6 +56,7 @@ impl Default for FabricConfig {
             client_slots: 128,
             server_slots: 64,
             window: 32,
+            max_inflight: 16,
             devices: Vec::new(),
         }
     }
@@ -234,6 +240,8 @@ pub struct Fabric {
     source: Mutex<Option<Weak<dyn ReadSource>>>,
     rt: tokio::runtime::Handle,
     stop: Arc<AtomicBool>,
+    /// The incast cap (`max_inflight` permits).
+    inflight: Arc<Semaphore>,
     pub stats: Stats,
 }
 
@@ -244,6 +252,14 @@ pub struct Stats {
     pub served: AtomicU64,
     pub served_bytes: AtomicU64,
     pub errors: AtomicU64,
+    /// Cumulative nanoseconds, for where a remote read's time goes: waiting
+    /// for a landing slot, for lane window room, and request to answer.
+    pub read_slot_wait_ns: AtomicU64,
+    pub read_window_wait_ns: AtomicU64,
+    pub read_rtt_ns: AtomicU64,
+    /// Serving: waiting for a staging slot, and reading the bytes.
+    pub serve_slot_wait_ns: AtomicU64,
+    pub serve_read_ns: AtomicU64,
 }
 
 impl Fabric {
@@ -279,6 +295,7 @@ impl Fabric {
             }));
         }
         let _ = me;
+        let max_inflight = cfg.max_inflight.max(1) as usize;
         let fabric = Arc::new(Fabric {
             cfg,
             rails,
@@ -293,6 +310,7 @@ impl Fabric {
             source: Mutex::new(None),
             rt: tokio::runtime::Handle::current(),
             stop: Arc::new(AtomicBool::new(false)),
+            inflight: Arc::new(Semaphore::new(max_inflight)),
             stats: Stats::default(),
         });
         for d in &fabric.devices {
@@ -551,12 +569,27 @@ impl Fabric {
         let lane = link.lanes
             [link.next.fetch_add(1, Ordering::Relaxed) as usize % link.lanes.len()]
         .clone();
+        let t0 = std::time::Instant::now();
+        // The incast cap: held until the answer (or failure) arrives.
+        let _cap = self
+            .inflight
+            .acquire()
+            .await
+            .map_err(|_| NestError::Unavailable("fabric stopped".into()))?;
         let slot = lane.dev.landing.acquire().await;
+        let t1 = std::time::Instant::now();
         let _permit = lane
             .window
             .acquire()
             .await
             .map_err(|_| NestError::Unavailable("lane closed".into()))?;
+        let t2 = std::time::Instant::now();
+        self.stats
+            .read_slot_wait_ns
+            .fetch_add(t1.duration_since(t0).as_nanos() as u64, Ordering::Relaxed);
+        self.stats
+            .read_window_wait_ns
+            .fetch_add(t2.duration_since(t1).as_nanos() as u64, Ordering::Relaxed);
         if lane.dead.load(Ordering::SeqCst) {
             return Err(NestError::Unavailable("RDMA link failed".into()));
         }
@@ -589,7 +622,11 @@ impl Fabric {
             self.fail_lane(&lane);
             return Err(NestError::Unavailable(e.to_string()));
         }
-        let r = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        let r = tokio::time::timeout(Duration::from_secs(30), rx).await;
+        self.stats
+            .read_rtt_ns
+            .fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let r = match r {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(NestError::Unavailable("RDMA link failed".into())),
             Err(_) => {
@@ -695,7 +732,9 @@ impl Fabric {
             let result = match source {
                 None => Err(NestError::Unavailable("not serving yet".into())),
                 Some(src) => {
+                    let t0 = std::time::Instant::now();
                     let slot = lane.dev.staging.acquire().await;
+                    let t1 = std::time::Instant::now();
                     let (slot, r) = src
                         .read_into(
                             FileId(req.file),
@@ -705,6 +744,12 @@ impl Fabric {
                             slot,
                         )
                         .await;
+                    me.stats
+                        .serve_slot_wait_ns
+                        .fetch_add(t1.duration_since(t0).as_nanos() as u64, Ordering::Relaxed);
+                    me.stats
+                        .serve_read_ns
+                        .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     r.map(|n| (slot, n))
                 }
             };

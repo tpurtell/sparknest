@@ -99,6 +99,10 @@ pub struct FabricSection {
     /// Optional verbs device / netdev / address filter (e.g. `["mlx5_0"]`).
     #[serde(default)]
     pub devices: Vec<String>,
+    /// Remote chunk reads outstanding at once from this host (the incast
+    /// cap; 4 MiB each). 0: the built-in default.
+    #[serde(default)]
+    pub max_inflight: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

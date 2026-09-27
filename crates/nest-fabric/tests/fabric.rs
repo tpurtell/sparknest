@@ -71,6 +71,7 @@ async fn read_protocol_over_loopback() {
         server_slots: 8,
         window: 8,
         devices: vec![],
+        max_inflight: 16,
     };
     let Some((rpc1, f1)) = node(1, cfg.clone()).await else {
         return;

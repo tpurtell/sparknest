@@ -41,6 +41,11 @@ pub struct NodeInfo {
     pub disk_read_bps: u64,
     #[serde(default)]
     pub link_bps: u64,
+    /// Fabric timing totals (ns) and counts, for diagnosis: reads issued
+    /// here (slot wait, window wait, round trip) and served here (slot
+    /// wait, read).
+    #[serde(default)]
+    pub fabric_timing: [u64; 7],
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +157,7 @@ pub enum MembershipChange {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum AdminResp {
-    Info(NodeInfo),
+    Info(Box<NodeInfo>),
     Health(StoreHealth),
     Started,
     Job(JobProgress),
@@ -280,6 +285,24 @@ impl Admin {
             fabric_served_bytes,
             io: self.vfs.io_report(),
             disk_read_bps: self.vfs.disk_read_bps(),
+            fabric_timing: fab
+                .as_ref()
+                .map(|f| {
+                    let s = &f.stats;
+                    let g = |a: &std::sync::atomic::AtomicU64| {
+                        a.load(std::sync::atomic::Ordering::Relaxed)
+                    };
+                    [
+                        g(&s.reads),
+                        g(&s.read_slot_wait_ns),
+                        g(&s.read_window_wait_ns),
+                        g(&s.read_rtt_ns),
+                        g(&s.served),
+                        g(&s.serve_slot_wait_ns),
+                        g(&s.serve_read_ns),
+                    ]
+                })
+                .unwrap_or_default(),
             link_bps: self.vfs.link_bps(),
         }
     }
@@ -385,7 +408,7 @@ impl Handler for AdminService {
             let a = a.upgrade().ok_or("shutting down")?;
             let req: AdminReq = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
             let resp = match req {
-                AdminReq::Info => AdminResp::Info(a.info()),
+                AdminReq::Info => AdminResp::Info(Box::new(a.info())),
                 AdminReq::StartReplicate {
                     job,
                     files,

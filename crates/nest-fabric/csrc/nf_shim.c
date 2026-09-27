@@ -268,7 +268,9 @@ int nf_qp_connect(struct nf_qp *q, uint8_t port, int sgid_index, uint32_t local_
 		return -1;
 	memset(&a, 0, sizeof a);
 	a.qp_state = IBV_QPS_RTS;
-	a.timeout = 14;
+	/* 4.096 us x 2^12 = 17 ms before resending a lost packet (14, the
+	 * usual default, is 67 ms: every drop under incast cost that much). */
+	a.timeout = 12;
 	a.retry_cnt = 7;
 	a.rnr_retry = 7;
 	a.sq_psn = local_psn;

@@ -636,7 +636,7 @@ impl Placer {
             (
                 h.clone(),
                 r.and_then(|r| match r {
-                    AdminResp::Info(i) => Ok(i),
+                    AdminResp::Info(i) => Ok(*i),
                     _ => Err(NestError::Io("unexpected".into())),
                 }),
             )
