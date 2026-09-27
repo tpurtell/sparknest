@@ -153,7 +153,7 @@ impl BackupArea {
         let objects = Arc::new(
             ObjectStore::open_with_staging(&root, &format!("staging-{node}"))
                 .map_err(io)?
-                .paced(ARCHIVE_PACE),
+                .window(4),
         );
         Ok(BackupArea { root, objects })
     }
@@ -578,6 +578,3 @@ impl MaxIo for NestError {
         }
     }
 }
-
-/// Transfers into archive stores flush this often (see `ObjectStore::paced`).
-const ARCHIVE_PACE: u64 = 64 << 20;

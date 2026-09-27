@@ -2600,74 +2600,57 @@ impl Vfs {
         let fab = self.fabric();
         let chunk: u64 = fab.as_ref().map(|f| f.chunk() as u64).unwrap_or(4 << 20);
         let window = 16usize;
-        // One writer thread per transfer, fed the chunks as they arrive:
-        // a blocking thread per chunk (16 per transfer, waiting on a paced
-        // disk) once exhausted the runtime's blocking pool and starved the
-        // metadata apply.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(window);
-        let writer =
-            tokio::task::spawn_blocking(move || -> std::io::Result<nest_store::Staging> {
-                while let Some((off, bytes)) = rx.blocking_recv() {
-                    staging.write_all_at(&bytes, off)?;
-                }
-                Ok(staging)
-            });
+        // Chunks are fetched 16 at a time and written as they arrive by
+        // direct I/O through io_uring (nest_store::uring): no thread waits
+        // on the disk, and the store's window of writes in flight paces the
+        // transfer at the device's speed.
+        let staging = Arc::new(staging);
         let mut next = 0u64;
         let mut inflight = futures::stream::FuturesUnordered::new();
         use futures::StreamExt;
         let fetch = |off: u64| {
-            let (fab, st) = (fab.clone(), tx.clone());
+            let (fab, st) = (fab.clone(), staging.clone());
             let (file, generation, size) = (a.id, a.generation, a.size);
             async move {
                 let len = (size - off).min(chunk) as usize;
-                let bytes: Vec<u8> = match &fab {
+                let buf = match &fab {
                     Some(f) => match f.read(src, file, generation, off, len).await {
-                        Ok(b) => b.as_slice().to_vec(),
+                        Ok(b) => nest_store::uring::AlignedBuf::copy_of(b.as_slice()),
                         Err(NestError::Stale) => return Err(NestError::Stale),
-                        Err(_) => {
-                            self.tcp_read(src, file, generation, off, len as u32)
-                                .await?
-                        }
+                        Err(_) => nest_store::uring::AlignedBuf::copy_of(
+                            &self
+                                .tcp_read(src, file, generation, off, len as u32)
+                                .await?,
+                        ),
                     },
-                    None => {
-                        self.tcp_read(src, file, generation, off, len as u32)
-                            .await?
-                    }
+                    None => nest_store::uring::AlignedBuf::copy_of(
+                        &self
+                            .tcp_read(src, file, generation, off, len as u32)
+                            .await?,
+                    ),
                 };
-                if bytes.len() != len {
+                if buf.len() != len {
                     return Err(NestError::Io(format!(
                         "short read at {off}: {} of {len} bytes",
-                        bytes.len()
+                        buf.len()
                     )));
                 }
-                st.send((off, bytes))
-                    .await
-                    .map_err(|_| NestError::Io("the writer stopped".into()))
+                st.write(buf, off).await.map_err(io)
             }
         };
-        let mut failed = None;
         while next < a.size || !inflight.is_empty() {
-            while failed.is_none() && inflight.len() < window && next < a.size {
+            while inflight.len() < window && next < a.size {
                 inflight.push(fetch(next));
                 next += chunk;
             }
-            match inflight.next().await {
-                Some(Err(e)) if failed.is_none() => failed = Some(e),
-                Some(_) => {}
-                None => break,
+            if let Some(r) = inflight.next().await {
+                r?;
             }
         }
         drop(inflight);
-        drop(tx);
-        // The writer's own error (a full disk, ...) explains a failed send.
-        let written = writer.await.map_err(|e| NestError::Io(e.to_string()))?;
-        if let Some(e) = failed {
-            return Err(match written {
-                Err(w) => io(w),
-                Ok(_) => e,
-            });
-        }
-        let st = written.map_err(io)?;
+        staging.flushed().await.map_err(io)?;
+        let st = Arc::try_unwrap(staging)
+            .map_err(|_| NestError::Io("transfer still referenced".into()))?;
         let store = dest.clone();
         let size = a.size;
         tokio::task::spawn_blocking(move || {
@@ -2681,7 +2664,11 @@ impl Vfs {
     }
 
     /// Copy the local object into `dest` (e.g. live store to an archive this
-    /// node is a gateway for) with `copy_file_range`, then commit.
+    /// node is a gateway for): read in 4 MiB chunks, written directly
+    /// through io_uring with the store's window in flight, the source's
+    /// pages dropped as it goes. Not `copy_file_range`: between two
+    /// filesystems (NVMe to the scratch disk) it quietly became a buffered
+    /// copy and flooded the page cache.
     async fn copy_local(
         &self,
         a: &FileAttr,
@@ -2694,65 +2681,38 @@ impl Vfs {
         let dest = dest.clone();
         let size = a.size;
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            const CHUNK: usize = 4 << 20;
             let from = src.open_read(key)?;
             let st = dest.begin_staging(key)?;
-            use std::os::fd::AsRawFd;
-            let (mut off_in, mut off_out): (libc::loff_t, libc::loff_t) = (0, 0);
-            while (off_in as u64) < size {
-                let want = ((size - off_in as u64) as usize).min(1 << 30);
-                // SAFETY: both fds are open for the duration; offsets are
-                // valid pointers to locals.
-                let n = unsafe {
-                    libc::copy_file_range(
-                        from.as_raw_fd(),
-                        &mut off_in,
-                        st.file().as_raw_fd(),
-                        &mut off_out,
-                        want,
-                        0,
-                    )
-                };
-                if n < 0 {
-                    let e = std::io::Error::last_os_error();
-                    // Different filesystem types (ext4 to CIFS, ...) or no
-                    // support: finish with an ordinary buffered copy.
-                    if matches!(
-                        e.raw_os_error(),
-                        Some(libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
-                    ) {
-                        use std::os::unix::fs::FileExt;
-                        let mut buf = vec![0u8; 4 << 20];
-                        let mut since_drop = 0usize;
-                        while (off_in as u64) < size {
-                            let want = ((size - off_in as u64) as usize).min(buf.len());
-                            let got = from.read_at(&mut buf[..want], off_in as u64)?;
-                            if got == 0 {
-                                return Err(std::io::Error::other(format!(
-                                    "short copy: {off_in} of {size} bytes"
-                                )));
-                            }
-                            // Paced for archive stores (no dirty-page flood).
-                            st.write_all_at(&buf[..got], off_out as u64)?;
-                            off_in += got as libc::loff_t;
-                            off_out += got as libc::loff_t;
-                            // Read once: keep the host's page cache for others.
-                            since_drop += got;
-                            if since_drop >= 256 << 20 {
-                                nest_store::drop_cached(&from);
-                                since_drop = 0;
-                            }
-                        }
-                        nest_store::drop_cached(&from);
-                        break;
+            let mut off = 0u64;
+            let mut since_drop = 0usize;
+            while off < size {
+                let want = ((size - off) as usize).min(CHUNK);
+                let mut buf = nest_store::uring::AlignedBuf::new(want);
+                let mut got = 0;
+                while got < want {
+                    let n = from.read_at(&mut buf.as_mut_slice()[got..], off + got as u64)?;
+                    if n == 0 {
+                        return Err(std::io::Error::other(format!(
+                            "short copy: {} of {size} bytes",
+                            off + got as u64
+                        )));
                     }
-                    return Err(e);
+                    got += n;
                 }
-                if n == 0 {
-                    return Err(std::io::Error::other(format!(
-                        "short copy: {off_in} of {size} bytes"
-                    )));
+                st.write_blocking(buf, off)?;
+                off += want as u64;
+                // Read once: keep the host's page cache for others.
+                since_drop += want;
+                if since_drop >= 256 << 20 {
+                    nest_store::drop_cached(&from);
+                    since_drop = 0;
                 }
             }
+            nest_store::drop_cached(&from);
+            st.flushed_blocking()?;
+            st.file().set_len(size)?;
             dest.commit_staging(st).map(|_| ())
         })
         .await

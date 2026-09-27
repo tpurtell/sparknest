@@ -533,11 +533,14 @@ pub async fn run(
         } else {
             all_verified = false;
             out.status = "failed".into();
-            out.note = format!(
-                "{} file(s) did not verify, e.g. {}",
-                bad.len(),
-                bad.first().cloned().unwrap_or_default()
-            );
+            // A step before failed (its note says why): keep that note.
+            if !bad.is_empty() {
+                out.note = format!(
+                    "{} file(s) did not verify, e.g. {}",
+                    bad.len(),
+                    bad.first().cloned().unwrap_or_default()
+                );
+            }
         }
         outcomes.lock().push(out);
     }

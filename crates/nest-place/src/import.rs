@@ -363,15 +363,26 @@ fn place(
                 let mut from = std::fs::File::open(src)?;
                 store.reserve_room(from.metadata()?.len())?;
                 let st = store.begin_staging(key)?;
-                let mut buf = vec![0u8; 8 << 20];
+                // Whole 4 MiB chunks (aligned offsets), written directly
+                // through io_uring with the store's window in flight; the
+                // source is read once and its pages dropped.
+                const CHUNK: usize = 4 << 20;
                 let mut off = 0u64;
                 loop {
-                    let n = std::io::Read::read(&mut from, &mut buf)?;
+                    let mut buf = nest_store::uring::AlignedBuf::new(CHUNK);
+                    let mut n = 0;
+                    while n < CHUNK {
+                        let got = std::io::Read::read(&mut from, &mut buf.as_mut_slice()[n..])?;
+                        if got == 0 {
+                            break;
+                        }
+                        n += got;
+                    }
                     if n == 0 {
                         break;
                     }
-                    // Paced (the store's step), and the source read once.
-                    st.write_all_at(&buf[..n], off)?;
+                    buf.truncate(n);
+                    st.write_blocking(buf, off)?;
                     off += n as u64;
                     if off % (256 << 20) < n as u64 {
                         nest_store::drop_cached(&from);
@@ -381,7 +392,13 @@ fn place(
                     if p.cancelled {
                         return Err(std::io::Error::other("cancelled"));
                     }
+                    if n < CHUNK {
+                        break;
+                    }
                 }
+                nest_store::drop_cached(&from);
+                st.flushed_blocking()?;
+                st.file().set_len(off)?;
                 store.commit_staging(st)?;
                 Ok(())
             };

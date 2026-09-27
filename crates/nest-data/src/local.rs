@@ -250,14 +250,14 @@ impl DataNode {
         if !nest_store::marker_ok(std::path::Path::new(&config.path), &identity) {
             return None;
         }
-        // Archives sit behind slow links (an SMB share, a hard disk):
-        // transfers into them are paced (ObjectStore::paced).
+        // Archives sit behind slow links (an SMB share, a hard disk): a
+        // transfer keeps few direct writes in flight (ObjectStore::window).
         let store = ObjectStore::open_with_staging(
             std::path::Path::new(&config.path),
             &format!("staging-{}", self.id),
         )
         .ok()?
-        .paced(64 << 20);
+        .window(4);
         let a = Arc::new(Archive {
             id,
             name,

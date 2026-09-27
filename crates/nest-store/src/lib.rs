@@ -17,6 +17,8 @@
 //! node's reconciliation pass (see `nest-data`), which is why most
 //! operations need no separate intent journal.
 
+pub mod uring;
+
 use nest_types::{FileId, Generation};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -56,10 +58,12 @@ pub struct ObjectStore {
     reserve: std::sync::atomic::AtomicU64,
     /// Last statvfs sample: (when, free bytes minus writes since).
     room: std::sync::Mutex<(std::time::Instant, u64)>,
-    /// Transfers into this store flush every this many bytes (see
-    /// `Staging::write_all_at`); `None`: left to the kernel.
-    pace: Option<u64>,
+    /// Direct writes each transfer keeps in flight (see `Staging::write`).
+    window: usize,
 }
+
+/// Direct writes a transfer keeps in flight unless a store says otherwise.
+const DEFAULT_WINDOW: usize = 8;
 
 fn object_name(k: ObjectKey) -> String {
     format!("{:016x}.{:x}", k.file.0, k.generation.0)
@@ -99,7 +103,7 @@ impl ObjectStore {
             staging: root.join("staging"),
             reserve: std::sync::atomic::AtomicU64::new(0),
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
-            pace: None,
+            window: DEFAULT_WINDOW,
         })
     }
 
@@ -125,7 +129,7 @@ impl ObjectStore {
             staging,
             reserve: std::sync::atomic::AtomicU64::new(0),
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
-            pace: None,
+            window: DEFAULT_WINDOW,
         })
     }
 
@@ -201,13 +205,11 @@ impl ObjectStore {
         }
     }
 
-    /// Flush transfers into this store every `bytes` and drop their pages
-    /// from the cache: for stores behind slow links (an SMB share, a hard
-    /// disk), where the kernel would otherwise let hundreds of GB of dirty
-    /// pages pile up on a large-memory host, then flush them for minutes
-    /// while everything else waits (raptor did, offloading a 400 GB model).
-    pub fn paced(mut self, bytes: u64) -> Self {
-        self.pace = Some(bytes.max(1 << 20));
+    /// Direct writes each transfer into this store keeps in flight: a
+    /// small number for a disk or share behind a slow link (a transfer
+    /// never runs further ahead of the device than this), more for NVMe.
+    pub fn window(mut self, writes: usize) -> Self {
+        self.window = writes.max(1);
         self
     }
 
@@ -222,23 +224,21 @@ impl ObjectStore {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
-        let flusher = match self.pace {
-            Some(pace) => Some(Flusher::start(file.try_clone()?, pace)),
-            None => None,
-        };
         Ok(Staging {
             key: k,
             path,
             file: Some(file),
-            flusher,
+            direct: std::sync::OnceLock::new(),
+            window: self.window,
+            pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
     /// Move a completely written staging file into place. The data is made
     /// durable first; after this returns the object survives a crash.
     pub fn commit_staging(&self, mut s: Staging) -> io::Result<ObjectKey> {
-        // Stop the background flusher first (commit syncs everything).
-        drop(s.flusher.take());
+        // Every direct write lands before the sync that makes it durable.
+        s.flushed_blocking()?;
         let f = s.file.take().expect("staging file present until commit");
         f.sync_all()?;
         drop(f);
@@ -349,103 +349,12 @@ pub struct Staging {
     key: ObjectKey,
     path: PathBuf,
     file: Option<File>,
-    /// Paced stores: flushes the file behind the writers.
-    flusher: Option<Flusher>,
-}
-
-/// Flushes a paced transfer in the background: when a window of `pace`
-/// bytes is written, writers hand it to this thread and go on; they wait
-/// only while two windows are unflushed. The device writes one window while
-/// the next fills (flushing inline left it idle between windows: ~88 MB/s
-/// on a 150 MB/s disk), and a transfer never holds more than ~2 × pace.
-struct Flusher {
-    shared: std::sync::Arc<(std::sync::Mutex<FlushState>, std::sync::Condvar)>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    pace: u64,
-}
-
-#[derive(Default)]
-struct FlushState {
-    /// Written since the last flush was requested.
-    dirty: u64,
-    requested: bool,
-    running: bool,
-    stop: bool,
-    error: Option<String>,
-}
-
-impl Flusher {
-    fn start(file: File, pace: u64) -> Flusher {
-        let shared = std::sync::Arc::new((
-            std::sync::Mutex::new(FlushState::default()),
-            std::sync::Condvar::new(),
-        ));
-        let s2 = shared.clone();
-        let thread = std::thread::Builder::new()
-            .name("nest-flush".into())
-            .spawn(move || {
-                let (m, cv) = &*s2;
-                loop {
-                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
-                    while !g.requested && !g.stop {
-                        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                    }
-                    if !g.requested {
-                        return;
-                    }
-                    g.requested = false;
-                    g.running = true;
-                    drop(g);
-                    let r = file.sync_data();
-                    drop_cached(&file);
-                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
-                    g.running = false;
-                    if let Err(e) = r {
-                        g.error.get_or_insert(e.to_string());
-                    }
-                    cv.notify_all();
-                }
-            })
-            .ok();
-        Flusher {
-            shared,
-            thread,
-            pace,
-        }
-    }
-
-    /// `n` more bytes were written: request a flush per window, and wait
-    /// while the flusher is a window behind.
-    fn wrote(&self, n: u64) -> io::Result<()> {
-        let (m, cv) = &*self.shared;
-        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
-        g.dirty += n;
-        while g.dirty >= 2 * self.pace && (g.running || g.requested) && g.error.is_none() {
-            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-        if let Some(e) = &g.error {
-            return Err(io::Error::other(e.clone()));
-        }
-        if g.dirty >= self.pace && !g.requested {
-            g.requested = true;
-            g.dirty = 0;
-            cv.notify_all();
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Flusher {
-    fn drop(&mut self) {
-        {
-            let (m, cv) = &*self.shared;
-            m.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
-            cv.notify_all();
-        }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
+    /// The same file opened for direct I/O (see `uring`), on first use;
+    /// `None` inside where the filesystem refuses O_DIRECT.
+    direct: std::sync::OnceLock<Option<std::sync::Arc<File>>>,
+    window: usize,
+    /// Direct writes in flight, oldest first.
+    pending: std::sync::Mutex<std::collections::VecDeque<uring::Done>>,
 }
 
 impl Staging {
@@ -458,15 +367,112 @@ impl Staging {
             .expect("staging file present until commit")
     }
 
-    /// Write at `off`. In a paced store the file is flushed behind the
-    /// writers, a window at a time (see `Flusher`), and its pages dropped
-    /// from the cache.
+    /// Write at `off` through the page cache (small or occasional writes;
+    /// bulk transfers use `write`).
     pub fn write_all_at(&self, buf: &[u8], off: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
-        self.file().write_all_at(buf, off)?;
-        match &self.flusher {
-            Some(f) => f.wrote(buf.len() as u64),
-            None => Ok(()),
+        self.file().write_all_at(buf, off)
+    }
+
+    fn direct_file(&self) -> Option<&std::sync::Arc<File>> {
+        self.direct
+            .get_or_init(|| {
+                OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&self.path)
+                    .ok()
+                    .map(std::sync::Arc::new)
+            })
+            .as_ref()
+    }
+
+    /// Queue a direct write of `buf` at `off` (a multiple of `uring::ALIGN`;
+    /// the last write of a file may be short: it is padded, and the file
+    /// trimmed at commit). Waits for this transfer's oldest write while
+    /// `window` are in flight. On a filesystem without direct I/O, or
+    /// without io_uring, writes here, through the page cache.
+    pub async fn write(&self, buf: uring::AlignedBuf, off: u64) -> io::Result<()> {
+        loop {
+            let oldest = {
+                let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if p.len() < self.window {
+                    break;
+                }
+                p.pop_front()
+            };
+            if let Some(d) = oldest {
+                d.await
+                    .map_err(|_| io::Error::other("write ring stopped"))??;
+            }
+        }
+        self.submit(buf, off)
+    }
+
+    /// `write` for a caller on a blocking thread.
+    pub fn write_blocking(&self, buf: uring::AlignedBuf, off: u64) -> io::Result<()> {
+        loop {
+            let oldest = {
+                let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if p.len() < self.window {
+                    break;
+                }
+                p.pop_front()
+            };
+            if let Some(d) = oldest {
+                d.blocking_recv()
+                    .map_err(|_| io::Error::other("write ring stopped"))??;
+            }
+        }
+        self.submit(buf, off)
+    }
+
+    fn submit(&self, buf: uring::AlignedBuf, off: u64) -> io::Result<()> {
+        match (self.direct_file(), uring::ring()) {
+            (Some(f), Some(r)) => {
+                let d = r.submit(f.clone(), off, buf);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(d);
+                Ok(())
+            }
+            (Some(f), None) => uring::write_now(f, off, &buf),
+            (None, _) => self.write_all_at(buf.as_slice(), off),
+        }
+    }
+
+    /// Wait for every write in flight.
+    pub async fn flushed(&self) -> io::Result<()> {
+        loop {
+            let d = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            match d {
+                Some(d) => d
+                    .await
+                    .map_err(|_| io::Error::other("write ring stopped"))??,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// `flushed` for a caller on a blocking thread.
+    pub fn flushed_blocking(&self) -> io::Result<()> {
+        loop {
+            let d = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            match d {
+                Some(d) => d
+                    .blocking_recv()
+                    .map_err(|_| io::Error::other("write ring stopped"))??,
+                None => return Ok(()),
+            }
         }
     }
 }
@@ -561,35 +567,42 @@ mod tests {
         ObjectKey::new(FileId(f), Generation(g))
     }
 
-    /// A paced transfer written out of order (several chunks in flight)
-    /// commits the same bytes, flushing as it goes.
+    /// Direct writes in flight out of order, from several threads, with a
+    /// short unaligned last chunk, commit the same bytes.
     #[test]
-    fn paced_staging_writes_commit_the_same_bytes() {
-        let dir = tempfile::tempdir().unwrap();
+    fn direct_writes_commit_the_same_bytes() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let s = ObjectStore::open_with_staging(dir.path(), "staging-1")
             .unwrap()
-            .paced(1 << 20);
+            .window(3);
         let data: Vec<u8> = (0..(5u32 << 20) + 123)
             .map(|i| (i * 31 % 251) as u8)
             .collect();
         let st = s.begin_staging(k(3, 2)).unwrap();
-        let chunk = 768 << 10;
+        let chunk = 1 << 20;
         let mut starts: Vec<usize> = (0..data.len()).step_by(chunk).collect();
         starts.reverse();
         std::thread::scope(|t| {
-            for part in starts.chunks(3) {
+            for part in starts.chunks(2) {
                 let (st, data) = (&st, &data);
                 t.spawn(move || {
                     for &o in part {
                         let end = (o + chunk).min(data.len());
-                        st.write_all_at(&data[o..end], o as u64).unwrap();
+                        st.write_blocking(uring::AlignedBuf::copy_of(&data[o..end]), o as u64)
+                            .unwrap();
                     }
                 });
             }
         });
+        st.flushed_blocking().unwrap();
+        // Really direct, through the ring (not a fallback).
+        assert!(st.direct_file().is_some(), "O_DIRECT refused here");
+        assert!(uring::ring().is_some(), "no io_uring");
+        st.file().set_len(data.len() as u64).unwrap();
         s.commit_staging(st).unwrap();
         let mut got = Vec::new();
         s.open_read(k(3, 2)).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got.len(), data.len());
         assert_eq!(got, data);
     }
 
@@ -677,32 +690,39 @@ mod pace_bench {
     /// `NEST_PACE_BENCH=DIR cargo test -p nest-store pace_bench -- --ignored --nocapture`
     #[test]
     #[ignore]
-    fn paced_write_rate() {
+    fn direct_write_rate() {
         let Some(dir) = std::env::var_os("NEST_PACE_BENCH") else {
             return;
         };
+        let window: usize = std::env::var("NEST_PACE_WINDOW")
+            .ok()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(8);
+        let gib: u64 = std::env::var("NEST_PACE_GIB")
+            .ok()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(4);
         let dir = std::path::Path::new(&dir).join(format!("pace-bench-{}", std::process::id()));
         let s = ObjectStore::open_with_staging(&dir, "staging-b")
             .unwrap()
-            .paced(64 << 20);
-        let buf = vec![0x5au8; 4 << 20];
-        let total: u64 = 4 << 30;
+            .window(window);
+        let total: u64 = gib << 30;
         let t = std::time::Instant::now();
         let st = s
             .begin_staging(ObjectKey::new(FileId(1), Generation(1)))
             .unwrap();
         let mut off = 0;
         while off < total {
-            st.write_all_at(&buf, off).unwrap();
-            off += buf.len() as u64;
+            st.write_blocking(uring::AlignedBuf::copy_of(&[0x5a; 4 << 20]), off)
+                .unwrap();
+            off += 4 << 20;
         }
         s.commit_staging(st).unwrap();
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
-            "paced write: {:.0} MB/s ({:.1} s for {} GiB)",
+            "direct write, window {window}: {:.0} MB/s ({:.1} s for {gib} GiB)",
             total as f64 / secs / 1e6,
-            secs,
-            total >> 30
+            secs
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

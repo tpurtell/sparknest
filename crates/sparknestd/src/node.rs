@@ -133,14 +133,12 @@ impl Node {
                 quarantine = true;
             }
         }
-        // Transfers into the live store are paced too, with a longer step
-        // than archives: a Spark receives faster over the fabric than its
-        // SSD writes, and unbounded dirty pages evict the page cache that
-        // loaders depend on (ADR-039).
+        // Transfers into the live store write directly with 16 in flight
+        // (NVMe keeps up; nothing floods the page cache loaders rely on).
         let store = Arc::new(
             ObjectStore::open(&cfg.node.state_dir)
                 .context("opening object store")?
-                .paced(256 << 20),
+                .window(16),
         );
         store.set_reserve(cfg.node.data_reserve_gib << 30);
         let (data, handler) = DataNode::new(id, store, tuning.lease);

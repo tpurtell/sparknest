@@ -36,6 +36,11 @@ pub struct MetaNodeConfig {
     /// How long a proposal keeps retrying through elections and partitions
     /// before reporting [`NestError::NoQuorum`].
     pub propose_deadline: Duration,
+    /// How long a committed proposal waits for this node to apply it (read
+    /// your writes). Longer than `propose_deadline`: the outcome is decided,
+    /// only this node's view lags (a busy host once fell a minute behind and
+    /// reported committed writes as failures).
+    pub apply_wait: Duration,
     /// Joining a running cluster with empty state: its incarnation, until
     /// the snapshot it sends brings it along (ADR-026).
     pub join_incarnation: Option<String>,
@@ -52,6 +57,7 @@ impl MetaNodeConfig {
             election_max_ms: 1000,
             snapshot_every: 50_000,
             propose_deadline: Duration::from_secs(15),
+            apply_wait: Duration::from_secs(120),
             join_incarnation: None,
         }
     }
@@ -495,11 +501,15 @@ impl MetaNode {
     /// Wait until the local state machine has applied `index`.
     pub async fn wait_applied(&self, index: u64) -> Result<(), NestError> {
         self.raft
-            .wait(Some(self.cfg.propose_deadline))
+            .wait(Some(self.cfg.apply_wait))
             .applied_index_at_least(Some(index), "sparknest read-your-writes")
             .await
             .map(|_| ())
-            .map_err(|_| NestError::Unavailable("committed but not yet applied locally".into()))
+            .map_err(|_| {
+                NestError::Unavailable(
+                    "committed, but this host is still applying the log (it is far behind)".into(),
+                )
+            })
     }
 
     /// Replicate `cmd` and return its outcome once it is also applied on

@@ -1042,3 +1042,32 @@ session over and over (not serving, reads flapping off the fabric).
 **Next.** Completion-driven transfer writes through io_uring (`RWF_DSYNC`,
 from the fabric's landing slots, a fixed number in flight per transfer and
 per device) replace the writer and flusher threads.
+
+## ADR-042 — Transfers are written with direct I/O through io_uring (2026-09-28)
+
+**Context.** ADRs 039–041 paced transfer writes through the page cache
+(flushes every window, a flusher thread, then a writer thread per
+transfer): threads still waited on the disk, pacing needed syncs, and a
+local copy to another filesystem used `copy_file_range`, which quietly
+became an unpaced buffered copy and flooded the page cache (the scratch
+disk offloads).
+
+**Decision.** Transfers into a store write 4 KiB-aligned buffers to the
+object's staging file opened with `O_DIRECT`, submitted to one io_uring
+per process (`nest-store/src/uring.rs`). A direct write completes when the
+device (or the SMB server) has the data, so each transfer keeps a fixed
+number of writes in flight (`ObjectStore::window`: 16 for the live store
+on NVMe, 4 for archives) and waits only for its oldest completion. No page
+cache, no per-window syncs, no threads parked. Short writes are continued;
+the last write is padded to the alignment and the file trimmed at commit,
+which still syncs once to make the object durable. Filesystems refusing
+`O_DIRECT` fall back to buffered writes; without io_uring, writes run on
+the caller's thread. The fabric copy, the local copy to archives (no longer
+`copy_file_range`) and import copies all use it. `unsafe` is allowed in
+`nest-store/src/uring.rs` (aligned buffers, ring submissions), as for the
+fabric's verbs layer and the FUSE io_uring transport.
+
+**Measured.** raptor NVMe, 8 GiB: 5.7–6.0 GB/s at windows 4–16 (the
+device's sustained rate), against 2.9 GB/s with inline flushing; the
+buffered flusher's 7.1 GB/s on a 4 GiB file was flattered by the page
+cache. The scratch disk is to be measured when idle.
