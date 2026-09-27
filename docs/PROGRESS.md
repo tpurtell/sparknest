@@ -3,6 +3,48 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+
+## 2026-09-27 — Usage, goal-based plans, space treemaps, hf import, a new UI
+
+- **Usage statistics (ADR-028).** Every host records per file and day:
+  opens, last open, bytes read locally / from other hosts / from archives,
+  in its own `usage.sqlite` (not replicated; 30 days). Handles count with
+  one atomic add; the VFS folds counters every 5 s.
+- **Plans have goals:** *free* (least recently used redundant copies
+  first), *tidy* (not opened within 1d/1w/1m, down to one copy), *speedup*
+  (copy files to hosts that pull them over the network). Every planned copy
+  says why. Plans offload only into archives the user picks.
+- **Space tree** (`/v1/space/tree`): by model (shared hf 2.0 blobs credited
+  to their repo through the snapshot → repo-link → store chain) or by path;
+  by size or by cost with copies; per host, per archive or the cluster.
+  `/v1/hf/detail` for one repo: files by snapshot name, where each lives,
+  revisions and refs, rules, per-host usage.
+- **Jobs**: cancellable (no new files start; nothing is evicted after a
+  cancelled offload or plan), timed, logged at start; imports mirror their
+  progress into the job; failures name the path. A copy no longer fails on
+  the first source that answers Stale when the file has not changed.
+- **Logs** kept in memory on every node (20,000 lines), merged in the UI
+  and `nest logs`.
+- **Imports**: relative destinations are inside sparknest; `--copy` copies
+  across filesystems straight into the store. **`nest hf import`** brings a
+  Hugging Face cache (classic or hf 2.0 shared-blob layout) into the hub:
+  blobs placed where huggingface_hub looks, `hf download` finishes each
+  snapshot (only what the source never finished is fetched), offline the
+  snapshot links are mirrored; refs copied, every file verified; `--move`
+  swaps in a symlink to the hub. Live check on the trial: `models--gpt2`
+  imported and finalized by hf in 1.1 s; `HF_HUB_OFFLINE=1 hf download`
+  resolves it from sparknest.
+- **Web UI rewritten** (Svelte 5 + Vite, one embedded file, no CDN): WebGL
+  plasma backdrop and a host constellation whose lightning arcs follow real
+  fabric traffic; WebGL treemaps with zoom and right-click / long-press
+  actions; Models with % of bytes per host, live copy progress, one-click
+  copy and a details drawer; Plans by goal with draggable free-space
+  handles; upload (files, folders, drag and drop), download (folders as a
+  streamed tar) and delete; phones get a top bar with a menu button.
+- Tests: 87 (usage + speedup + tidy, space tree incl. hf 2.0 link chains,
+  cancelled offload keeps live copies, hf import of both layouts with move,
+  copy across filesystems via /dev/shm).
+
 ## 2026-09-27 — M8: relaxed durability, automatic recovery, faster metadata
 
 - openraft 0.10 (alpha.35): leader replicates submitted entries, appends

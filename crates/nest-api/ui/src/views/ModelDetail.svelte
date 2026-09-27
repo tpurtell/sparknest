@@ -1,7 +1,7 @@
 <script lang="ts">
   import { get, type Readiness, type TreeNode, type HostUsage } from "../lib/api";
   import { app, runningJobs, startJob, go } from "../lib/state.svelte";
-  import { human, ago, selLabel } from "../lib/format";
+  import { human, ago, selLabel, splitRepo } from "../lib/format";
   import { copyTo, offload, keepOn, removeFrom, nodeMenu } from "../lib/actions";
   import Treemap from "../components/Treemap.svelte";
   import Icon from "../components/Icon.svelte";
@@ -58,7 +58,7 @@
   <div class="stack">
     <div>
       <div class="caps">{d.kind}</div>
-      <h2 class="title"><span class="muted">{d.repo.split("/")[0]}/</span>{d.repo.split("/").slice(1).join("/")}</h2>
+      <h2 class="title"><span class="muted">{splitRepo(d.repo)[0]}</span>{splitRepo(d.repo)[1]}</h2>
       <div class="row small muted mono">
         <span>{human(d.tree.bytes)}</span><span>·</span><span>{d.tree.files} files</span><span>·</span><span class="path">{d.path}</span>
       </div>

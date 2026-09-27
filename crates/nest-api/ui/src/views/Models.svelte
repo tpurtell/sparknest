@@ -1,7 +1,7 @@
 <script lang="ts">
   import { get, type Repo, type Readiness } from "../lib/api";
   import { app, route, go, targets, runningJobs, startJob } from "../lib/state.svelte";
-  import { human, ago, selLabel } from "../lib/format";
+  import { human, ago, selLabel, splitRepo } from "../lib/format";
   import { copyTo, offload, removeFrom } from "../lib/actions";
   import JobStrip from "../components/JobStrip.svelte";
   import Drawer from "../components/Drawer.svelte";
@@ -111,7 +111,7 @@
       <div class="repo panel">
         <button class="name" onclick={() => go("models", r.selector)}>
           <div class="title">
-            <span class="org">{r.repo.split("/")[0]}/</span><b>{r.repo.split("/").slice(1).join("/")}</b>
+            <span class="org">{splitRepo(r.repo)[0]}</span><b>{splitRepo(r.repo)[1]}</b>
             {#if r.kind === "dataset"}<span class="badge">dataset</span>{/if}
             {#if r.writing}<span class="badge warn">{r.writing} writing</span>{/if}
           </div>

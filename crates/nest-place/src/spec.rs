@@ -32,8 +32,9 @@ impl Selector {
                     Some((r, v)) => (r.to_string(), Some(v.to_string())),
                     None => (rest.to_string(), None),
                 };
-                if !repo.contains('/') {
-                    return Err(format!("expected org/name in {s:?}"));
+                // Legacy repos have no org ("gpt2", "bert-base-uncased").
+                if repo.is_empty() || repo.starts_with('/') || repo.ends_with('/') {
+                    return Err(format!("expected a repo name (org/name or name) in {s:?}"));
                 }
                 return Ok(Selector::Hf {
                     hub: hub.to_string(),
@@ -97,6 +98,7 @@ mod tests {
     fn describe_round_trips_through_parse() {
         for s in [
             "hf:org/model",
+            "hf:gpt2",
             "hf:org/model@main",
             "hf-dataset:org/data",
             "hf-dataset:org/data@abc",

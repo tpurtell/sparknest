@@ -45,3 +45,9 @@ export function parseSize(s: string): number {
 
 /** Short label for a selector: "hf:org/name" → "org/name". */
 export const selLabel = (s: string) => s.replace(/^hf(-dataset)?:/, "");
+
+/** "org/name" → ["org/", "name"]; legacy repos have no org. */
+export function splitRepo(repo: string): [string, string] {
+  const i = repo.indexOf("/");
+  return i < 0 ? ["", repo] : [repo.slice(0, i + 1), repo.slice(i + 1)];
+}
