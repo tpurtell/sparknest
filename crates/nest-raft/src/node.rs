@@ -11,8 +11,10 @@ use futures::future::BoxFuture;
 use nest_meta::{Command, Reply};
 use nest_rpc::{Handler, Rpc, service};
 use nest_types::{NestError, NodeId};
+use openraft::Instant as _;
+use openraft::async_runtime::WatchReceiver;
 use openraft::error::{ClientWriteError, RaftError};
-use openraft::{BasicNode, ChangeMembers, SnapshotPolicy};
+use openraft::{BasicNode, ChangeMembers, ReadPolicy, SnapshotPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -97,15 +99,16 @@ impl Handler for MetaService {
             let req: MetaReq = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
             let stale_leader = {
                 let m = raft.metrics();
-                let m = m.borrow();
+                let m = m.borrow_watched();
                 m.state == openraft::ServerState::Leader
-                    && m.millis_since_quorum_ack.is_none_or(|ms| ms > lease_ms)
+                    && m.last_quorum_acked
+                        .is_none_or(|t| t.into_inner().elapsed() > Duration::from_millis(lease_ms))
             };
             let resp = match req {
                 MetaReq::Propose(_) if stale_leader => MetaResp::NoQuorum,
                 MetaReq::Propose(r) => match raft.client_write(r).await {
                     Ok(w) => MetaResp::Written {
-                        index: w.log_id.index,
+                        index: w.log_id.index(),
                         resp: w.data,
                     },
                     Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
@@ -113,10 +116,10 @@ impl Handler for MetaService {
                     }
                     Err(e) => MetaResp::Failed(e.to_string()),
                 },
-                MetaReq::ReadIndex => match raft.get_read_log_id().await {
-                    Ok((read, _)) => MetaResp::ReadIndex(read.map(|l| l.index).unwrap_or(0)),
+                MetaReq::ReadIndex => match raft.get_read_log_id(ReadPolicy::ReadIndex).await {
+                    Ok((read, _)) => MetaResp::ReadIndex(read.index()),
                     Err(RaftError::APIError(
-                        openraft::error::CheckIsLeaderError::ForwardToLeader(f),
+                        openraft::error::LinearizableReadError::ForwardToLeader(f),
                     )) => MetaResp::NotLeader(f.leader_id),
                     Err(e) => MetaResp::Failed(e.to_string()),
                 },
@@ -150,9 +153,14 @@ impl MetaNode {
             election_timeout_max: cfg.election_max_ms,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(cfg.snapshot_every),
             max_in_snapshot_log_to_keep: 1000,
+            // A host that lost its log tail (wiped, or rolled back by a
+            // power loss under relaxed durability, ADR-026) rejoins and is
+            // repaired instead of stopping the leader.
+            allow_log_reversion: Some(true),
             ..Default::default()
         }
         .validate()?;
+        let snap_dir = sm.snap_dir().to_path_buf();
         let raft = Raft::new(
             cfg.node.0,
             Arc::new(config),
@@ -161,7 +169,7 @@ impl MetaNode {
             sm,
         )
         .await?;
-        network::register(&rpc, raft.clone());
+        network::register(&rpc, raft.clone(), snap_dir);
         rpc.register(
             service::META,
             Arc::new(MetaService {
@@ -214,7 +222,7 @@ impl MetaNode {
         let idx = last
             .and_then(|b| postcard::from_bytes::<Option<crate::LogId>>(&b).ok())
             .flatten()
-            .map(|l| l.index)
+            .map(|l| l.index())
             .unwrap_or(0);
         Ok(idx)
     }
@@ -224,16 +232,25 @@ impl MetaNode {
         nest_meta::open_read(&self.meta_path)
     }
 
+    /// A snapshot of this node's Raft metrics.
+    pub fn metrics(&self) -> Metrics {
+        self.raft.metrics().borrow_watched().clone()
+    }
+
     pub fn leader(&self) -> Option<NodeId> {
-        self.raft.metrics().borrow().current_leader.map(NodeId)
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .current_leader
+            .map(NodeId)
     }
 
     pub fn applied_index(&self) -> u64 {
         self.raft
             .metrics()
-            .borrow()
+            .borrow_watched()
             .last_applied
-            .map(|l| l.index)
+            .map(|l| l.index())
             .unwrap_or(0)
     }
 
@@ -269,7 +286,12 @@ impl MetaNode {
         if self.rpc.peer_addr(target).is_some() {
             return;
         }
-        let m = self.raft.metrics().borrow().membership_config.clone();
+        let m = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .clone();
         if let Some(n) = m
             .nodes()
             .find(|(id, _)| **id == target.0)
@@ -411,5 +433,5 @@ fn _assert_send(n: &MetaNode) -> impl Send + '_ {
 }
 
 pub type Membership = openraft::Membership<u64, BasicNode>;
-pub type Metrics = openraft::RaftMetrics<u64, BasicNode>;
+pub type Metrics = openraft::RaftMetrics<TypeConfig>;
 pub type TC = TypeConfig;

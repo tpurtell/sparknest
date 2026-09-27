@@ -1,16 +1,25 @@
 //! Raft state machine over `meta.sqlite`.
 
-use crate::{LogId, Request, Response, StorageError, TypeConfig};
+use crate::{Entry, LogId, RAFT_FORMAT, Request, Response, TypeConfig};
+use futures::{Stream, TryStreamExt};
 use nest_meta::{Effect, Reply};
-use openraft::storage::{RaftStateMachine, Snapshot};
-use openraft::{
-    BasicNode, Entry, EntryPayload, RaftSnapshotBuilder, SnapshotMeta, StorageIOError,
-    StoredMembership,
-};
+use openraft::alias::{SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
+use openraft::storage::{EntryResponder, RaftStateMachine};
+use openraft::{EntryPayload, OptionalSend, RaftSnapshotBuilder};
 use parking_lot::Mutex;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// A snapshot is a complete `meta.sqlite` copy on disk. The network moves
+/// the file itself in chunks (`network::full_snapshot`).
+#[derive(Clone, Debug)]
+pub struct SnapshotFile(pub PathBuf);
+
+type Meta = SnapshotMetaOf<TypeConfig>;
+type Snapshot = SnapshotOf<TypeConfig, SnapshotFile>;
+type Membership = StoredMembershipOf<TypeConfig>;
 
 /// What local services learn from the state machine.
 #[derive(Clone, Debug)]
@@ -51,17 +60,13 @@ fn enc<T: serde::Serialize>(v: &T) -> Vec<u8> {
     postcard::to_stdvec(v).expect("state machine types always encode")
 }
 
-fn sm_err(e: impl std::error::Error + 'static) -> StorageError {
-    StorageIOError::write_state_machine(openraft::AnyError::new(&e)).into()
-}
-
-fn snap_err(e: impl std::error::Error + 'static) -> StorageError {
-    StorageIOError::write_snapshot(None, openraft::AnyError::new(&e)).into()
+fn sm_err(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+    io::Error::other(e)
 }
 
 #[derive(Clone)]
 struct CurrentSnapshot {
-    meta: SnapshotMeta<u64, BasicNode>,
+    meta: Meta,
     path: PathBuf,
 }
 
@@ -71,10 +76,10 @@ pub struct StateMachine {
     snap_dir: PathBuf,
     handler: Arc<dyn EffectHandler>,
     current: Arc<Mutex<Option<CurrentSnapshot>>>,
-    receiving: Option<PathBuf>,
+    _ckpt: crate::checkpoint::Checkpointer,
 }
 
-type Applied = (Option<LogId>, StoredMembership<u64, BasicNode>);
+type Applied = (Option<LogId>, Membership);
 
 fn read_applied(c: &Connection) -> rusqlite::Result<Applied> {
     let get = |k: &str| -> rusqlite::Result<Option<Vec<u8>>> {
@@ -82,13 +87,33 @@ fn read_applied(c: &Connection) -> rusqlite::Result<Applied> {
             .query_row(params![k], |r| r.get(0))
             .optional()
     };
-    let last = get("last_applied")?
-        .and_then(|b| postcard::from_bytes(&b).ok())
-        .flatten();
-    let mem = get("membership")?
-        .and_then(|b| postcard::from_bytes(&b).ok())
-        .unwrap_or_default();
+    fn dec<T: serde::de::DeserializeOwned>(b: Vec<u8>) -> rusqlite::Result<T> {
+        postcard::from_bytes(&b).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
+        })
+    }
+    let last: Option<LogId> = get("last_applied")?.map(dec).transpose()?.flatten();
+    let mem: Membership = get("membership")?.map(dec).transpose()?.unwrap_or_default();
     Ok((last, mem))
+}
+
+/// The Raft format of the openraft values in `sm_state`, if recorded.
+/// A database with applied state but no record was written by format 1.
+pub fn sm_format(c: &Connection) -> rusqlite::Result<Option<u32>> {
+    let v: Option<Vec<u8>> = c
+        .query_row("SELECT v FROM sm_state WHERE k = 'raft_format'", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if let Some(b) = v {
+        return Ok(postcard::from_bytes(&b).ok());
+    }
+    let applied: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sm_state WHERE k = 'last_applied')",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if applied { Some(1) } else { None })
 }
 
 impl StateMachine {
@@ -102,7 +127,26 @@ impl StateMachine {
             )
         })?;
         let c = nest_meta::open_write(&meta_path)?;
+        c.pragma_update(None, "wal_autocheckpoint", 0)?;
         c.execute_batch(SM_SCHEMA)?;
+        match sm_format(&c)? {
+            None => {
+                c.execute(
+                    "INSERT OR REPLACE INTO sm_state (k, v) VALUES ('raft_format', ?1)",
+                    params![enc(&RAFT_FORMAT)],
+                )?;
+            }
+            Some(v) if v == RAFT_FORMAT => {}
+            Some(v) => {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                    Some(format!(
+                        "{} holds Raft format {v} state but this build uses {RAFT_FORMAT}",
+                        meta_path.display()
+                    )),
+                ));
+            }
+        }
         // Pick up the newest local snapshot so it can be served to lagging peers.
         let mut current = None;
         if let Ok(rd) = std::fs::read_dir(&snap_dir) {
@@ -115,7 +159,7 @@ impl StateMachine {
                 .collect();
             snaps.sort();
             for p in &snaps {
-                if let Ok(Some(meta)) = snapshot_meta_of(p) {
+                if let Ok(Some((meta, _))) = snapshot_meta_of(p) {
                     current = Some(CurrentSnapshot {
                         meta,
                         path: p.clone(),
@@ -126,18 +170,24 @@ impl StateMachine {
                 let _ = std::fs::remove_file(p);
             }
         }
+        let ckpt = crate::checkpoint::start(&meta_path, crate::checkpoint::INTERVAL);
         Ok(StateMachine {
             db: Arc::new(Mutex::new(c)),
             meta_path,
             snap_dir,
             handler,
             current: Arc::new(Mutex::new(current)),
-            receiving: None,
+            _ckpt: ckpt,
         })
     }
 
     pub fn meta_path(&self) -> &Path {
         &self.meta_path
+    }
+
+    /// Where incoming snapshots are written before installation.
+    pub fn snap_dir(&self) -> &Path {
+        &self.snap_dir
     }
 }
 
@@ -155,8 +205,8 @@ fn rd_leftovers(dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Read the snapshot meta embedded in a snapshot database file.
-fn snapshot_meta_of(path: &Path) -> rusqlite::Result<Option<SnapshotMeta<u64, BasicNode>>> {
+/// Read the snapshot meta and id embedded in a snapshot database file.
+fn snapshot_meta_of(path: &Path) -> rusqlite::Result<Option<(Meta, String)>> {
     let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: Option<String> = c
         .query_row("SELECT v FROM sm_state WHERE k = 'snapshot_id'", [], |r| {
@@ -168,16 +218,18 @@ fn snapshot_meta_of(path: &Path) -> rusqlite::Result<Option<SnapshotMeta<u64, Ba
         return Ok(None);
     };
     let (last_log_id, last_membership) = read_applied(&c)?;
-    Ok(Some(SnapshotMeta {
-        last_log_id,
-        last_membership,
+    Ok(Some((
+        Meta {
+            last_log_id,
+            last_membership,
+        },
         snapshot_id,
-    }))
+    )))
 }
 
 fn apply_entries(
     c: &mut Connection,
-    entries: Vec<Entry<TypeConfig>>,
+    entries: Vec<Entry>,
 ) -> rusqlite::Result<(Vec<Response>, Vec<Effect>, u64)> {
     let tx = c.transaction()?;
     let mut responses = Vec::with_capacity(entries.len());
@@ -189,7 +241,7 @@ fn apply_entries(
         match e.payload {
             EntryPayload::Blank => responses.push(Response(Ok(Reply::Done))),
             EntryPayload::Membership(m) => {
-                let sm = StoredMembership::new(Some(e.log_id), m);
+                let sm = Membership::new(Some(e.log_id), m);
                 tx.prepare_cached(
                     "INSERT OR REPLACE INTO sm_state (k, v) VALUES ('membership', ?1)",
                 )?
@@ -230,37 +282,47 @@ fn apply_entries(
     tx.prepare_cached("INSERT OR REPLACE INTO sm_state (k, v) VALUES ('last_applied', ?1)")?
         .execute(params![enc(&last)])?;
     tx.commit()?;
-    Ok((responses, effects, last.map(|l| l.index).unwrap_or(0)))
+    Ok((responses, effects, last.map(|l| l.index()).unwrap_or(0)))
 }
 
 impl RaftStateMachine<TypeConfig> for StateMachine {
+    type SnapshotData = SnapshotFile;
     type SnapshotBuilder = SnapshotBuilder;
 
-    async fn applied_state(&mut self) -> Result<Applied, StorageError> {
+    async fn applied_state(&mut self) -> io::Result<Applied> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || read_applied(&db.lock()))
             .await
-            .expect("state machine task panicked")
+            .map_err(io::Error::other)?
             .map_err(sm_err)
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Response>, StorageError>
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> io::Result<()>
     where
-        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
-        I::IntoIter: Send,
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
     {
-        let entries: Vec<_> = entries.into_iter().collect();
-        if entries.is_empty() {
-            return Ok(Vec::new());
+        let mut batch = Vec::new();
+        let mut responders = Vec::new();
+        while let Some((entry, responder)) = entries.try_next().await? {
+            batch.push(entry);
+            responders.push(responder);
+        }
+        if batch.is_empty() {
+            return Ok(());
         }
         let db = self.db.clone();
         let (responses, effects, index) =
-            tokio::task::spawn_blocking(move || apply_entries(&mut db.lock(), entries))
+            tokio::task::spawn_blocking(move || apply_entries(&mut db.lock(), batch))
                 .await
-                .expect("state machine task panicked")
+                .map_err(io::Error::other)?
                 .map_err(sm_err)?;
         self.handler.on_event(&SmEvent::Applied { index, effects });
-        Ok(responses)
+        for (responder, resp) in responders.into_iter().zip(responses) {
+            if let Some(r) = responder {
+                r.send(resp);
+            }
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -271,55 +333,33 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<tokio::fs::File>, StorageError> {
-        let path = self
-            .snap_dir
-            .join(format!("incoming-{:016x}.sqlite", rand::random::<u64>()));
-        let f = tokio::fs::File::create(&path).await.map_err(snap_err)?;
-        self.receiving = Some(path);
-        Ok(Box::new(f))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<u64, BasicNode>,
-        snapshot: Box<tokio::fs::File>,
-    ) -> Result<(), StorageError> {
-        use tokio::io::AsyncWriteExt;
-        let mut f = *snapshot;
-        f.flush().await.map_err(snap_err)?;
-        f.sync_all().await.map_err(snap_err)?;
-        drop(f);
-        let incoming = self.receiving.take().ok_or_else(|| {
-            snap_err(std::io::Error::other(
-                "install_snapshot without begin_receiving_snapshot",
-            ))
-        })?;
-        let final_path = self
-            .snap_dir
-            .join(format!("snapshot-{}.sqlite", meta.snapshot_id));
+    async fn install_snapshot(&mut self, meta: &Meta, snapshot: SnapshotFile) -> io::Result<()> {
+        let incoming = snapshot.0;
         let db = self.db.clone();
-        let meta2 = meta.clone();
-        let fp = final_path.clone();
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
-            let embedded = snapshot_meta_of(&incoming)?;
-            if embedded.as_ref().map(|m| &m.snapshot_id) != Some(&meta2.snapshot_id) {
+        let snap_dir = self.snap_dir.clone();
+        let want = meta.last_log_id;
+        let final_path = tokio::task::spawn_blocking(move || -> rusqlite::Result<PathBuf> {
+            let Some((embedded, id)) = snapshot_meta_of(&incoming)? else {
+                return Err(rusqlite::Error::InvalidQuery);
+            };
+            if embedded.last_log_id != want {
                 return Err(rusqlite::Error::InvalidQuery);
             }
             let mut c = db.lock();
             c.restore(MAIN_DB, &incoming, None::<fn(rusqlite::backup::Progress)>)?;
             c.execute_batch(SM_SCHEMA)?;
+            let fp = snap_dir.join(format!("snapshot-{id}.sqlite"));
             std::fs::rename(&incoming, &fp).map_err(|e| {
                 rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
                     Some(e.to_string()),
                 )
             })?;
-            Ok(())
+            Ok(fp)
         })
         .await
-        .expect("state machine task panicked")
-        .map_err(snap_err)?;
+        .map_err(io::Error::other)?
+        .map_err(sm_err)?;
         let old = self.current.lock().replace(CurrentSnapshot {
             meta: meta.clone(),
             path: final_path.clone(),
@@ -329,18 +369,16 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         {
             let _ = std::fs::remove_file(old.path);
         }
-        let index = meta.last_log_id.map(|l| l.index).unwrap_or(0);
+        let index = meta.last_log_id.map(|l| l.index()).unwrap_or(0);
         self.handler.on_event(&SmEvent::Resync { index });
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError> {
+    async fn get_current_snapshot(&mut self) -> io::Result<Option<Snapshot>> {
         let cur = self.current.lock().clone();
-        let Some(cur) = cur else { return Ok(None) };
-        let f = tokio::fs::File::open(&cur.path).await.map_err(snap_err)?;
-        Ok(Some(Snapshot {
-            meta: cur.meta,
-            snapshot: Box::new(f),
+        Ok(cur.map(|c| Snapshot {
+            meta: c.meta,
+            snapshot: SnapshotFile(c.path),
         }))
     }
 }
@@ -352,7 +390,9 @@ pub struct SnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError> {
+    type SnapshotData = SnapshotFile;
+
+    async fn build_snapshot(&mut self) -> io::Result<Snapshot> {
         let meta_path = self.meta_path.clone();
         let snap_dir = self.snap_dir.clone();
         let (meta, path) = tokio::task::spawn_blocking(move || -> rusqlite::Result<_> {
@@ -369,8 +409,8 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
             let (last, _) = read_applied(&c)?;
             let id = format!(
                 "{}-{}-{:08x}",
-                last.map(|l| l.leader_id.term).unwrap_or(0),
-                last.map(|l| l.index).unwrap_or(0),
+                last.map(|l| l.committed_leader_id().term).unwrap_or(0),
+                last.map(|l| l.index()).unwrap_or(0),
                 rand::random::<u32>()
             );
             c.execute(
@@ -388,12 +428,12 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
                     Some(e.to_string()),
                 )
             })?;
-            let meta = snapshot_meta_of(&final_path)?.expect("snapshot id was just written");
+            let (meta, _) = snapshot_meta_of(&final_path)?.expect("snapshot id was just written");
             Ok((meta, final_path))
         })
         .await
-        .expect("snapshot task panicked")
-        .map_err(snap_err)?;
+        .map_err(io::Error::other)?
+        .map_err(sm_err)?;
         let old = self.current.lock().replace(CurrentSnapshot {
             meta: meta.clone(),
             path: path.clone(),
@@ -401,10 +441,9 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
         if let Some(old) = old {
             let _ = std::fs::remove_file(old.path);
         }
-        let f = tokio::fs::File::open(&path).await.map_err(snap_err)?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(f),
+            snapshot: SnapshotFile(path),
         })
     }
 }

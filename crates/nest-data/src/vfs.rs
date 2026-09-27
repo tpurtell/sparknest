@@ -349,14 +349,7 @@ impl Vfs {
         granted: Instant,
     ) {
         let members: Vec<NodeId> = {
-            let m = self
-                .d
-                .meta()
-                .raft()
-                .metrics()
-                .borrow()
-                .membership_config
-                .clone();
+            let m = self.d.meta().metrics().membership_config;
             m.nodes()
                 .map(|(id, _)| NodeId(*id))
                 .filter(|n| *n != self.me())

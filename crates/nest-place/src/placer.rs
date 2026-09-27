@@ -216,15 +216,7 @@ impl Placer {
             .into_iter()
             .filter_map(|s| s.node.map(|n| (n, s.name)))
             .collect();
-        let m = self
-            .vfs
-            .data()
-            .meta()
-            .raft()
-            .metrics()
-            .borrow()
-            .membership_config
-            .clone();
+        let m = self.vfs.data().meta().metrics().membership_config;
         let mut out: Vec<HostRef> = m
             .nodes()
             .map(|(id, _)| {
@@ -1168,7 +1160,7 @@ impl Placer {
 
     /// Voters, learners and addresses as this node sees them.
     pub fn membership(&self) -> NestResult<serde_json::Value> {
-        let m = self.vfs.data().meta().raft().metrics().borrow().clone();
+        let m = self.vfs.data().meta().metrics();
         let names: HashMap<NodeId, String> = self
             .nodes()?
             .into_iter()
