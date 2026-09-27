@@ -381,11 +381,30 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
         .as_ref()
         .unwrap()
         .free_bytes;
-    let plan = p
-        .plan(&[("n1".into(), free_now + 2 * size - (1 << 20))])
-        .await
-        .unwrap();
+    let target = [("n1".into(), free_now + 2 * size - (1 << 20))];
+    // With no archive chosen, only the redundant copy goes; the sole copy
+    // is reported, not offloaded.
+    let plan = p.plan(&target, &[]).await.unwrap();
+    assert!(!plan.feasible, "{plan:?}");
+    assert!(plan.archives.is_empty());
+    assert_eq!(plan.steps.len(), 1, "{plan:?}");
+    assert!(matches!(
+        plan.steps[0],
+        nest_place::plan::Step::Evict { .. }
+    ));
+    assert!(
+        plan.blocked[0].contains("no archive store was chosen"),
+        "{:?}",
+        plan.blocked
+    );
+    assert!(p.plan(&target, &["nope".into()]).await.is_err());
+
+    let plan = p.plan(&target, &["nas".into()]).await.unwrap();
     assert!(plan.feasible, "{plan:?}");
+    let a = &plan.archives[0];
+    assert!(a.store == "nas" && a.reachable, "{a:?}");
+    assert_eq!(a.adds, size, "the sole copy lands in the archive");
+    assert_eq!(a.projected_free, a.free_now - size);
     let kinds: Vec<(&str, Vec<FileId>)> = plan
         .steps
         .iter()
@@ -418,7 +437,7 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
 
     // A target that only removing the pinned file could meet is reported.
     let plan = p
-        .plan(&[("n1".into(), free_now + 100 * size)])
+        .plan(&[("n1".into(), free_now + 100 * size)], &["nas".into()])
         .await
         .unwrap();
     assert!(!plan.feasible);
@@ -434,7 +453,7 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
 
     // A host named directly beats its group, whichever comes first.
     let plan = p
-        .plan(&[("n1".into(), 7), ("@both".into(), 9)])
+        .plan(&[("n1".into(), 7), ("@both".into(), 9)], &[])
         .await
         .unwrap();
     let t = |h: &str| plan.hosts.iter().find(|x| x.host == h).unwrap().target;
@@ -468,7 +487,10 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
         .as_ref()
         .unwrap()
         .free_bytes;
-    let plan = p.plan(&[("n1".into(), free_now + size / 2)]).await.unwrap();
+    let plan = p
+        .plan(&[("n1".into(), free_now + size / 2)], &[])
+        .await
+        .unwrap();
     assert_eq!(plan.steps.len(), 1, "{plan:?}");
     p.set_rule(
         "late",

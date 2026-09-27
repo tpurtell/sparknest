@@ -6,8 +6,10 @@
 //! 1. Evict copies that are redundant (another live copy exists elsewhere,
 //!    including an archive) and that no rule requires on that host; files
 //!    with the most copies first, then largest first.
-//! 2. If an archive store has room, offload files that are only here and
-//!    not rule-required (copy into the archive, then evict).
+//! 2. Offload files that are only here and not rule-required into the
+//!    archive stores the caller chose (copy into the archive, then evict),
+//!    filling them in the order given. With no archive chosen, a plan only
+//!    removes redundant copies.
 //! 3. Otherwise report what blocks it: bytes required there by rules, and
 //!    only copies with nowhere to go.
 //!
@@ -56,10 +58,25 @@ pub struct HostTarget {
     pub projected_free: u64,
 }
 
+/// An archive store the plan may offload into, and what it would take.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArchiveTarget {
+    pub store: String,
+    /// Checked through a healthy gateway; `false` means it takes nothing.
+    pub reachable: bool,
+    pub free_now: u64,
+    pub total: u64,
+    /// Bytes this plan would write into it.
+    pub adds: u64,
+    pub projected_free: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub id: u64,
     pub hosts: Vec<HostTarget>,
+    #[serde(default)]
+    pub archives: Vec<ArchiveTarget>,
     pub steps: Vec<Step>,
     pub blocked: Vec<String>,
     pub feasible: bool,
@@ -97,8 +114,13 @@ pub async fn requirements(placer: &Placer) -> NestResult<HashMap<(FileId, NodeId
     Ok(required_by)
 }
 
-/// Build a plan. `free` maps host names or @groups to desired free bytes.
-pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
+/// Build a plan. `free` maps host names or @groups to desired free bytes;
+/// `archives` names the archive stores sole copies may be offloaded into.
+pub async fn make(
+    placer: &Placer,
+    free: &[(String, u64)],
+    archives: &[String],
+) -> NestResult<Plan> {
     let status = placer.status().await?;
     let nodes = placer.nodes()?;
     // Desired free space per node. A host named directly beats a group it
@@ -123,19 +145,43 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
     // Every live copy on every node, with sizes and copy counts.
     let (mut copies_on, mut count) = collect_copies(placer)?;
 
-    // An archive with room, for offloading only-copies.
-    let mut archive: Option<(String, u64)> = None;
-    for s in placer.stores().await.unwrap_or_default() {
-        if let Some((_, h)) = s.gateways.iter().find(|(_, h)| h.healthy) {
-            let room = h.free_bytes;
-            if archive.as_ref().is_none_or(|(_, r)| room > *r) {
-                archive = Some((s.name.clone(), room));
-            }
+    let mut blocked = Vec::new();
+    // The chosen archives, with their room, for offloading only-copies.
+    let known = placer.archive_stores()?;
+    for a in archives {
+        if !known.iter().any(|(_, n, _)| n == a) {
+            return Err(NestError::Invalid(format!("{a} is not an archive store")));
         }
+    }
+    let health = placer.stores().await.unwrap_or_default();
+    let mut dest: Vec<ArchiveTarget> = Vec::new();
+    for a in archives {
+        if dest.iter().any(|d| &d.store == a) {
+            continue;
+        }
+        let h = health
+            .iter()
+            .filter(|s| &s.name == a)
+            .flat_map(|s| s.gateways.iter())
+            .find(|(_, h)| h.healthy)
+            .map(|(_, h)| h.clone());
+        dest.push(ArchiveTarget {
+            store: a.clone(),
+            reachable: h.is_some(),
+            free_now: h.as_ref().map_or(0, |h| h.free_bytes),
+            total: h.as_ref().map_or(0, |h| h.total_bytes),
+            adds: 0,
+            projected_free: h.as_ref().map_or(0, |h| h.free_bytes),
+        });
+    }
+    for d in dest.iter().filter(|d| !d.reachable) {
+        blocked.push(format!(
+            "archive store {}: no gateway can reach it",
+            d.store
+        ));
     }
 
     let mut steps = Vec::new();
-    let mut blocked = Vec::new();
     let mut hosts = Vec::new();
     for (node, target) in &want {
         let host = name_of
@@ -183,18 +229,19 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
                 copies: evict,
             });
         }
-        if deficit > 0
-            && !only.is_empty()
-            && let Some((store, room)) = archive.as_mut()
-        {
+        for d in dest.iter_mut().filter(|d| d.reachable) {
+            if deficit == 0 || only.is_empty() {
+                break;
+            }
             let mut off = Vec::new();
             let mut left = Vec::new();
             for cp in only.drain(..) {
-                if deficit == 0 || cp.size > *room {
+                if deficit == 0 || cp.size > d.projected_free {
                     left.push(cp);
                     continue;
                 }
-                *room -= cp.size;
+                d.projected_free -= cp.size;
+                d.adds += cp.size;
                 deficit = deficit.saturating_sub(cp.size);
                 projected += cp.size;
                 off.push(cp);
@@ -204,7 +251,7 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
                 steps.push(Step::Offload {
                     host: host.clone(),
                     node: *node,
-                    store: store.clone(),
+                    store: d.store.clone(),
                     bytes: off.iter().map(|c| c.size).sum(),
                     copies: off,
                 });
@@ -217,10 +264,10 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
             }
             let stuck: u64 = only.iter().map(|c| c.size).sum();
             if stuck > 0 {
-                let archive_why = if archive.is_some() {
-                    "no archive store has room for them"
+                let archive_why = if dest.iter().any(|d| d.reachable) {
+                    "the chosen archive stores have no room for them"
                 } else {
-                    "no archive store is available"
+                    "no archive store was chosen to offload them into"
                 };
                 why += &format!("; {} here are only copies and {archive_why}", human(stuck));
             }
@@ -240,6 +287,7 @@ pub async fn make(placer: &Placer, free: &[(String, u64)]) -> NestResult<Plan> {
     Ok(Plan {
         id: rand::random::<u32>() as u64,
         hosts,
+        archives: dest,
         steps,
         blocked,
         feasible,

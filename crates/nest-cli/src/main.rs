@@ -105,13 +105,17 @@ enum Cmd {
         cmd: RuleCmd,
     },
     /// Plan (and apply) reaching free-space targets:
-    /// nest plan --free raptor=800GiB --free @sparks=400GiB
+    /// nest plan --free raptor=800GiB --free @sparks=400GiB --to nas
     Plan {
         #[command(subcommand)]
         cmd: Option<PlanCmd>,
         /// HOST_OR_@GROUP=SIZE (repeatable); a bare number is GiB (600 = 600 GiB)
         #[arg(long)]
         free: Vec<String>,
+        /// Archive store sole copies may be offloaded into (repeatable, filled
+        /// in order). Without it the plan only removes redundant copies.
+        #[arg(long = "to", value_name = "STORE")]
+        to: Vec<String>,
     },
     /// Host groups (@name).
     Group {
@@ -836,7 +840,11 @@ async fn main() -> Result<()> {
             let jid = v["job"].as_u64().unwrap_or(0);
             if *wait { wait_job(&c, jid).await? } else { v }
         }
-        Cmd::Plan { cmd: None, free } => {
+        Cmd::Plan {
+            cmd: None,
+            free,
+            to,
+        } => {
             if free.is_empty() {
                 bail!("give at least one --free HOST=SIZE");
             }
@@ -847,7 +855,9 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("expected HOST=SIZE, got {f:?}"))?;
                 pairs.push(json!([h, parse_size(sz)?]));
             }
-            let v = c.post("/v1/plans", json!({ "free": pairs })).await?;
+            let v = c
+                .post("/v1/plans", json!({ "free": pairs, "archives": to }))
+                .await?;
             if !cli.json {
                 println!(
                     "plan {}{}",
@@ -874,6 +884,25 @@ async fn main() -> Result<()> {
                         human(now),
                         human(after),
                         human(target)
+                    );
+                }
+                for a in v["archives"].as_array().into_iter().flatten() {
+                    let now = a["free_now"].as_u64().unwrap_or(0);
+                    let after = a["projected_free"].as_u64().unwrap_or(0);
+                    if a["reachable"].as_bool() == Some(false) {
+                        println!(
+                            "  archive {:<9} unreachable",
+                            a["store"].as_str().unwrap_or("")
+                        );
+                        continue;
+                    }
+                    println!(
+                        "  archive {:<9} free {} -> {} (+{} stored) of {}",
+                        a["store"].as_str().unwrap_or(""),
+                        human(now),
+                        human(after),
+                        human(a["adds"].as_u64().unwrap_or(0)),
+                        human(a["total"].as_u64().unwrap_or(0))
                     );
                 }
                 for st in v["steps"].as_array().into_iter().flatten() {

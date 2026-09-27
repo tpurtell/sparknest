@@ -635,6 +635,15 @@ impl Placer {
             ..Default::default()
         }));
         self.jobs.lock().insert(id, job.clone());
+        // Jobs live in memory only; the log is what outlives a restart.
+        tracing::info!(
+            job = id,
+            selector = %sel.describe(),
+            to = ?hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),
+            files = m.entries.len(),
+            bytes = m.bytes(),
+            "replicate started"
+        );
         let me = self.clone();
         tokio::spawn(async move {
             let r = me.run_replicate(&job, m, hosts, parallel).await;
@@ -765,6 +774,7 @@ impl Placer {
     /// Remove copies of the selection from `hosts` (never the last live copy).
     pub async fn evict(&self, sel: &Selector, hosts: &[String]) -> NestResult<Vec<EvictReport>> {
         let m = self.manifest(sel).await?;
+        tracing::info!(selector = %sel.describe(), from = ?hosts, files = m.entries.len(), "evict");
         let files: Vec<FileId> = m.entries.iter().map(|e| e.file).collect();
         let mut out = Vec::new();
         for h in self.resolve_targets(hosts).await? {
@@ -813,6 +823,7 @@ impl Placer {
             ..Default::default()
         }));
         self.jobs.lock().insert(id, job.clone());
+        tracing::info!(job = id, selector = %sel.describe(), %store, files = m.entries.len(), bytes = m.bytes(), "offload started");
         let me = self.clone();
         tokio::spawn(async move {
             let r = async {
@@ -859,9 +870,15 @@ impl Placer {
 
     // ------------------------------------------------------------ plans
 
-    /// Propose a plan to reach `free` bytes free on each named host/@group.
-    pub async fn plan(&self, free: &[(String, u64)]) -> NestResult<crate::plan::Plan> {
-        let p = crate::plan::make(self, free).await?;
+    /// Propose a plan to reach `free` bytes free on each named host/@group,
+    /// offloading sole copies only into the `archives` named (none: only
+    /// redundant copies are removed).
+    pub async fn plan(
+        &self,
+        free: &[(String, u64)],
+        archives: &[String],
+    ) -> NestResult<crate::plan::Plan> {
+        let p = crate::plan::make(self, free, archives).await?;
         self.plans.lock().insert(p.id, p.clone());
         Ok(p)
     }
@@ -882,6 +899,12 @@ impl Placer {
             ..Default::default()
         }));
         self.jobs.lock().insert(jid, job.clone());
+        tracing::info!(
+            job = jid,
+            plan = id,
+            steps = plan.steps.len(),
+            "plan apply started"
+        );
         let me = self.clone();
         tokio::spawn(async move {
             let r: NestResult<()> = async {

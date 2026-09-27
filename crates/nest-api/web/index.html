@@ -150,7 +150,7 @@ let view = (() => { const v = new URLSearchParams(location.search).get("view"); 
 let status = null, stores = [];
 let filesPath = new URLSearchParams(location.search).get("path") || "/";
 let timer = null;
-let groups = [], lastPlan = null, planInputs = {};
+let groups = [], lastPlan = null, planInputs = {}, planArchives = [];
 
 function targets() {
   const t = (status?.nodes || []).map(n => ({ name: n.name, kind: "node" }));
@@ -232,9 +232,10 @@ async function models() {
       const h = byHost[c.name];
       if (!h) return `<td></td>`;
       const cls = h.ready ? "ready" : h.missing_files < h.files ? "partial" : "none";
-      const label = h.ready ? "✓" : cls === "partial" ? Math.floor(100 * (h.bytes - h.missing_bytes) / Math.max(h.bytes, 1)) + "%" : "—";
+      // Files, not bytes: shared weights without the small config files read as "99%" yet are not usable.
+      const label = h.ready ? "✓" : cls === "partial" ? `${h.files - h.missing_files}/${h.files}` : "—";
       return `<td><span class="cell ${cls}" data-act="cell" data-sel="${esc(r.selector)}" data-host="${esc(c.name)}" data-kind="${c.kind}" data-ready="${h.ready}"
-        title="${esc(c.name)}: ${h.ready ? "complete" : `missing ${h.missing_files} files (${human(h.missing_bytes)})`}">${label}</span></td>`;
+        title="${esc(c.name)}: ${h.ready ? "complete" : `has ${h.files - h.missing_files} of ${h.files} files; missing ${h.missing_files} (${human(h.missing_bytes)})`}">${label}</span></td>`;
     }).join("");
     return `<tr><td>${esc(r.repo)} ${r.kind === "dataset" ? `<span class="badge">dataset</span>` : ""}${r.writing ? `<span class="badge writing">${r.writing} writing</span>` : ""}</td>
       <td class="num">${human(r.bytes)}</td><td class="num">${r.revisions}</td>${cells}
@@ -316,8 +317,14 @@ async function space() {
   let out = `<h2>Space</h2><p class="muted small">sparknest holds <b>${human(live)}</b> on the hosts (all copies) and <b>${human(archived)}</b> in archive stores.
     "Free" is the whole disk; only sparknest's own copies can be moved to make room.</p>
     <h2>Desired free space</h2><p class="muted small">Set a floor in GiB (or 1.5T, 800G …) for hosts or groups; a host set directly beats its group. Planning moves nothing:
-    it lists redundant copies to remove, then sole copies to offload to an archive store. Last copies and copies a rule requires are never removed.</p>
+    it lists redundant copies to remove, then sole copies to offload into the archive stores you tick (filled in the order shown). With none ticked it only removes redundant copies.
+    Last copies and copies a rule requires are never removed.</p>
     <div class="tablewrap"><table><tr><th>Host</th><th class="num">sparknest here</th><th class="num">Free</th><th class="num">Total</th><th>Keep free</th></tr>${grows}${nrows}</table></div>
+    ${stores.length ? `<div class="card"><div class="small muted">Offload sole copies into</div><div class="checks">${stores.map(s => {
+      const g = (s.gateways.find(([, h]) => h.healthy) || [])[1];
+      return `<label><input type="checkbox" class="parch" value="${esc(s.name)}"${planArchives.includes(s.name) ? " checked" : ""}>${esc(s.name)}
+        <span class="muted small">${g ? `${human(g.free_bytes)} free of ${human(g.total_bytes)}` : "unreachable"}</span></label>`;
+    }).join("")}</div></div>` : ""}
     <div class="row"><button class="btn primary" data-act="mkplan">Make plan</button>${lastPlan ? ` <button class="btn" data-act="clearplan">Clear</button>` : ""}</div>`;
   if (lastPlan) {
     const p = lastPlan;
@@ -338,8 +345,15 @@ async function space() {
       return `<details class="card"><summary>${what} · ${human(st.bytes)}</summary>${files}</details>`;
     }).join("");
     const blocked = p.blocked.map(b => `<div class="card" style="color:var(--bad)">${esc(b)}</div>`).join("");
+    const arch = (p.archives || []).map(a => `<tr><td>${esc(a.store)}</td>${a.reachable
+      ? `<td class="num">${human(a.free_now)}</td><td class="num">${human(a.projected_free)}${a.adds ? ` <span class="muted small">−${human(a.adds)}</span>` : ""}</td>
+        <td class="num">${human(a.total)}</td><td class="num">${a.adds ? "+" + human(a.adds) : `<span class="muted">nothing</span>`}</td>`
+      : `<td colspan="4" style="color:var(--bad)">unreachable</td>`}</tr>`).join("");
+    const archTable = arch ? `<div class="tablewrap"><table><tr><th>Archive</th><th class="num">Free now</th><th class="num">After</th><th class="num">Total</th><th class="num">Stored by plan</th></tr>${arch}</table></div>`
+      : `<p class="muted small">No archive store ticked: this plan only removes redundant copies.</p>`;
     out += `<h2>Plan ${p.id} ${p.feasible ? "" : `<span class="pill" style="color:var(--bad)">not fully feasible</span>`}</h2>
       <div class="tablewrap"><table><tr><th>Host</th><th class="num">sparknest here</th><th class="num">Free now</th><th class="num">After</th><th class="num">Target</th><th></th></tr>${hosts}</table></div>
+      ${archTable}
       ${steps || `<div class="empty">Nothing to do: every target is already met or nothing can safely move.</div>`}${blocked}
       ${p.steps.length ? `<div class="row"><button class="btn primary" data-act="applyplan" data-id="${p.id}">Apply plan</button></div>` : ""}`;
   }
@@ -405,10 +419,11 @@ function bind() {
     else if (d.act === "mkplan") {
       planInputs = {};
       for (const i of document.querySelectorAll("input.free")) if (i.value.trim()) planInputs[i.dataset.k] = i.value.trim();
+      planArchives = [...document.querySelectorAll("input.parch:checked")].map(i => i.value);
       try {
         const free = Object.entries(planInputs).map(([k, v]) => [k, parseSize(v)]);
         if (!free.length) throw new Error("set at least one free-space target");
-        lastPlan = await post("/v1/plans", { free }); render();
+        lastPlan = await post("/v1/plans", { free, archives: planArchives }); render();
       } catch (err) { toast(err.message, true); }
     }
     else if (d.act === "clearplan") { lastPlan = null; render(); }
