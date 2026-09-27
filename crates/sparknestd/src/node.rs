@@ -266,7 +266,7 @@ impl Node {
             vfs: vfs.clone(),
             placer: placer.clone(),
             mountpoint,
-            hub: "/hub".into(),
+            hub: cfg.hf.hub(),
             web_token: nest_api::web_token(&secret_for_web),
             web_addr: cfg.node.api_listen,
             host: cfg.node.name.clone(),

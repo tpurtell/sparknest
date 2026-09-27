@@ -35,8 +35,8 @@ seven hosts should show `serving`. Then prepare the Hugging Face area and the
 archive and host groups:
 
 ```sh
-mkdir /mnt/sparknest/hub
-nest policy /hub incomplete          # seal blobs when a download completes
+mkdir -p /mnt/sparknest/hf-home/hub
+nest policy /hf-home/hub incomplete  # seal blobs when a download completes
 nest group set sparks ostrich,dodo,emu,kiwi,rhea,moa
 nest store add nas /mnt/models/sparknest --gateways @all
 ```
@@ -47,19 +47,20 @@ The cache and `/srv/sparknest` share raptor's root filesystem, so import
 hard-links: nothing is copied and no space is needed.
 
 ```sh
-nest import --move --wait ~/.cache/huggingface/hub /hub
+nest hf import --move --wait ~/.cache/huggingface
 ```
 
-`--move` unlinks each source once the namespace holds it. What stays in
-`~/.cache/huggingface/hub` is only what was not imported: partial
-downloads, lock files, and anything listed as an error. Review it, then:
+Each repo's blobs are hard-linked where huggingface_hub looks, `hf
+download` finishes each snapshot, and every file is verified. With `--move`,
+once every repo verified, `~/.cache/huggingface/hub` becomes a link to
+`/mnt/sparknest/hf-home/hub` (repos that did not verify stay, each listed in
+the job's notes). Then point jobs at the cluster's home:
 
 ```sh
-mv ~/.cache/huggingface/hub ~/.cache/huggingface/hub.before-sparknest
-ln -s /mnt/sparknest/hub ~/.cache/huggingface/hub
+export HF_HOME=/mnt/sparknest/hf-home
+export HF_TOKEN_PATH=~/.cache/huggingface/token   # the token stays yours
 ```
 
-Keep `~/.cache/huggingface/token` and `xet/` local; only `hub` moves.
 Resume jobs, and check that a model loads from the new path.
 
 ## 3. Adopt each Spark's cache (1.1 to 1.7 TB each)
@@ -67,15 +68,15 @@ Resume jobs, and check that a model loads from the new path.
 On each Spark in turn, the same command:
 
 ```sh
-nest import --move --wait ~/.cache/huggingface/hub /hub
+nest hf import --move --wait ~/.cache/huggingface
 ```
 
 Blobs the namespace already has, from raptor or an earlier Spark, are
 **adopted**: the Spark's own file becomes its copy of that blob, with no
 transfer and no extra space. New repos and blobs are imported. A blob whose
 size differs from the cluster's is reported and left in place for review.
-A repo's `refs/` stay as the first import wrote them. Then swap in the
-symlink as in step 2.
+A repo's `refs/` stay as the first import wrote them. With `--move`, the
+Spark's cache becomes a link to the cluster's hub as in step 2.
 
 When all six are done, `nest where hf:<org>/<model>` shows which hosts
 hold a complete copy of each model.

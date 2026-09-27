@@ -538,11 +538,10 @@ pub async fn import_entries(
                 id
             }
         };
-        let exists = vfs
+        let existing = vfs
             .data()
             .with_reader(|c| query::lookup(c, parent, name.as_bytes()))
-            .map_err(sql)?
-            .is_some();
+            .map_err(sql)?;
         let real = match std::fs::canonicalize(&e.src) {
             Ok(r) => r,
             Err(err) => {
@@ -556,9 +555,22 @@ pub async fn import_entries(
         let Ok(md) = std::fs::metadata(&real) else {
             continue;
         };
-        if exists {
+        if let Some(file) = existing {
+            // Content-addressed blobs the cluster already has: this host's
+            // file becomes its copy (a hard link, nothing transferred).
+            let r = if e.seal {
+                vfs.adopt_local(file, &real, md.len()).await
+            } else {
+                Ok(false)
+            };
             let mut p = progress.lock();
-            p.skipped += 1;
+            match r {
+                Ok(true) => p.adopted += 1,
+                // Same name, other size: not the same blob; a person decides.
+                Err(NestError::Invalid(m)) => p.errors.push(format!("{}: {m}", e.src.display())),
+                // Already a copy here, or another filesystem: nothing to do.
+                _ => p.skipped += 1,
+            }
             p.adopted_bytes += md.len();
             continue;
         }

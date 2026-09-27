@@ -35,3 +35,9 @@ devices = []       # optional filter, e.g. ["mlx5_0"]
 allow_other = true # needs user_allow_other in /etc/fuse.conf
 ttl_ms = 1000
 io_uring = true   # FUSE over io_uring when the kernel has fuse.enable_uring=1
+
+[hf]
+# Where HF_HOME lives in the namespace; huggingface_hub's cache is <home>/hub.
+# Point HF_HOME at the same path under the mount, e.g.
+#   export HF_HOME=/mnt/sparknest/hf-home
+home = "/hf-home"

@@ -15,6 +15,38 @@ pub struct Config {
     pub fabric: FabricSection,
     #[serde(default)]
     pub fuse: FuseSection,
+    #[serde(default)]
+    pub hf: HfSection,
+}
+
+/// Hugging Face: where HF_HOME lives in the namespace. Point HF_HOME at the
+/// same path under the mount (e.g. /mnt/sparknest/hf-home); huggingface_hub
+/// keeps its cache in `<home>/hub`, and also writes tokens and the Xet
+/// cache under HF_HOME, which is why it is a directory of its own and not
+/// the namespace root.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HfSection {
+    #[serde(default = "default_hf_home")]
+    pub home: String,
+}
+
+impl Default for HfSection {
+    fn default() -> Self {
+        HfSection {
+            home: default_hf_home(),
+        }
+    }
+}
+
+fn default_hf_home() -> String {
+    "/hf-home".into()
+}
+
+impl HfSection {
+    /// The hub cache inside HF_HOME, as a namespace path.
+    pub fn hub(&self) -> String {
+        format!("{}/hub", self.home.trim_end_matches('/'))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

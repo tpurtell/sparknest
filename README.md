@@ -42,7 +42,7 @@ configuration and service units: [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ```sh
 nest status                                   # hosts, stores, leader
-nest ls /hub                                  # where each file's copies are
+nest ls /hf-home/hub                          # where each file's copies are
 nest where hf:Qwen/Qwen3-8B                   # hosts with a complete copy
 nest replicate hf:Qwen/Qwen3-8B --hosts @sparks --wait
 nest rule set qwen hf:Qwen/Qwen3-8B --hosts @sparks --auto

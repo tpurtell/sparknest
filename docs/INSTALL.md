@@ -99,20 +99,25 @@ web UI with its token (`api_listen` must be set for the web UI).
 
 ## Hugging Face cache
 
-Give the hub a seal policy, adopt the existing cache, and point the hub
-directory at the mount (tokens and `xet/` stay local):
+The cluster keeps a Hugging Face home at `/hf-home` in the namespace
+(`[hf] home` in `node.toml`); huggingface_hub's cache is `/hf-home/hub`.
+Give the hub a seal policy, bring the existing cache in, and point `HF_HOME`
+at it:
 
 ```sh
-mkdir /mnt/sparknest/hub && nest policy /hub incomplete
-nest import --move --wait ~/.cache/huggingface/hub /hub
-mv ~/.cache/huggingface/hub ~/.cache/huggingface/hub.old   # leftovers only
-ln -s /mnt/sparknest/hub ~/.cache/huggingface/hub
+mkdir -p /mnt/sparknest/hf-home/hub && nest policy /hf-home/hub incomplete
+nest hf import --wait ~/.cache/huggingface       # add --move to swap in a link
+export HF_HOME=/mnt/sparknest/hf-home            # e.g. in ~/.profile
+export HF_TOKEN_PATH=~/.cache/huggingface/token  # keep your token to yourself
 ```
 
-Import hard-links, so the cache must share a filesystem with the state
-directory. On further hosts, blobs the cluster already has become that
-host's copies without any transfer. Either Hugging Face cache layout is
-accepted. Use `huggingface_hub` 1.32 or newer (2.0 recommended).
+`HF_HOME` is shared by every host, and `hf auth login` writes the token
+into it; `HF_TOKEN_PATH` keeps it in your home instead. `nest hf import`
+hard-links blobs when the cache shares a filesystem with the state
+directory and copies them otherwise, then lets `hf download` finish each
+snapshot; either cache layout is accepted. On further hosts, blobs the
+cluster already has become that host's copies without any transfer. Use
+`huggingface_hub` 1.32 or newer (2.0 recommended).
 `docs/MIGRATION.md` is the full walk-through for an existing fleet.
 
 ## Placement, archives and space

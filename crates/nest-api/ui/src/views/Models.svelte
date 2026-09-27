@@ -159,7 +159,7 @@
         {/if}
       </div>
     {:else}
-      {#if !err}<div class="panel empty">No Hugging Face repos yet. Point <code>HF_HUB_CACHE</code> at <code>{hub}</code> under the mount, or <code>nest hf import</code>.</div>{/if}
+      {#if !err}<div class="panel empty">No Hugging Face repos yet. Point <code>HF_HOME</code> at <code>{hub.replace(/\/hub$/, "")}</code> under the mount, or <code>nest hf import</code> an existing cache.</div>{/if}
     {/each}
   </div>
 </div>

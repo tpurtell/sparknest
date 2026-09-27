@@ -131,6 +131,7 @@ impl TestCluster {
                 allow_nonempty: false,
                 rescue_unmounted: true,
             },
+            hf: Default::default(),
         }
     }
 
@@ -138,9 +139,7 @@ impl TestCluster {
         let cfg = self.config(id, listen);
         let mut tuning = self.tuning.clone();
         tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
-        let node = Node::start(cfg, b"testkit-secret".to_vec(), tuning, false)
-            .await
-            .unwrap();
+        let node = start_node(cfg, tuning).await;
         self.addrs.insert(id, node.rpc.local_addr());
         self.nodes.insert(id, node);
     }
@@ -179,12 +178,7 @@ impl TestCluster {
                 let cfg = self.config(id, self.addrs[&id]);
                 let mut tuning = self.tuning.clone();
                 tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
-                async move {
-                    let n = Node::start(cfg, b"testkit-secret".to_vec(), tuning, false)
-                        .await
-                        .unwrap();
-                    (id, n)
-                }
+                async move { (id, start_node(cfg, tuning).await) }
             })
             .collect();
         for (id, n) in futures::future::join_all(starts).await {
@@ -355,6 +349,30 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
             copy_dir(&p, &dest);
         } else if p.is_file() {
             std::fs::copy(&p, &dest).unwrap();
+        }
+    }
+}
+
+/// Start a node. A restarted node binds its old port (peers know it), and
+/// in a busy test run another test's outgoing connection may hold that
+/// ephemeral port for a moment: retry the bind rather than fail the test.
+async fn start_node(cfg: Config, tuning: Tuning) -> Node {
+    let mut tries = 0;
+    loop {
+        match Node::start(
+            cfg.clone(),
+            b"testkit-secret".to_vec(),
+            tuning.clone(),
+            false,
+        )
+        .await
+        {
+            Ok(n) => return n,
+            Err(e) if tries < 100 && format!("{e:#}").contains("Address already in use") => {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("starting node: {e:#}"),
         }
     }
 }
