@@ -1,6 +1,6 @@
 <script lang="ts">
   import { post, type Plan } from "../lib/api";
-  import { app, route } from "../lib/state.svelte";
+  import { app, route, singleFlight } from "../lib/state.svelte";
   import { human, pct } from "../lib/format";
   import PlanPreview from "../components/PlanPreview.svelte";
   import Icon from "../components/Icon.svelte";
@@ -30,8 +30,11 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
   function schedule() {
     clearTimeout(timer);
-    timer = setTimeout(make, 350);
+    timer = setTimeout(makeOnce, 350);
   }
+  // One plan request at a time; a change made meanwhile plans once more
+  // with the latest targets when it answers (dragging never piles up).
+  const makeOnce = singleFlight(() => make());
   async function make() {
     let body: any;
     if (goal === "free") {

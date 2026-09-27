@@ -59,10 +59,26 @@ export async function consolidate(selector: string, host?: string) {
     const target =
       host ?? plan.steps.find((s) => s.kind === "replicate")?.host ?? plan.notes[0]?.split(":")[0] ?? "one host";
     if (!plan.feasible) return inform(`Cannot move ${selLabel(selector)} to ${target}`, plan.blocked.join("\n"));
-    if (!plan.steps.length) return toast(`${selLabel(selector)} is already only on ${target}`);
+    // Copies rules keep in place ("dodo: 1.2 GiB stays, rule "all" keeps it there").
+    const pinned = plan.notes.filter((n) => n.includes(" keeps it there"));
+    const pinnedHosts = pinned.map((n) => n.split(":")[0]);
+    const rules = [...new Set(pinned.flatMap((n) => [...n.matchAll(/"([^"]+)"/g)].map((m) => m[1])))];
+    if (!plan.steps.length) {
+      if (pinned.length)
+        return inform(
+          `Rules keep ${selLabel(selector)} where it is`,
+          `Rule${rules.length > 1 ? "s" : ""} ${rules.map((r) => `"${r}"`).join(", ")} ${rules.length > 1 ? "keep" : "keeps"} copies on ${pinnedHosts.join(", ")}, so nothing can be moved to ${target}. Change or delete the rule (Rules) to move it.`,
+        );
+      return toast(`${selLabel(selector)} is already only on ${target}`);
+    }
     await post(`/v1/plans/${plan.id}/apply`);
-    const why = plan.notes.find((n) => n.startsWith(target + ":"))?.slice(target.length + 1).trim();
+    const why = plan.notes.find((n) => n.startsWith(target + ":") && !n.includes(" keeps it there"))?.slice(target.length + 1).trim();
     toast(`Moving ${selLabel(selector)} to ${target}${why ? ` (${why})` : ""}`);
+    if (pinned.length)
+      await inform(
+        `Moved what rules allow`,
+        `Copies on ${pinnedHosts.join(", ")} stay: rule${rules.length > 1 ? "s" : ""} ${rules.map((r) => `"${r}"`).join(", ")} ${rules.length > 1 ? "keep" : "keeps"} them there. The rest is moving to ${target}.`,
+      );
     poll();
   } catch (e) {
     toast((e as Error).message, true);

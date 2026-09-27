@@ -931,12 +931,16 @@ fn make_consolidate(
         }
         let mut drop = Vec::new();
         let mut req = 0u64;
+        let mut rules: Vec<String> = Vec::new();
         for c in w.copies_on.get(&n).cloned().unwrap_or_default() {
             if !files.contains(&c.file) {
                 continue;
             }
-            if w.required(c.file, n).is_some() {
+            if let Some(r) = w.required(c.file, n) {
                 req += c.size;
+                if !rules.contains(r) {
+                    rules.push(r.clone());
+                }
                 continue;
             }
             drop.push(Copy {
@@ -946,8 +950,12 @@ fn make_consolidate(
         }
         if req > 0 {
             let h = w.host(n);
-            w.notes
-                .push(format!("{h}: {} stays, required by rules", human(req)));
+            let quoted: Vec<String> = rules.iter().map(|r| format!("{r:?}")).collect();
+            w.notes.push(format!(
+                "{h}: {} stays, rule {} keeps it there",
+                human(req),
+                quoted.join(", ")
+            ));
         }
         if !drop.is_empty() {
             let b: u64 = drop.iter().map(|c| c.size).sum();
