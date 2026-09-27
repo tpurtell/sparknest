@@ -11,6 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// `files.flags` bit: seal when the current write epoch finalizes.
 const FLAG_SEAL_PENDING: i64 = 1;
+/// Regular files: reads are scattered (ADR-031).
+pub(crate) const FLAG_READ_SCATTERED: i64 = 1 << 10;
 
 enum Fail {
     Nest(NestError),
@@ -270,6 +272,19 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
             );
             c.prepare_cached("INSERT OR REPLACE INTO groups (name, members) VALUES (?1, ?2)")?
                 .execute(params![name, json])?;
+            Ok(Reply::Done)
+        }
+        Command::SetReadPattern { file, scattered } => {
+            // A hint: no ctime change, nothing for caches to invalidate.
+            let n = c
+                .prepare_cached(
+                    "UPDATE files SET flags = CASE WHEN ?2 THEN flags | ?3 ELSE flags & ~?3 END \
+                     WHERE id = ?1 AND kind = 1",
+                )?
+                .execute(params![file.0 as i64, *scattered, FLAG_READ_SCATTERED])?;
+            if n == 0 {
+                return err(NestError::NotFound);
+            }
             Ok(Reply::Done)
         }
         Command::DeleteGroup { name } => {

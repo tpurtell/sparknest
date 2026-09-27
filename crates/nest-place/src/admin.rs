@@ -36,6 +36,9 @@ pub struct NodeInfo {
     /// reads; rates come from differences between polls).
     #[serde(default)]
     pub local_read_bytes: u64,
+    /// Files this host reads directly because reads are scattered (ADR-031).
+    #[serde(default)]
+    pub scattered_files: u64,
     /// What this host has learned about the sources it reads from
     /// (ADR-030): latency, in flight, recent rate.
     #[serde(default)]
@@ -299,6 +302,7 @@ impl Admin {
             fabric_read_bytes,
             fabric_served_bytes,
             local_read_bytes: self.vfs.local_read_bytes(),
+            scattered_files: self.vfs.scattered_files() as u64,
             io: self.vfs.io_report(),
             disk_read_bps: self.vfs.disk_read_bps(),
             fabric_timing: fab

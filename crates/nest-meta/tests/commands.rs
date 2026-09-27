@@ -409,6 +409,34 @@ fn ownership_lifecycle() {
 }
 
 #[test]
+fn read_pattern_hint() {
+    let mut db = Db::new();
+    let f = db.file(ROOT, "table", 1, 10);
+    assert!(!query::read_scattered(&db.c, f.id).unwrap());
+    let before = db.attr(f.id);
+    db.ok(Command::SetReadPattern {
+        file: f.id,
+        scattered: true,
+    });
+    assert!(query::read_scattered(&db.c, f.id).unwrap());
+    assert_eq!(db.attr(f.id), before, "a hint changes no attributes");
+    db.ok(Command::SetReadPattern {
+        file: f.id,
+        scattered: false,
+    });
+    assert!(!query::read_scattered(&db.c, f.id).unwrap());
+    // Regular files only.
+    assert!(matches!(
+        db.run(Command::SetReadPattern {
+            file: ROOT,
+            scattered: true
+        })
+        .0,
+        Err(NestError::NotFound)
+    ));
+}
+
+#[test]
 fn sealing() {
     let mut db = Db::new();
     let f = db.file(ROOT, "blob", 1, 10);

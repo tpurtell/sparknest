@@ -17,6 +17,7 @@ pub mod balance;
 pub mod diskprobe;
 pub mod fsck;
 mod local;
+pub mod pattern;
 mod readahead;
 mod remote;
 mod session;

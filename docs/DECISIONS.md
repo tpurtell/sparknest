@@ -739,3 +739,77 @@ every node).
 **Consequences.** WebSockets do not count against the per-server
 connection limit, so tabs no longer starve each other. The HTTP endpoints
 stay for the CLI and scripts.
+
+## ADR-030 — Reads spread over every copy: local first, rendezvous stripes, capped (2026-09-27)
+
+**Context.** A model with a copy on every host was read only from the
+local disk (passthrough or the daemon's pread). The Sparks' disks read
+~5 GB/s against 23 GiB/s of RDMA links; raptor's links carry 93 GiB/s.
+When all hosts boot the same model at once (ds41rt), every copy is being
+read anyway, so their page caches can serve each other.
+
+**Decision.**
+- Passthrough policy `always | sole | never` (`[fuse] passthrough`): `sole`
+  uses passthrough only where this host holds the only live copy, so the
+  daemon can spread reads of files with several.
+- A STABLE file with several copies is read through readahead in 4 MiB
+  chunks, each from a source the node's balancer picks: this host's disk
+  first while its latency is within 2× the best; otherwise peers ranked by
+  rendezvous hash of (file, 32 MiB stripe), so hosts loading the same
+  shards ask the same peer for the same stripe and hit its page cache.
+- The peers used are capped to a prefix whose measured disk rates sum to
+  125% of this host's link rate. Disk rates are measured with O_DIRECT
+  after boot and daily while idle (`disk-bandwidth.json`); link rates come
+  from sysfs. `nest io` and the I/O page show what each host learned.
+- Speculative fabric chunks take landing slots only while slots are
+  spare, and remote chunks are copied out of their slot on arrival, so a
+  demanded read always gets a slot (invariant 9). Fabric reads are
+  cancellation-safe: the pending table owns a read's slot until the peer
+  answers.
+- RoCE is lossy on the current switch: a 17 ms QP retransmit timeout (was
+  67 ms) and at most 16 fabric reads in flight per host bound the cost of
+  incast drops until PFC/ECN is configured.
+
+**Measured** (cold, 164 GiB EXL3 model on all 7 hosts, 8 readers each): a
+Spark alone 3.3 → 6.2–6.5 GB/s; all seven at once 21.9 → 39.6 GB/s
+aggregate (each Spark ~54 s → ~29 s); raptor alone at 16 readers 8.9 →
+14.5 GB/s. See benchmarks/.
+
+**Consequences.** Reading never creates a replica; everything held is
+transient. The in-flight cap is one number for hosts whose links differ
+4×; it should scale with the reader's link (to be benchmarked).
+
+## ADR-031 — Files read in scattered pieces are read directly, and the file remembers (2026-09-27)
+
+**Context.** ds41rt maps engram tables (hundreds of GB of hash tables)
+with MADV_RANDOM: every page fault is one 4 KiB FUSE read at an unrelated
+offset. ADR-030's readahead fetched a 4 MiB chunk for each, from the disk
+or a peer, and discarded almost all of it; a loader that opens a shard
+per tensor did the same with the unread tail of each window. On raptor
+the readahead read 2.3 TiB to deliver a few hundred GiB, and the first
+request stalled behind it. FUSE never sees madvise or fadvise.
+
+**Decision.**
+- Every chunk readahead drops reports how much readers consumed. Per file
+  on each host, once 64 MiB of dropped chunks were less than 25% consumed
+  (a decaying tally, so a stream's unread tail does not count alone), the
+  file's reads are *scattered*.
+- Scattered files are read exactly as asked: from this host's copy when it
+  has one (on the FUSE fast path), otherwise from whichever copy is least
+  busy, over every copy (no stripes, no cap). New opens get passthrough
+  when the policy is `sole` and a local copy exists.
+- The verdict is recorded with the file (`Command::SetReadPattern`, a bit
+  in `files.flags`) and seeds every host at open, so it is learned once
+  per cluster and survives restarts. Hosts reading through the daemon keep
+  judging: if 90% of 256 MiB of direct reads continue each other, the file
+  streams again and the flag is cleared. A host using passthrough cannot
+  see its reads and does not revise it. `nest read-pattern PATH
+  scattered|stream [-r]` overrides.
+
+**Alternatives.** Smaller chunks for everyone (hurts streams); passing the
+application's advice (FUSE has no channel for it); per-host memory only
+(every host and restart relearns, during the load that hurts most).
+
+**Consequences.** One metadata write per file when first judged. The
+kernel's own read-around still applies to mapped files opened without
+MADV_RANDOM; only passthrough avoids FUSE for those entirely.

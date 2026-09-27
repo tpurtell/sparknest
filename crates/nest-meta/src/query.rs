@@ -322,6 +322,15 @@ pub fn locks_of(c: &Connection, file: FileId) -> rusqlite::Result<Vec<LockRow>> 
     rows.collect()
 }
 
+/// Whether a regular file's reads are recorded as scattered (ADR-031).
+pub fn read_scattered(c: &Connection, file: FileId) -> rusqlite::Result<bool> {
+    let flags: Option<i64> = c
+        .prepare_cached("SELECT flags FROM files WHERE id = ?1 AND kind = 1")?
+        .query_row(params![file.0 as i64], |r| r.get(0))
+        .optional()?;
+    Ok(flags.unwrap_or(0) & crate::apply::FLAG_READ_SCATTERED != 0)
+}
+
 /// A directory's own sealing policy (bits 8-9 of `files.flags`).
 pub fn seal_policy(c: &Connection, dir: FileId) -> rusqlite::Result<crate::SealPolicy> {
     let flags: Option<i64> = c

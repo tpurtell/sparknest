@@ -238,6 +238,13 @@ pub enum Command {
     DeleteGroup {
         name: String,
     },
+    /// Record how a regular file is read (ADR-031): `scattered` when readers
+    /// take small pieces at random, so hosts read it directly instead of
+    /// reading ahead. A hint learned by whichever host notices first.
+    SetReadPattern {
+        file: FileId,
+        scattered: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

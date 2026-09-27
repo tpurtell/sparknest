@@ -127,6 +127,8 @@ struct Handle {
     /// How reads of a generation are served, decided on its first read:
     /// `Some(sources)` when spread over several copies.
     route: Mutex<Option<(Generation, Option<Route>)>>,
+    /// Where this handle's previous direct read ended (u64::MAX: none).
+    last_end: AtomicU64,
 }
 
 /// A generation readable from several copies.
@@ -174,6 +176,8 @@ pub struct Vfs {
     owned: Mutex<HashMap<FileId, Arc<Owned>>>,
     usage: Arc<crate::usage::Usage>,
     balancer: Arc<crate::balance::Balancer>,
+    /// Which files are read in scattered pieces (read directly).
+    patterns: Arc<crate::pattern::Patterns>,
     /// This host's measured disk read rate (bytes/s; 0 until measured).
     disk_bps: Arc<AtomicU64>,
     /// Revocation state per (file, epoch) this node was granted.
@@ -264,6 +268,7 @@ impl Vfs {
             owned: Mutex::new(HashMap::new()),
             usage: Arc::new(crate::usage::Usage::open(d.store().root())),
             balancer: Arc::new(crate::balance::Balancer::default()),
+            patterns: Arc::default(),
             disk_bps: Arc::new(AtomicU64::new(
                 crate::diskprobe::load(d.store().root()).map_or(0, |b| b.bytes_per_s),
             )),
@@ -285,6 +290,20 @@ impl Vfs {
                 v.on_effect(index, e);
             }
         }));
+        // A verdict on how a file is read goes into its metadata, so other
+        // hosts and restarts start from it (ADR-031).
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&vfs);
+            vfs.patterns.set_on_change(Box::new(move |file, scattered| {
+                let weak = weak.clone();
+                rt.spawn(async move {
+                    let Some(v) = weak.upgrade() else { return };
+                    if let Err(e) = v.propose(Command::SetReadPattern { file, scattered }).await {
+                        tracing::debug!(file = file.0, error = %e, "could not record the read pattern");
+                    }
+                });
+            }));
+        }
         // Ownerships granted before this VFS existed (startup) are finalized
         // by the data node; nothing to adopt here.
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -377,6 +396,18 @@ impl Vfs {
             self.local_read_bytes.fetch_add(n, Ordering::Relaxed);
         }
         h.count(src, n);
+    }
+
+    /// A direct read of a scattered file: note whether it continued the
+    /// handle's previous one (streams switch back to readahead).
+    fn note_direct(&self, h: &Handle, offset: u64, n: u64) {
+        let seq = h.last_end.swap(offset + n, Ordering::Relaxed) == offset;
+        self.patterns.direct(h.file, n, seq);
+    }
+
+    /// Files this host currently reads directly (scattered reads).
+    pub fn scattered_files(&self) -> usize {
+        self.patterns.random_files()
     }
 
     /// Bytes read from this host's own disk through sparknest so far.
@@ -1424,6 +1455,7 @@ impl Vfs {
             readahead: tokio::sync::Mutex::new(None),
             read_bytes: Default::default(),
             route: Mutex::new(None),
+            last_end: AtomicU64::new(u64::MAX),
         });
         self.handles.lock().insert(fh, h);
         self.d.handle_opened(file);
@@ -1443,8 +1475,10 @@ impl Vfs {
             let key = ObjectKey::new(a.id, a.generation);
             let allowed = match self.cfg.passthrough {
                 Passthrough::Always => true,
-                // Other copies exist: let the daemon spread the reads.
-                Passthrough::Sole => !self.live_elsewhere(a),
+                // Other copies exist: let the daemon spread the reads,
+                // unless they are scattered (the local disk answers those
+                // fastest).
+                Passthrough::Sole => !self.live_elsewhere(a) || self.patterns.is_random(a.id),
                 Passthrough::Never => false,
             };
             if allowed
@@ -1475,6 +1509,9 @@ impl Vfs {
         }
         self.d.wait_caught_up(self.cfg.catch_up_wait).await;
         self.usage.record_open(file);
+        if !writable && let Ok(scattered) = self.q(|c| query::read_scattered(c, file)) {
+            self.patterns.seed(file, scattered);
+        }
         let mode = self.choose_mode(&a, writable);
         let fh = self.new_handle(file, flags);
         if writable && flags & oflags::TRUNC != 0 {
@@ -1618,8 +1655,12 @@ impl Vfs {
             }
             let a = self.raw_attr(h.file)?;
             let key = ObjectKey::new(h.file, a.generation);
+            // Read in scattered pieces: exactly what is asked, no readahead
+            // (ADR-031).
+            let scattered = self.patterns.is_random(h.file);
             // Several copies: spread chunks over them (ADR-030).
-            if let Some(route) = self.route(&h, &a)
+            if !scattered
+                && let Some(route) = self.route(&h, &a)
                 && let Some(fab) = self.fabric()
             {
                 let _t = self.track(h.file);
@@ -1628,6 +1669,7 @@ impl Vfs {
                     *ra = Some(crate::readahead::Readahead::new(
                         &fab,
                         self.balancer.clone(),
+                        self.patterns.clone(),
                         h.file,
                         a.generation,
                         route.sources.clone(),
@@ -1681,8 +1723,47 @@ impl Vfs {
                     .expect("blocking task");
                 if let Ok(b) = &r {
                     self.count_read(&h, kind, b.len() as u64);
+                    if scattered {
+                        self.note_direct(&h, offset, b.len() as u64);
+                    }
                 }
                 return r;
+            }
+            // Scattered, no local copy: each read from whichever copy is
+            // least busy, over every copy (no stripes, no cap).
+            if scattered
+                && let Some(route) = self.route(&h, &a)
+                && let Some(fab) = self.fabric()
+            {
+                let peers: Vec<crate::balance::Source> = route
+                    .sources
+                    .iter()
+                    .copied()
+                    .filter(|s| matches!(s, crate::balance::Source::Peer(_)))
+                    .collect();
+                if !peers.is_empty() {
+                    let ticket = self.balancer.pick_least_busy(&peers);
+                    let crate::balance::Source::Peer(node) = ticket.source() else {
+                        unreachable!("peers only")
+                    };
+                    let _t = self.track(h.file);
+                    match self
+                        .fabric_exact(&fab, node, h.file, a.generation, offset, size)
+                        .await
+                    {
+                        Ok(b) => {
+                            ticket.finish(b.len() as u64);
+                            self.count_read(&h, crate::usage::Source::Remote, b.len() as u64);
+                            self.note_direct(&h, offset, b.len() as u64);
+                            return Ok(b);
+                        }
+                        // Fall through to the one-holder-at-a-time path.
+                        Err(e) => {
+                            ticket.fail();
+                            last = e;
+                        }
+                    }
+                }
             }
             let sources = match (a.gen_state, a.owner) {
                 (GenState::Owned, Some(o)) => vec![o],
@@ -1696,13 +1777,14 @@ impl Vfs {
             }
             for s in sources {
                 if let Some(fab) = self.fabric() {
-                    let r = if a.gen_state == GenState::Stable {
+                    let r = if a.gen_state == GenState::Stable && !scattered {
                         // Immutable generation: read ahead in whole chunks.
                         let mut ra = h.readahead.lock().await;
                         if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
                             *ra = Some(crate::readahead::Readahead::new(
                                 &fab,
                                 self.balancer.clone(),
+                                self.patterns.clone(),
                                 h.file,
                                 a.generation,
                                 vec![crate::balance::Source::Peer(s)],
@@ -1850,7 +1932,11 @@ impl Vfs {
         let key = ObjectKey::new(h.file, a.generation);
         // Until the first read has decided how this generation is served,
         // the slow path decides; a spread read only serves ready chunks here.
-        let spread = if self.cfg.balance_reads && a.gen_state == GenState::Stable {
+        // Scattered reads go straight to a local copy (ADR-031).
+        let scattered = self.patterns.is_random(h.file);
+        let spread = if scattered {
+            false
+        } else if self.cfg.balance_reads && a.gen_state == GenState::Stable {
             match h.route.lock().as_ref() {
                 Some((g, r)) if *g == a.generation => r.is_some(),
                 _ => return None,
@@ -1883,11 +1969,14 @@ impl Vfs {
                 // the caller's result type for its length.
                 let n = a.size.saturating_sub(offset).min(size as u64);
                 self.count_read(&h, self.source_kind(&src), n);
+                if scattered {
+                    self.note_direct(&h, offset, n);
+                }
             }
             return Some(r);
         }
         // Only STABLE generations are cached ahead: their bytes never change.
-        if a.gen_state != GenState::Stable {
+        if a.gen_state != GenState::Stable || scattered {
             return None;
         }
         let fab = self.fabric()?;

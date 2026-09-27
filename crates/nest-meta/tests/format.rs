@@ -250,6 +250,13 @@ fn format_is_pinned() {
             },
             "DeleteGroup",
         ),
+        (
+            Command::SetReadPattern {
+                file: f,
+                scattered: false,
+            },
+            "SetReadPattern",
+        ),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");

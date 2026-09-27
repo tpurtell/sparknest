@@ -219,6 +219,32 @@ impl Balancer {
         ranked.truncate(keep.max(1));
     }
 
+    /// Pick whichever of `candidates` (non-empty) answers soonest by its
+    /// load, for a small scattered read: no stripes, no cap (ADR-031).
+    pub fn pick_least_busy(self: &Arc<Self>, candidates: &[Source]) -> Ticket {
+        let mut st = self.stats.lock();
+        let src = *candidates
+            .iter()
+            .min_by(|a, b| {
+                let sa = st
+                    .get(a)
+                    .map_or_else(|| Stat::new(**a).score(), |x| x.score());
+                let sb = st
+                    .get(b)
+                    .map_or_else(|| Stat::new(**b).score(), |x| x.score());
+                sa.total_cmp(&sb)
+            })
+            .expect("non-empty");
+        st.entry(src).or_insert_with(|| Stat::new(src)).in_flight += 1;
+        drop(st);
+        Ticket {
+            b: self.clone(),
+            src,
+            start: Instant::now(),
+            done: false,
+        }
+    }
+
     /// Pick the source for the next chunk of stripe `key` among
     /// `candidates` (non-empty) and count it in flight.
     pub fn pick(self: &Arc<Self>, candidates: &[Source], key: u64) -> Ticket {

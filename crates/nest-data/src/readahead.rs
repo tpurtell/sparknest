@@ -16,8 +16,13 @@
 //! spare slots, so a demanded read can always get one (PROPOSAL
 //! invariant 9). Everything held here is transient:
 //! reading never creates a replica.
+//!
+//! Every chunk dropped reports to the host's `Patterns` how much of it was
+//! consumed, so files read in scattered pieces are noticed and read
+//! directly instead (see `pattern`).
 
 use crate::balance::{Balancer, Source};
+use crate::pattern::Patterns;
 use nest_fabric::Fabric;
 use nest_store::{ObjectKey, ObjectStore};
 use nest_types::{FileId, Generation, NestError, NestResult};
@@ -43,7 +48,8 @@ impl Buf {
 
 enum Chunk {
     Pending(Source, JoinHandle<NestResult<Buf>>),
-    Ready(Source, Buf),
+    /// A fetched chunk and how many of its bytes readers have taken.
+    Ready(Source, Buf, u64),
 }
 
 pub(crate) struct Readahead {
@@ -62,6 +68,9 @@ pub(crate) struct Readahead {
     chunks: BTreeMap<u64, Chunk>,
     /// Bytes handed out, by origin (local, remote), for usage accounting.
     served: [u64; 2],
+    patterns: Arc<Patterns>,
+    /// Dropped chunks not yet reported: bytes, and bytes of them consumed.
+    dropped: (u64, u64),
     /// Captured at creation: fetches may be started from a FUSE thread that
     /// is not inside the runtime (fast path).
     rt: tokio::runtime::Handle,
@@ -75,6 +84,7 @@ impl Readahead {
     pub(crate) fn new(
         fabric: &Fabric,
         balancer: Arc<Balancer>,
+        patterns: Arc<Patterns>,
         file: FileId,
         generation: Generation,
         sources: Vec<Source>,
@@ -95,6 +105,8 @@ impl Readahead {
             eof: size,
             chunks: BTreeMap::new(),
             served: [0, 0],
+            patterns,
+            dropped: (0, 0),
             rt: tokio::runtime::Handle::current(),
         }
     }
@@ -213,7 +225,7 @@ impl Readahead {
                     if (buf.len() as u64) < self.chunk {
                         self.eof = Some(start + buf.len() as u64);
                     }
-                    self.chunks.insert(start, Chunk::Ready(src, buf));
+                    self.chunks.insert(start, Chunk::Ready(src, buf, 0));
                 }
                 // That copy failed; others may still serve.
                 Err(e) if self.sources.len() > 1 => {
@@ -225,6 +237,34 @@ impl Readahead {
             }
         }
         Ok(())
+    }
+
+    /// Drop the chunk at `start` (cancelling it if still in flight) and
+    /// count how much of it was used.
+    fn drop_chunk(&mut self, start: u64) {
+        let Some(c) = self.chunks.remove(&start) else {
+            return;
+        };
+        let (bytes, used) = match c {
+            Chunk::Pending(_, h) => {
+                h.abort();
+                let end = self
+                    .eof
+                    .map_or(start + self.chunk, |e| e.min(start + self.chunk));
+                (end.saturating_sub(start), 0)
+            }
+            Chunk::Ready(_, buf, used) => (buf.len() as u64, used),
+        };
+        self.dropped.0 += bytes;
+        self.dropped.1 += used;
+        if self.dropped.0 >= 8 * self.chunk {
+            self.report();
+        }
+    }
+
+    fn report(&mut self) {
+        let (bytes, used) = std::mem::take(&mut self.dropped);
+        self.patterns.discarded(self.file, bytes, used);
     }
 
     fn account(&mut self, src: Source, n: usize) {
@@ -246,7 +286,7 @@ impl Readahead {
         let mut taken = Vec::new();
         while pos < end {
             let start = pos / c * c;
-            let Some(Chunk::Ready(src, buf)) = self.chunks.get(&start) else {
+            let Some(Chunk::Ready(src, buf, _)) = self.chunks.get(&start) else {
                 return None;
             };
             let from = (pos - start) as usize;
@@ -255,14 +295,17 @@ impl Readahead {
             }
             let n = (buf.len() - from).min((end - pos) as usize);
             out.extend_from_slice(&buf.as_slice()[from..from + n]);
-            taken.push((*src, n));
+            taken.push((*src, n, start));
             pos += n as u64;
             if buf.len() < c as usize {
                 break;
             }
         }
-        for (src, n) in taken {
+        for (src, n, start) in taken {
             self.account(src, n);
+            if let Some(Chunk::Ready(_, _, used)) = self.chunks.get_mut(&start) {
+                *used += n as u64;
+            }
         }
         // Keep the pipeline moving exactly as a full read would.
         let sequential = offset == self.next;
@@ -290,7 +333,7 @@ impl Readahead {
         let first = offset / c * c;
         let stale: Vec<u64> = self.chunks.range(..first).map(|(k, _)| *k).collect();
         for k in stale {
-            self.chunks.remove(&k);
+            self.drop_chunk(k);
         }
         let last = (offset + size as u64).saturating_sub(1) / c * c;
         self.top_up(fabric, last);
@@ -315,9 +358,7 @@ impl Readahead {
         // Drop chunks the reader has moved past.
         let stale: Vec<u64> = self.chunks.range(..first).map(|(k, _)| *k).collect();
         for k in stale {
-            if let Some(Chunk::Pending(_, h)) = self.chunks.remove(&k) {
-                h.abort();
-            }
+            self.drop_chunk(k);
         }
         // Demanded chunks, then speculative ones.
         let last = (offset + size as u64).saturating_sub(1) / c * c;
@@ -337,7 +378,7 @@ impl Readahead {
                 self.chunks.clear();
                 return Err(e);
             }
-            let Some(Chunk::Ready(src, buf)) = self.chunks.get(&start) else {
+            let Some(Chunk::Ready(src, buf, used)) = self.chunks.get_mut(&start) else {
                 return Err(NestError::Io("readahead chunk missing".into()));
             };
             let from = (pos - start) as usize;
@@ -347,6 +388,7 @@ impl Readahead {
             let n = (buf.len() - from).min((end - pos) as usize);
             let full = buf.len() == c as usize;
             out.extend_from_slice(&buf.as_slice()[from..from + n]);
+            *used += n as u64;
             let src = *src;
             self.account(src, n);
             pos += n as u64;
@@ -360,10 +402,10 @@ impl Readahead {
 
 impl Drop for Readahead {
     fn drop(&mut self) {
-        for (_, c) in std::mem::take(&mut self.chunks) {
-            if let Chunk::Pending(_, h) = c {
-                h.abort();
-            }
+        let starts: Vec<u64> = self.chunks.keys().copied().collect();
+        for k in starts {
+            self.drop_chunk(k);
         }
+        self.report();
     }
 }

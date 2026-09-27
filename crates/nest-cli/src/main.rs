@@ -42,6 +42,21 @@ enum Cmd {
         #[arg(long)]
         unseal: bool,
     },
+    /// Say how files are read: scattered (read directly) or stream (read ahead)
+    ///
+    /// Hosts learn this on their own when readahead goes unused (small reads
+    /// at random offsets, e.g. a lookup table mapped with MADV_RANDOM) and
+    /// record it with the file; this overrides that. Scattered files are
+    /// read exactly as asked, from this host's copy when it has one
+    /// (passthrough for new opens where allowed) or from the least busy
+    /// copy.
+    ReadPattern {
+        path: String,
+        #[arg(value_parser = ["scattered", "stream"])]
+        pattern: String,
+        #[arg(short, long)]
+        recursive: bool,
+    },
     /// Remove files or trees in bulk (far faster than `rm -r` through the mount)
     ///
     /// Many entries go into each metadata commit: tens of thousands of
@@ -800,6 +815,17 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Cmd::ReadPattern {
+            path,
+            pattern,
+            recursive,
+        } => {
+            c.post(
+                "/v1/read-pattern",
+                json!({ "path": abspath(path), "recursive": recursive, "scattered": pattern == "scattered" }),
+            )
+            .await?
+        }
         Cmd::Rm {
             paths,
             recursive,
@@ -1462,11 +1488,15 @@ async fn main() -> Result<()> {
                         0 => "?".to_string(),
                         b => format!("{}/s", human(b)),
                     };
-                    let caps = format!(
+                    let mut caps = format!(
                         "disk {} · links {}",
                         rate("disk_read_bps"),
                         rate("link_bps")
                     );
+                    match n["info"]["scattered_files"].as_u64().unwrap_or(0) {
+                        0 => {}
+                        k => caps += &format!(" · {k} file{} read directly (scattered)", if k == 1 { "" } else { "s" }),
+                    }
                     if io.is_empty() {
                         println!("{host}: {caps}; no spread reads yet");
                         continue;
