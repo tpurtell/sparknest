@@ -1,7 +1,7 @@
 <script lang="ts">
   import Treemap from "../components/Treemap.svelte";
   import { get, type TreeNode, type SpaceStore } from "../lib/api";
-  import { app, route, go, runningJobs } from "../lib/state.svelte";
+  import { app, route, go, runningJobs, singleFlight } from "../lib/state.svelte";
   import { human, pct } from "../lib/format";
   import { nodeMenu } from "../lib/actions";
 
@@ -37,6 +37,7 @@
     }
     loading = false;
   }
+  const refresh = singleFlight(load);
   $effect(() => {
     void scope;
     void weight;
@@ -46,7 +47,7 @@
   // Refresh quietly while copies are running.
   $effect(() => {
     void app.tick;
-    if (runningJobs().length && app.tick % 3 === 0) load();
+    if (runningJobs().length && app.tick % 3 === 0) refresh();
   });
 
   const root = $derived.by<TreeNode | null>(() => {

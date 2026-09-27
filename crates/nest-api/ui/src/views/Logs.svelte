@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get, type LogLine } from "../lib/api";
-  import { app, route } from "../lib/state.svelte";
+  import { app, route, singleFlight } from "../lib/state.svelte";
 
   let host = $state(route.params.get("host") ?? "");
   let level = $state("info");
@@ -16,6 +16,7 @@
     lines = v.lines.slice().reverse();
     unreachable = v.unreachable;
   }
+  const refresh = singleFlight(load);
   $effect(() => {
     void host;
     void level;
@@ -23,7 +24,7 @@
   });
   $effect(() => {
     void app.tick;
-    if (follow) load();
+    if (follow) refresh();
   });
   const t = (ms: number) => new Date(ms).toLocaleTimeString([], { hour12: false }) + "." + String(ms % 1000).padStart(3, "0");
 </script>

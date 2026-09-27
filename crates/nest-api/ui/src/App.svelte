@@ -85,6 +85,7 @@
           {#if running.length}
             <a class="pill live" href="#/jobs"><span class="dot spark"></span>{running.length} job{running.length > 1 ? "s" : ""}</a>
           {/if}
+          {#if app.slow}<span class="pill err" title="A request to this node has been waiting that long">API slow · {app.slow}s</span>{/if}
           {#if app.error}<span class="pill err hide-s">{app.error}</span>{/if}
         </div>
         {#if moreOpen}

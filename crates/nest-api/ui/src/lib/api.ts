@@ -35,19 +35,39 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
-  const r = await fetch(path, {
-    method,
-    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const v = await r.json().catch(() => ({ error: r.statusText }));
-  if (!r.ok) throw new ApiError(v.error || r.statusText, r.status);
-  return v as T;
+/** Requests in flight and the age of the oldest, for the "API slow" pill. */
+export const net = { inflight: new Map<number, number>(), seq: 0 };
+
+/** Every request gives up after `timeoutMs`: a browser allows six
+ * connections per server, and requests that never finish would otherwise
+ * queue everything behind them until a reload. */
+export async function api<T = any>(method: string, path: string, body?: unknown, timeoutMs = 20_000): Promise<T> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  const id = ++net.seq;
+  net.inflight.set(id, performance.now());
+  try {
+    const r = await fetch(path, {
+      method,
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctl.signal,
+    });
+    const v = await r.json().catch(() => ({ error: r.statusText }));
+    if (!r.ok) throw new ApiError(v.error || r.statusText, r.status);
+    return v as T;
+  } catch (e) {
+    if ((e as Error).name === "AbortError") throw new ApiError(`${path.split("?")[0]} did not answer within ${timeoutMs / 1000} s`, 0);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    net.inflight.delete(id);
+  }
 }
 
 export const get = <T = any>(p: string) => api<T>("GET", p);
-export const post = <T = any>(p: string, b: unknown = {}) => api<T>("POST", p, b);
+/** Plans and actions may take longer than a status poll. */
+export const post = <T = any>(p: string, b: unknown = {}) => api<T>("POST", p, b, 60_000);
 export const del = <T = any>(p: string) => api<T>("DELETE", p);
 
 // ---------------------------------------------------------------- types

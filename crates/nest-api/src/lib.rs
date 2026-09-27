@@ -655,7 +655,9 @@ async fn cluster_add(State(api): State<Api>, Json(r): Json<AddReq>) -> R<serde_j
 }
 
 async fn stores(State(api): State<Api>) -> R<serde_json::Value> {
-    Ok(Json(json!({ "stores": api.placer.stores().await? })))
+    Ok(Json(
+        json!({ "stores": api.placer.stores_listing().await? }),
+    ))
 }
 
 #[derive(Deserialize)]

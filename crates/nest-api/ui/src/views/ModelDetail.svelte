@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get, type Readiness, type TreeNode, type HostUsage } from "../lib/api";
-  import { app, runningJobs, startJob, go } from "../lib/state.svelte";
+  import { app, runningJobs, startJob, go, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
   import { copyTo, offload, keepOn, removeFrom, nodeMenu } from "../lib/actions";
   import Treemap from "../components/Treemap.svelte";
@@ -30,10 +30,11 @@
       err = (e as Error).message;
     }
   }
+  const refresh = singleFlight(load);
   $effect(() => {
     void selector;
     void app.tick;
-    load();
+    refresh();
   });
 
   const inflight = $derived(

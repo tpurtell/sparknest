@@ -1,7 +1,22 @@
 // Cluster state shared by every view, refreshed every 2 s while the page is
 // visible, plus routing and toasts.
 
-import { get, post, hasToken, ApiError, type Status, type Store, type Job } from "./api";
+import { get, post, hasToken, ApiError, net, type Status, type Store, type Job } from "./api";
+
+/** Run `fn` only if its previous run finished: a slow server gets one
+ * request of each kind at a time, never a growing pile. */
+export function singleFlight<A extends unknown[]>(fn: (...a: A) => Promise<unknown>): (...a: A) => Promise<void> {
+  let busy = false;
+  return async (...a: A) => {
+    if (busy) return;
+    busy = true;
+    try {
+      await fn(...a);
+    } finally {
+      busy = false;
+    }
+  };
+}
 
 export interface Rates {
   read: number;
@@ -18,11 +33,15 @@ export const app = $state({
   rates: {} as Record<string, Rates>,
   error: "",
   tick: 0,
+  /** Seconds the oldest request has been waiting, when that is long. */
+  slow: 0,
 });
 
 const prev: Record<string, { t: number; r: number; s: number }> = {};
 
-export async function poll() {
+export const poll = singleFlight(pollOnce);
+
+async function pollOnce() {
   if (!app.authed) return;
   try {
     const [status, stores, jobs, groups] = await Promise.all([
@@ -64,6 +83,8 @@ export function startPolling() {
   clearInterval(timer);
   poll();
   timer = setInterval(() => {
+    const oldest = Math.min(Infinity, ...net.inflight.values());
+    app.slow = isFinite(oldest) && performance.now() - oldest > 4000 ? Math.round((performance.now() - oldest) / 1000) : 0;
     if (document.visibilityState === "visible") poll();
   }, 2000);
 }

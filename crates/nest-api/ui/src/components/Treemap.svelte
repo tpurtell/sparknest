@@ -116,6 +116,7 @@
       if (p) from.set(it.key, p);
     }
     anim = { start: performance.now(), from };
+    labelsDirty = true;
     items = out;
     prev = new Map(out.map((it) => [it.key, it.r]));
     kick();
@@ -123,6 +124,10 @@
 
   let raf = 0;
   let looping = false;
+  // Labels are text on a 2D canvas, the costly part: drawn while the layout
+  // moves and once after, not on every shimmer frame.
+  let labelsDirty = true;
+  let lastFrame = 0;
   function kick() {
     if (!looping) {
       looping = true;
@@ -147,6 +152,14 @@
   function frame(now: number) {
     looping = false;
     if (!gl) return;
+    const animating = now - anim.start < 500;
+    // Only the shimmer is left: 30 frames a second is plenty.
+    const live = !reducedMotion() && (hover || items.some((it) => busy(it.n)));
+    if (!animating && !labelsDirty && now - lastFrame < 33) {
+      if (live) kick();
+      return;
+    }
+    lastFrame = now;
     const rs = current_rects(now);
     const glr: GlRect[] = rs.map(({ it, r }) => ({
       ...r,
@@ -159,9 +172,10 @@
         (busy(it.n) ? 8 : 0),
     }));
     gl.draw(glr, now / 1000);
-    drawLabels(rs);
-    const animating = now - anim.start < 500;
-    const live = !reducedMotion() && (hover || items.some((it) => busy(it.n)));
+    if (animating || labelsDirty) {
+      drawLabels(rs);
+      labelsDirty = animating;
+    }
     if (animating || live) kick();
   }
 

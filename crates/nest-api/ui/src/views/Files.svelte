@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get, post } from "../lib/api";
-  import { app, route, go, toast } from "../lib/state.svelte";
+  import { app, route, go, toast, singleFlight } from "../lib/state.svelte";
   import { human } from "../lib/format";
   import { nodeMenu } from "../lib/actions";
   import { download, remove, mkdir, upload } from "../lib/files.svelte";
@@ -21,10 +21,11 @@
       err = (e as Error).message;
     }
   }
+  const refresh = singleFlight(load);
   $effect(() => {
     void path;
     void app.tick;
-    load();
+    refresh();
   });
   const full = (n: string) => (path === "/" ? "" : path) + "/" + n;
   const parts = $derived(path.split("/").filter(Boolean));

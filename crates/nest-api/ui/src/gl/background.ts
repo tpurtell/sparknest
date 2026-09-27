@@ -72,7 +72,9 @@ export function startBackground(canvas: HTMLCanvasElement, energy: () => number,
   const uen = gl.getUniformLocation(prog, "energy");
   let e = 0;
   const draw = (t: number) => {
-    fit(canvas, 0.5);
+    // A soft backdrop: about a third of a megapixel is enough at any size.
+    const css = Math.max(1, canvas.clientWidth * canvas.clientHeight);
+    fit(canvas, Math.min(0.5, Math.sqrt(350_000 / css) / Math.min(window.devicePixelRatio || 1, 2)));
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.useProgram(prog);
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);

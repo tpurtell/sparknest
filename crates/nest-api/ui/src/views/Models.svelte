@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get, type Repo, type Readiness } from "../lib/api";
-  import { app, route, go, targets, runningJobs, startJob } from "../lib/state.svelte";
+  import { app, route, go, targets, runningJobs, startJob, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
   import { copyTo, offload, removeFrom } from "../lib/actions";
   import JobStrip from "../components/JobStrip.svelte";
@@ -25,9 +25,10 @@
       err = (e as Error).message;
     }
   }
+  const refresh = singleFlight(load);
   $effect(() => {
     void app.tick;
-    load();
+    refresh();
   });
 
   const cols = $derived(targets());

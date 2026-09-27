@@ -107,6 +107,9 @@ pub struct Placer {
     admin: Arc<admin::Admin>,
     jobs: Mutex<HashMap<u64, Arc<Mutex<ClusterJob>>>>,
     imports: Mutex<HashMap<u64, Arc<Mutex<crate::import::ImportProgress>>>>,
+    /// Recent answers the web UI asks for every few seconds.
+    usage_cache: Mutex<Option<(u64, std::time::Instant, UsageMap)>>,
+    stores_cache: Mutex<Option<(std::time::Instant, Vec<StoreStatus>)>>,
     plans: Mutex<HashMap<u64, crate::plan::Plan>>,
     next_job: AtomicU64,
     dirty: Arc<tokio::sync::Notify>,
@@ -170,6 +173,9 @@ async fn auto_reconcile(p: std::sync::Weak<Placer>) {
     }
 }
 
+/// Per-host file usage, by node.
+pub type UsageMap = HashMap<NodeId, HashMap<FileId, nest_data::usage::FileUsage>>;
+
 fn sql(e: rusqlite::Error) -> NestError {
     NestError::Io(format!("metadata: {e}"))
 }
@@ -185,6 +191,8 @@ impl Placer {
             admin,
             jobs: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
+            usage_cache: Mutex::new(None),
+            stores_cache: Mutex::new(None),
             plans: Mutex::new(HashMap::new()),
             next_job: AtomicU64::new(rand::random::<u32>() as u64),
             dirty: Arc::new(tokio::sync::Notify::new()),
@@ -418,11 +426,21 @@ impl Placer {
         gateway: NodeId,
         store: StoreId,
     ) -> NestResult<admin::StoreHealth> {
+        self.store_health_within(gateway, store, Duration::from_secs(10))
+            .await
+    }
+
+    async fn store_health_within(
+        &self,
+        gateway: NodeId,
+        store: StoreId,
+        within: Duration,
+    ) -> NestResult<admin::StoreHealth> {
         match admin::call(
             self.rpc(),
             gateway,
             &AdminReq::StoreHealth { store },
-            Duration::from_secs(10),
+            within,
         )
         .await?
         {
@@ -484,7 +502,26 @@ impl Placer {
         Ok(out)
     }
 
+    /// Archive stores with the health each gateway reports now.
     pub async fn stores(&self) -> NestResult<Vec<StoreStatus>> {
+        let v = self.stores_uncached().await?;
+        *self.stores_cache.lock() = Some((std::time::Instant::now(), v.clone()));
+        Ok(v)
+    }
+
+    /// `stores()`, reusing an answer up to 5 s old: for listings the UI
+    /// polls (a NAS share can be slow to report under load). Placement
+    /// decisions use `stores()`.
+    pub async fn stores_listing(&self) -> NestResult<Vec<StoreStatus>> {
+        if let Some((at, v)) = &*self.stores_cache.lock()
+            && at.elapsed() < Duration::from_secs(5)
+        {
+            return Ok(v.clone());
+        }
+        self.stores().await
+    }
+
+    async fn stores_uncached(&self) -> NestResult<Vec<StoreStatus>> {
         let names: HashMap<NodeId, String> = self
             .nodes()?
             .into_iter()
@@ -496,7 +533,7 @@ impl Placer {
             let names = &names;
             let checks = cfg.gateways.iter().map(|g| async move {
                 let h = self
-                    .store_health(*g, id)
+                    .store_health_within(*g, id, Duration::from_secs(4))
                     .await
                     .unwrap_or_else(|e| admin::StoreHealth {
                         error: Some(e.to_string()),
@@ -1066,10 +1103,22 @@ impl Placer {
     /// Every host's per-file usage since `since_ms`, by node. Hosts that do
     /// not answer are left out (their files look unused: callers that
     /// remove copies must treat a missing host as unknown, not idle).
-    pub async fn usage(
-        &self,
-        since_ms: u64,
-    ) -> NestResult<HashMap<NodeId, HashMap<FileId, nest_data::usage::FileUsage>>> {
+    pub async fn usage(&self, since_ms: u64) -> NestResult<UsageMap> {
+        // Usage moves slowly: the same window within a few seconds is
+        // answered from memory (the Models page asks on every refresh).
+        let key = since_ms / 60_000;
+        if let Some((k, at, v)) = &*self.usage_cache.lock()
+            && *k == key
+            && at.elapsed() < Duration::from_secs(10)
+        {
+            return Ok(v.clone());
+        }
+        let v = self.usage_uncached(since_ms).await?;
+        *self.usage_cache.lock() = Some((key, std::time::Instant::now(), v.clone()));
+        Ok(v)
+    }
+
+    async fn usage_uncached(&self, since_ms: u64) -> NestResult<UsageMap> {
         let nodes = self.nodes()?;
         let me = self.vfs.data().id();
         let got = futures::future::join_all(nodes.iter().map(|h| async move {
@@ -1086,7 +1135,7 @@ impl Placer {
                 self.rpc(),
                 h.node,
                 &AdminReq::Usage { since_ms },
-                Duration::from_secs(5),
+                Duration::from_secs(3),
             )
             .await;
             (h.node, r)
