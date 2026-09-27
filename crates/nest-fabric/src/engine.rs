@@ -195,8 +195,29 @@ struct Lane {
     dead: AtomicBool,
 }
 
-/// A client waiting for a read: (lane used, completion).
-type Waiter = (u32, oneshot::Sender<Result<usize, NestError>>);
+/// A read in flight. The pending table owns its landing slot until the
+/// peer answers: a reader that gives up (its future dropped, e.g. readahead
+/// cancelling a chunk) must not return the slot to the pool while the peer
+/// may still write into it, or the next request given that slot would take
+/// this request's answer (its bytes and length) as its own.
+struct Waiter {
+    lane: u32,
+    slot: Slot,
+    tx: oneshot::Sender<Result<(usize, Slot), NestError>>,
+}
+
+impl Waiter {
+    /// The peer wrote `len` bytes: hand the slot to the reader, or free it
+    /// if the reader has gone.
+    fn complete(self, len: usize) {
+        let _ = self.tx.send(Ok((len, self.slot)));
+    }
+
+    /// The peer will not write: the slot is free again.
+    fn fail(self, e: NestError) {
+        let _ = self.tx.send(Err(e));
+    }
+}
 
 struct Link {
     lanes: Vec<Arc<Lane>>,
@@ -595,7 +616,6 @@ impl Fabric {
         }
         let (tx, rx) = oneshot::channel();
         let key = (lane.dev.id, slot.index());
-        self.pending.lock().insert(key, (lane.id, tx));
         let mut msg = [0u8; MSG_SIZE];
         ReadReq {
             slot: slot.index(),
@@ -607,6 +627,15 @@ impl Fabric {
             rkey: slot.rkey(),
         }
         .encode(&mut msg);
+        // From here the slot belongs to the pending table until the answer.
+        self.pending.lock().insert(
+            key,
+            Waiter {
+                lane: lane.id,
+                slot,
+                tx,
+            },
+        );
         // SAFETY: inline send copies the message at post time.
         let posted = unsafe {
             lane.qp.post_send(
@@ -618,7 +647,8 @@ impl Fabric {
             )
         };
         if let Err(e) = posted {
-            self.pending.lock().remove(&key);
+            // Never sent: nothing will write the slot.
+            drop(self.pending.lock().remove(&key));
             self.fail_lane(&lane);
             return Err(NestError::Unavailable(e.to_string()));
         }
@@ -630,16 +660,17 @@ impl Fabric {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(NestError::Unavailable("RDMA link failed".into())),
             Err(_) => {
-                self.pending.lock().remove(&key);
-                // The slot may still be written later: never reuse it on
-                // this lane. Retiring the link fences the NIC.
+                // The slot may still be written later: never reuse it.
+                // Retiring the link fences the NIC.
+                if let Some(w) = self.pending.lock().remove(&key) {
+                    std::mem::forget(w.slot);
+                }
                 self.fail_lane(&lane);
-                std::mem::forget(slot);
                 return Err(NestError::Unavailable("RDMA read timed out".into()));
             }
         };
         match r {
-            Ok(n) => {
+            Ok((n, slot)) => {
                 self.stats.reads.fetch_add(1, Ordering::Relaxed);
                 self.stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 Ok(ReadBuf { slot, len: n })
@@ -658,11 +689,14 @@ impl Fabric {
             let mut p = self.pending.lock();
             let keys: Vec<_> = p
                 .iter()
-                .filter(|(_, (l, _))| *l == lane.id)
+                .filter(|(_, w)| w.lane == lane.id)
                 .map(|(k, _)| *k)
                 .collect();
             for k in keys {
-                if let Some((_, tx)) = p.remove(&k) {
+                if let Some(w) = p.remove(&k) {
+                    // As on a timeout: a write may still land in the slot.
+                    let Waiter { slot, tx, .. } = w;
+                    std::mem::forget(slot);
                     let _ = tx.send(Err(NestError::Unavailable("RDMA link failed".into())));
                 }
             }
@@ -690,8 +724,9 @@ impl Fabric {
             (WR_RING, sys::NF_OP_RECV_IMM) => {
                 let slot = wc.imm >> IMM_LEN_BITS;
                 let len = (wc.imm & ((1 << IMM_LEN_BITS) - 1)) as usize;
-                if let Some((_, tx)) = self.pending.lock().remove(&(dev.id, slot)) {
-                    let _ = tx.send(Ok(len));
+                let w = self.pending.lock().remove(&(dev.id, slot));
+                if let Some(w) = w {
+                    w.complete(len);
                 }
                 if let Some(l) = lane {
                     let _ = self.post_ring(&l, idx);
@@ -708,8 +743,9 @@ impl Fabric {
                     Some(KIND_READ) if msg.len() >= 48 => self.serve(l, ReadReq::decode(&msg)),
                     Some(KIND_ERR) if msg.len() >= 8 => {
                         let slot = u32::from_le_bytes(msg[4..8].try_into().unwrap());
-                        if let Some((_, tx)) = self.pending.lock().remove(&(dev.id, slot)) {
-                            let _ = tx.send(Err(err_from(msg[1])));
+                        let w = self.pending.lock().remove(&(dev.id, slot));
+                        if let Some(w) = w {
+                            w.fail(err_from(msg[1]));
                         }
                     }
                     _ => tracing::warn!(peer = %l.peer, "unrecognized fabric message"),

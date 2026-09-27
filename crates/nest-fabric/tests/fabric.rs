@@ -152,3 +152,86 @@ async fn read_protocol_over_loopback() {
     f1.shutdown();
     f2.shutdown();
 }
+
+/// Like `Synthetic`, but every answer takes a while (a busy disk).
+struct Slow;
+
+impl ReadSource for Slow {
+    fn read_into(
+        &self,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: usize,
+        buf: Slot,
+    ) -> BoxFuture<'static, (Slot, Result<usize, NestError>)> {
+        async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Synthetic
+                .read_into(file, generation, offset, len, buf)
+                .await
+        }
+        .boxed()
+    }
+}
+
+/// A reader that gives up on a read (readahead cancelling a chunk) must
+/// not let the next read of that landing slot take the late answer as its
+/// own: that surfaced as short reads (a tail chunk's length) and wrong bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cancelled_reads_never_answer_later_ones() {
+    let cfg = FabricConfig {
+        chunk: 4 << 20,
+        client_slots: 8,
+        server_slots: 8,
+        window: 8,
+        devices: vec![],
+        max_inflight: 64,
+    };
+    let Some((rpc1, f1)) = node(1, cfg.clone()).await else {
+        return;
+    };
+    let (rpc2, f2) = node(2, cfg).await.unwrap();
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+    let src: Arc<dyn ReadSource> = Arc::new(Slow);
+    f1.set_source(Arc::downgrade(&src));
+    // Warm the link up.
+    f2.read(NodeId(1), FileId(7), Generation(3), 0, 4096)
+        .await
+        .unwrap();
+    for round in 0..4 {
+        // Tail reads (1000 bytes each) abandoned while the peer works on them.
+        for _ in 0..8 {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(2),
+                f2.read(NodeId(1), FileId(7), Generation(3), SIZE - 1000, 4 << 20),
+            )
+            .await;
+        }
+        // Full chunks right after, reusing the same slots.
+        let mut tasks = Vec::new();
+        for i in 0..16u64 {
+            let f2 = f2.clone();
+            tasks.push(tokio::spawn(async move {
+                let off = i * (4 << 20);
+                let b = f2
+                    .read(NodeId(1), FileId(7), Generation(3), off, 4 << 20)
+                    .await
+                    .unwrap();
+                assert_eq!(b.len(), 4 << 20, "round {round} read {i}: short");
+                assert!(
+                    b.as_slice()
+                        .iter()
+                        .enumerate()
+                        .step_by(4099)
+                        .all(|(k, v)| *v == byte(off + k as u64)),
+                    "round {round} read {i}: wrong bytes"
+                );
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+    }
+}
