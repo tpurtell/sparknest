@@ -1,14 +1,22 @@
 //! Which copy to read a chunk from (ADR-030).
 //!
 //! A STABLE file with copies on several hosts can be read from any of
-//! them: the local disk, or any holder over the fabric. Each chunk goes to
-//! the source with the lowest expected wait, `latency × (in flight + 1)`,
-//! where latency is a peak-sensitive moving average of recent chunk reads
-//! from that source (it jumps up at once when a source slows and decays
-//! over a couple of seconds). An idle local disk always wins: the network
-//! is used to add bandwidth once the local disk is busy, not instead of it.
-//! Sources that are faster (raptor's disk, a page-cache hit) earn more
-//! chunks without being told.
+//! them: the local disk, or any holder over the fabric. Each source's
+//! expected wait is `latency × (in flight + 1)`, latency being a
+//! peak-sensitive moving average of its recent chunk reads (it jumps up at
+//! once when a source slows and decays over a couple of seconds).
+//!
+//! - The local disk goes first while it keeps up: it takes a chunk unless
+//!   its expected wait is more than `SLACK` times the best available.
+//! - What the local disk cannot take goes to the other holders by
+//!   rendezvous hashing: the file is cut into stripes, each stripe ranks
+//!   the holders by a hash of (file, stripe, holder), and the first-ranked
+//!   holder not clearly busier than the best takes it. Hosts that load the
+//!   same file at once (a model loaded on every Spark at boot) send the same
+//!   stripe to the same holder, which reads it from disk once and serves
+//!   the rest from its page cache; a busy holder sheds stripes to the next.
+//! - Faster sources (raptor's disk, a page-cache hit) keep more work
+//!   without being told.
 //!
 //! The same table records bytes per source over a sliding window for
 //! `nest io`, which prints what each host has learned.
@@ -24,6 +32,19 @@ use std::time::{Duration, Instant};
 pub enum Source {
     Local,
     Peer(NodeId),
+}
+
+/// How much busier than the best choice a preferred source may be.
+const SLACK: f64 = 2.0;
+
+/// Rendezvous weight of holder `node` for `key` (a stripe of a file): the
+/// same on every host.
+fn weight(key: u64, node: NodeId) -> u64 {
+    // SplitMix64 of the pair.
+    let mut z = key ^ node.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Latency assumed before a source has been measured, per chunk.
@@ -151,29 +172,37 @@ impl Drop for Ticket {
 }
 
 impl Balancer {
-    /// Pick the source for the next chunk among `candidates` (non-empty)
-    /// and count it in flight.
-    pub fn pick(self: &Arc<Self>, candidates: &[Source]) -> Ticket {
+    /// Pick the source for the next chunk of stripe `key` among
+    /// `candidates` (non-empty) and count it in flight.
+    pub fn pick(self: &Arc<Self>, candidates: &[Source], key: u64) -> Ticket {
         let mut st = self.stats.lock();
-        let local_idle = candidates.contains(&Source::Local)
-            && st.get(&Source::Local).is_none_or(|s| s.in_flight == 0);
-        let src = if local_idle {
+        let score = |s: &Source| {
+            st.get(s)
+                .map_or_else(|| Stat::new(*s).score(), |x| x.score())
+        };
+        let best = candidates.iter().map(&score).fold(f64::INFINITY, f64::min);
+        let src = if candidates.contains(&Source::Local) && score(&Source::Local) <= best * SLACK {
             Source::Local
         } else {
-            *candidates
+            let mut peers: Vec<NodeId> = candidates
                 .iter()
-                .min_by(|a, b| {
-                    let sa = st
-                        .get(a)
-                        .map_or_else(|| Stat::new(**a).score(), |s| s.score());
-                    let sb = st
-                        .get(b)
-                        .map_or_else(|| Stat::new(**b).score(), |s| s.score());
-                    // Ties go to the local disk.
-                    sa.total_cmp(&sb)
-                        .then_with(|| (**b == Source::Local).cmp(&(**a == Source::Local)))
+                .filter_map(|s| match s {
+                    Source::Peer(n) => Some(*n),
+                    Source::Local => None,
                 })
-                .expect("candidates")
+                .collect();
+            peers.sort_by_key(|n| std::cmp::Reverse(weight(key, *n)));
+            peers
+                .into_iter()
+                .map(Source::Peer)
+                .find(|s| score(s) <= best * SLACK)
+                .unwrap_or_else(|| {
+                    // Only the local disk qualified after all.
+                    *candidates
+                        .iter()
+                        .min_by(|a, b| score(a).total_cmp(&score(b)))
+                        .expect("candidates")
+                })
         };
         st.entry(src).or_insert_with(|| Stat::new(src)).in_flight += 1;
         Ticket {
@@ -247,45 +276,76 @@ mod tests {
     }
 
     #[test]
-    fn idle_local_first_then_spill_to_the_fastest_peer() {
+    fn local_first_then_the_stripe_ranked_peer() {
         let b = Arc::new(Balancer::default());
         let all = [Source::Local, A, B];
-        // Idle local disk wins even with peers available.
-        let t1 = b.pick(&all);
-        assert_eq!(t1.source(), Source::Local);
-        // Local busy: a peer takes the next chunk.
-        let t2 = b.pick(&all);
-        assert_ne!(t2.source(), Source::Local);
-        t2.finish(4 << 20);
-        t1.finish(4 << 20);
-        teach(&b, Source::Local, 0.003);
-        teach(&b, A, 0.001);
-        teach(&b, B, 0.010);
-        // Local busy again: the faster peer is chosen over the slower one,
-        // and with A busy too, local (3 ms × 2) still beats B (10 ms).
-        let l = b.pick(&all);
-        assert_eq!(l.source(), Source::Local);
-        let a = b.pick(&all);
-        assert_eq!(a.source(), A);
-        let third = b.pick(&all);
-        assert_eq!(
-            third.source(),
-            A,
-            "A: 1 ms × 2 beats local 3 ms × 2 and B 10 ms"
-        );
-        drop(third); // abandoned: not an error
-        drop(a);
-        l.fail();
+        for s in all {
+            teach(&b, s, 0.002);
+        }
+        // Local takes chunks while within SLACK of the best (idle peers:
+        // 2 ms); at 2 in flight it is at 6 ms > 2 × 2 ms, so the next spills.
+        let l1 = b.pick(&all, 7);
+        let l2 = b.pick(&all, 7);
+        assert_eq!((l1.source(), l2.source()), (Source::Local, Source::Local));
+        let spill = b.pick(&all, 7);
+        assert_ne!(spill.source(), Source::Local);
+        // The spill is the stripe's first-ranked peer, the same on any host.
+        let first = if weight(7, NodeId(2)) > weight(7, NodeId(3)) {
+            A
+        } else {
+            B
+        };
+        assert_eq!(spill.source(), first);
+        drop((l1, l2, spill));
+    }
+
+    #[test]
+    fn hosts_spilling_the_same_stripe_ask_the_same_holder() {
+        // Hosts 1 and 2 both busy locally; holders 3, 4, 5 shared.
+        let peers = [NodeId(3), NodeId(4), NodeId(5)];
+        // Each host has its own balancer and a saturated local disk.
+        let pick_on = |key: u64| {
+            let b = Arc::new(Balancer::default());
+            teach(&b, Source::Local, 1.0);
+            let mut c: Vec<Source> = peers.iter().map(|n| Source::Peer(*n)).collect();
+            c.push(Source::Local);
+            b.pick(&c, key).source()
+        };
+        let mut spread = std::collections::HashMap::new();
+        for key in 0..300u64 {
+            let (x, y) = (pick_on(key), pick_on(key));
+            assert_eq!(x, y, "stripe {key}");
+            *spread.entry(format!("{x:?}")).or_insert(0) += 1;
+        }
+        assert_eq!(spread.len(), 3, "{spread:?}");
+        assert!(spread.values().all(|n| *n > 60), "{spread:?}");
+    }
+
+    #[test]
+    fn a_busy_peer_sheds_and_failures_count() {
+        let b = Arc::new(Balancer::default());
+        let peers = [A, B];
+        teach(&b, A, 0.002);
+        teach(&b, B, 0.002);
+        let key = (0..1000u64)
+            .find(|k| weight(*k, NodeId(2)) > weight(*k, NodeId(3)))
+            .unwrap();
+        let held: Vec<Ticket> = (0..3).map(|_| b.pick(&[A], key)).collect();
+        // A: 2 ms × 4 = 8 ms > 2 × B's 2 ms: the stripe goes to B.
+        let t = b.pick(&peers, key);
+        assert_eq!(t.source(), B);
+        drop(held);
+        let t2 = b.pick(&peers, key);
+        assert_eq!(t2.source(), A, "idle again: back to its first choice");
+        t2.fail(); // a failure counts; an abandoned read does not
+        drop(t);
         let r = b.report();
+        assert!(r.iter().any(|x| x.source == A && x.errors == 1), "{r:?}");
         assert!(
-            r.iter().any(|x| x.source == Source::Local && x.errors == 1),
+            r.iter()
+                .all(|x| x.in_flight == 0 && (x.source == A || x.errors == 0)),
             "{r:?}"
         );
-        assert!(
-            r.iter().all(|x| x.source == Source::Local || x.errors == 0),
-            "{r:?}"
-        );
-        assert!(r.iter().all(|x| x.in_flight == 0), "{r:?}");
     }
 
     #[test]

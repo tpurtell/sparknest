@@ -110,6 +110,8 @@ pub struct Placer {
     /// Recent answers the web UI asks for every few seconds.
     usage_cache: Mutex<Option<(u64, std::time::Instant, UsageMap)>>,
     stores_cache: Mutex<Option<(std::time::Instant, Vec<StoreStatus>)>>,
+    /// Each host's last answer to Info, for live views.
+    info_cache: Mutex<HashMap<NodeId, admin::NodeInfo>>,
     plans: Mutex<HashMap<u64, crate::plan::Plan>>,
     next_job: AtomicU64,
     dirty: Arc<tokio::sync::Notify>,
@@ -193,6 +195,7 @@ impl Placer {
             imports: Mutex::new(HashMap::new()),
             usage_cache: Mutex::new(None),
             stores_cache: Mutex::new(None),
+            info_cache: Mutex::new(HashMap::new()),
             plans: Mutex::new(HashMap::new()),
             next_job: AtomicU64::new(rand::random::<u32>() as u64),
             dirty: Arc::new(tokio::sync::Notify::new()),
@@ -512,13 +515,23 @@ impl Placer {
     /// `stores()`, reusing an answer up to 5 s old: for listings the UI
     /// polls (a NAS share can be slow to report under load). Placement
     /// decisions use `stores()`.
-    pub async fn stores_listing(&self) -> NestResult<Vec<StoreStatus>> {
-        if let Some((at, v)) = &*self.stores_cache.lock()
-            && at.elapsed() < Duration::from_secs(5)
-        {
-            return Ok(v.clone());
+    pub async fn stores_listing(self: &Arc<Self>) -> NestResult<Vec<StoreStatus>> {
+        let cached = self.stores_cache.lock().clone();
+        match cached {
+            Some((at, v)) if at.elapsed() < Duration::from_secs(5) => Ok(v),
+            // Stale: answer at once and refresh in the background, so a slow
+            // NAS never holds up a live view.
+            Some((_, v)) => {
+                // One refresh at a time: count this answer as fresh meanwhile.
+                *self.stores_cache.lock() = Some((std::time::Instant::now(), v.clone()));
+                let me = self.clone();
+                tokio::spawn(async move {
+                    let _ = me.stores().await;
+                });
+                Ok(v)
+            }
+            None => self.stores().await,
         }
-        self.stores().await
     }
 
     async fn stores_uncached(&self) -> NestResult<Vec<StoreStatus>> {
@@ -574,12 +587,33 @@ impl Placer {
     }
 
     pub async fn status(&self) -> NestResult<Vec<NodeStatus>> {
+        self.status_within(Duration::from_secs(3)).await
+    }
+
+    /// `status` for live views: a host that does not answer within a
+    /// second is shown as it last answered (a busy host must not hold up
+    /// everyone's picture); one that has never answered shows its error.
+    pub async fn status_live(&self) -> NestResult<Vec<NodeStatus>> {
+        let mut v = self.status_within(Duration::from_millis(900)).await?;
+        let last = self.info_cache.lock();
+        for n in &mut v {
+            if n.info.is_none()
+                && let Some(i) = last.get(&n.node)
+            {
+                n.info = Some(i.clone());
+                n.error = None;
+            }
+        }
+        Ok(v)
+    }
+
+    async fn status_within(&self, within: Duration) -> NestResult<Vec<NodeStatus>> {
         let nodes = self.nodes()?;
         let infos = futures::future::join_all(nodes.iter().map(|h| async move {
             if h.node == self.vfs.data().id() {
                 return (h.clone(), Ok(self.admin.info()));
             }
-            let r = admin::call(self.rpc(), h.node, &AdminReq::Info, Duration::from_secs(3)).await;
+            let r = admin::call(self.rpc(), h.node, &AdminReq::Info, within).await;
             (
                 h.clone(),
                 r.and_then(|r| match r {
@@ -589,6 +623,14 @@ impl Placer {
             )
         }))
         .await;
+        {
+            let mut c = self.info_cache.lock();
+            for (h, r) in &infos {
+                if let Ok(i) = r {
+                    c.insert(h.node, i.clone());
+                }
+            }
+        }
         Ok(infos
             .into_iter()
             .map(|(h, r)| NodeStatus {

@@ -236,7 +236,18 @@ async fn status(State(api): State<Api>) -> R<serde_json::Value> {
 }
 
 pub(crate) async fn status_json(api: &Api) -> Result<serde_json::Value, ApiError> {
-    let nodes = api.placer.status().await?;
+    status_json_with(api, api.placer.status().await?).await
+}
+
+/// For live views: busy hosts answer from their last report.
+pub(crate) async fn status_json_live(api: &Api) -> Result<serde_json::Value, ApiError> {
+    status_json_with(api, api.placer.status_live().await?).await
+}
+
+async fn status_json_with(
+    api: &Api,
+    nodes: Vec<nest_place::placer::NodeStatus>,
+) -> Result<serde_json::Value, ApiError> {
     let d = api.vfs.data();
     let t = api.vfs.statfs().map(|(_, n)| n).unwrap_or(0);
     Ok(json!({

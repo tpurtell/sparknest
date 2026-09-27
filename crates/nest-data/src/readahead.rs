@@ -10,14 +10,15 @@
 //! copies given: this host's disk (a pread on the blocking pool) or a holder
 //! over the fabric. A source that fails a chunk (its copy gone, a peer
 //! down) is dropped for this stream and the chunk is fetched elsewhere.
-//! Fabric chunks stay in their registered landing slots (no extra copy)
-//! until the reader moves past them; speculative fabric chunks are only
-//! requested while the node has spare slots, so a demanded read can always
-//! get one (PROPOSAL invariant 9). Everything held here is transient:
+//! Fabric chunks are copied out of their registered landing slot on arrival
+//! (holding slots until the reader got there starved new requests);
+//! speculative fabric chunks are still only requested while the node has
+//! spare slots, so a demanded read can always get one (PROPOSAL
+//! invariant 9). Everything held here is transient:
 //! reading never creates a replica.
 
 use crate::balance::{Balancer, Source};
-use nest_fabric::{Fabric, ReadBuf};
+use nest_fabric::Fabric;
 use nest_store::{ObjectKey, ObjectStore};
 use nest_types::{FileId, Generation, NestError, NestResult};
 use std::collections::BTreeMap;
@@ -25,20 +26,18 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-enum Buf {
-    Fabric(ReadBuf),
-    Local(Vec<u8>),
-}
+/// A fetched chunk. Fabric chunks are copied out of their landing slot as
+/// soon as they arrive: a slot held until the reader got there (chunks from
+/// other hosts arrive ahead of the local ones) starved new requests of
+/// slots, and waiting for one dominated the latency of remote chunks.
+struct Buf(Vec<u8>);
 
 impl Buf {
     fn as_slice(&self) -> &[u8] {
-        match self {
-            Buf::Fabric(b) => b.as_slice(),
-            Buf::Local(v) => v,
-        }
+        &self.0
     }
     fn len(&self) -> usize {
-        self.as_slice().len()
+        self.0.len()
     }
 }
 
@@ -111,11 +110,31 @@ impl Readahead {
         (s[0], s[1])
     }
 
-    fn fetch(&mut self, fabric: &Arc<Fabric>, start: u64) {
+    /// Start fetching the chunk at `start`. A speculative chunk may use a
+    /// fabric landing slot only while slots are spare: fetched chunks hold
+    /// their slot until the reader consumes them, so speculation must never
+    /// take the slots a demanded read needs (PROPOSAL invariant 9; without
+    /// this, many readers reading ahead deadlock). With slots short it goes
+    /// to the local disk if there is a copy, else waits.
+    fn fetch(&mut self, fabric: &Arc<Fabric>, start: u64, speculative: bool) {
         if self.chunks.contains_key(&start) || self.eof.is_some_and(|e| start >= e) {
             return;
         }
-        let ticket = self.balancer.pick(&self.sources);
+        let slots_short = fabric.spare_landing() <= fabric.landing_slots() / 4;
+        let local_only = [Source::Local];
+        let candidates: &[Source] = if speculative && slots_short {
+            if !self.sources.contains(&Source::Local) {
+                return;
+            }
+            &local_only
+        } else {
+            &self.sources
+        };
+        // Stripes of 32 MiB: long sequential reads for the serving disk, yet
+        // enough of them to spread a model over every copy.
+        let stripe = start / (8 * self.chunk);
+        let key = self.file.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ stripe;
+        let ticket = self.balancer.pick(candidates, key);
         let src = ticket.source();
         let (file, generation, len) = (self.file, self.generation, self.chunk as usize);
         let task = match src {
@@ -151,7 +170,7 @@ impl Readahead {
                     match r {
                         Ok(buf) => {
                             ticket.finish(buf.len() as u64);
-                            Ok(Buf::Local(buf))
+                            Ok(Buf(buf))
                         }
                         Err(e) => {
                             ticket.fail();
@@ -165,8 +184,10 @@ impl Readahead {
                 self.rt.spawn(async move {
                     match f.read(node, file, generation, start, len).await {
                         Ok(b) => {
-                            ticket.finish(b.len() as u64);
-                            Ok(Buf::Fabric(b))
+                            let v = b.as_slice().to_vec();
+                            drop(b); // the landing slot is free again
+                            ticket.finish(v.len() as u64);
+                            Ok(Buf(v))
                         }
                         Err(e) => {
                             ticket.fail();
@@ -198,7 +219,7 @@ impl Readahead {
                 Err(e) if self.sources.len() > 1 => {
                     tracing::debug!(file = self.file.0, ?src, error = %e, "chunk source failed; trying another copy");
                     self.sources.retain(|s| *s != src);
-                    self.fetch(fabric, start);
+                    self.fetch(fabric, start, false);
                 }
                 Err(e) => return Err(e),
             }
@@ -254,17 +275,12 @@ impl Readahead {
         Some(out)
     }
 
-    /// Top up the window after `[offset, offset+size)`: fabric chunks only
-    /// while landing slots are spare.
+    /// Top up the window after `[offset, offset+size)` with speculative
+    /// chunks (fabric ones only while landing slots are spare).
     fn top_up(&mut self, fabric: &Arc<Fabric>, last: u64) {
         let c = self.chunk;
-        let reserve = fabric.landing_slots() / 4;
-        let peers_only = !self.sources.contains(&Source::Local);
         for i in 1..self.window as u64 {
-            if peers_only && fabric.spare_landing() <= reserve {
-                break;
-            }
-            self.fetch(fabric, last + i * c);
+            self.fetch(fabric, last + i * c, true);
         }
     }
 
@@ -307,7 +323,7 @@ impl Readahead {
         let last = (offset + size as u64).saturating_sub(1) / c * c;
         let mut s = first;
         while s <= last {
-            self.fetch(fabric, s);
+            self.fetch(fabric, s, false);
             s += c;
         }
         self.top_up(fabric, last);

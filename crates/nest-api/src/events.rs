@@ -53,7 +53,7 @@ impl Default for Events {
 
 /// What the UI's shell shows everywhere.
 async fn snapshot(api: &Api) -> Option<String> {
-    let status = crate::status_json(api).await.ok()?;
+    let status = crate::status_json_live(api).await.ok()?;
     let stores = api.placer.stores_listing().await.unwrap_or_default();
     let groups: Vec<_> = api
         .placer
