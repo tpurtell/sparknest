@@ -1508,9 +1508,11 @@ async fn main() -> Result<()> {
                     }
                     if io.is_empty() {
                         println!("{host}: {caps}; no spread reads yet");
+                        io_window_table(&n["info"]["io_windows"][1]);
                         continue;
                     }
                     println!("{host}: {caps}");
+                    io_window_table(&n["info"]["io_windows"][1]);
                     println!(
                         "    {:<10} {:>10} {:>8} {:>12} {:>12} {:>7}",
                         "source", "latency", "flight", "last 10 s", "total", "errors"
@@ -1797,4 +1799,54 @@ fn is_sparknest_mount(mp: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Read latencies by kind and size over one window (`nest io`).
+fn io_window_table(w: &Value) {
+    let classes = w["classes"].as_array().cloned().unwrap_or_default();
+    let secs = w["ms"].as_u64().unwrap_or(0) as f64 / 1000.0;
+    if classes.is_empty() || secs <= 0.0 {
+        return;
+    }
+    let us = |v: &Value| match v.as_u64().unwrap_or(0) {
+        u if u >= 10_000 => format!("{:.0}ms", u as f64 / 1000.0),
+        u if u >= 1000 => format!("{:.1}ms", u as f64 / 1000.0),
+        u => format!("{u}us"),
+    };
+    println!(
+        "    last {:.0} s: {:<7} {:>6} {:>9} {:>11} {:>7} {:>7} {:>7} {:>7}",
+        secs, "reads", "size", "per s", "rate", "mean", "p50", "p90", "p99"
+    );
+    for c in &classes {
+        let size = match c["max_bytes"].as_u64().unwrap_or(0) {
+            0 => ">128K".to_string(),
+            b => format!("≤{}K", b >> 10),
+        };
+        let kind = match c["kind"].as_str().unwrap_or("") {
+            "Disk" => "disk",
+            "Fabric" => "fabric",
+            "Served" => "served",
+            k => k,
+        };
+        println!(
+            "    {:<14} {:>6} {:>9.0} {:>9}/s {:>7} {:>7} {:>7} {:>7}",
+            kind,
+            size,
+            c["count"].as_u64().unwrap_or(0) as f64 / secs,
+            human((c["bytes"].as_u64().unwrap_or(0) as f64 / secs) as u64),
+            us(&c["mean_us"]),
+            us(&c["p50_us"]),
+            us(&c["p90_us"]),
+            us(&c["p99_us"])
+        );
+    }
+    let dropped = w["readahead_dropped"].as_u64().unwrap_or(0);
+    if dropped > 0 {
+        let used = w["readahead_used"].as_u64().unwrap_or(0);
+        println!(
+            "    readahead: dropped {} of chunks, {:.0}% unused",
+            human(dropped),
+            100.0 * (1.0 - used as f64 / dropped as f64)
+        );
+    }
 }

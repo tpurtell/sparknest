@@ -348,6 +348,8 @@ pub struct Fabric {
     /// Staging slots held until their write-with-imm completes.
     in_flight: Mutex<HashMap<u64, Slot>>,
     source: Mutex<Option<Weak<dyn ReadSource>>>,
+    /// Where read latencies are recorded (set by the host's data layer).
+    io: std::sync::OnceLock<Arc<crate::iostats::IoStats>>,
     rt: tokio::runtime::Handle,
     stop: Arc<AtomicBool>,
     /// The incast cap, in `BUDGET_UNIT`s of bytes.
@@ -455,6 +457,7 @@ impl Fabric {
             inflight: Arc::new(Semaphore::new((budget / BUDGET_UNIT as u64) as usize)),
             link_bps: link,
             stats: Stats::default(),
+            io: std::sync::OnceLock::new(),
         });
         for d in &fabric.devices {
             let (weak, dev, stop) = (Arc::downgrade(&fabric), d.clone(), fabric.stop.clone());
@@ -487,6 +490,17 @@ impl Fabric {
 
     pub fn set_source(&self, source: Weak<dyn ReadSource>) {
         *self.source.lock() = Some(source);
+    }
+
+    /// Record read latencies into `io` (reads made and served).
+    pub fn set_io_stats(&self, io: Arc<crate::iostats::IoStats>) {
+        let _ = self.io.set(io);
+    }
+
+    fn record(&self, kind: crate::iostats::Kind, bytes: usize, took: Duration) {
+        if let Some(io) = self.io.get() {
+            io.record(kind, bytes as u64, took);
+        }
     }
 
     pub fn shutdown(&self) {
@@ -816,6 +830,7 @@ impl Fabric {
             Ok((n, slot)) => {
                 self.stats.reads.fetch_add(1, Ordering::Relaxed);
                 self.stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                self.record(crate::iostats::Kind::Fabric, len, t0.elapsed());
                 Ok(ReadBuf { slot, len: n })
             }
             Err(e) => Err(e),
@@ -925,6 +940,7 @@ impl Fabric {
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Some(answer.map(|(n, slot)| {
             dst[..n].copy_from_slice(slot.as_slice(n));
+            self.record(crate::iostats::Kind::Fabric, len, t0.elapsed());
             self.stats.reads.fetch_add(1, Ordering::Relaxed);
             self.stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
             self.stats.read_now.fetch_add(1, Ordering::Relaxed);
@@ -1035,6 +1051,7 @@ impl Fabric {
                     self.stats
                         .serve_read_ns
                         .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.record(crate::iostats::Kind::Served, len, t.elapsed());
                     self.stats.served_fast.fetch_add(1, Ordering::Relaxed);
                     self.answer(&lane, &req, r.map(|n| (slot, n)));
                     return;
@@ -1069,6 +1086,7 @@ impl Fabric {
                     me.stats
                         .serve_read_ns
                         .fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    me.record(crate::iostats::Kind::Served, len, t1.elapsed());
                     r.map(|n| (slot, n))
                 }
             };

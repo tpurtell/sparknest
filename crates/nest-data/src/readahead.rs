@@ -69,6 +69,7 @@ pub(crate) struct Readahead {
     /// Bytes handed out, by origin (local, remote), for usage accounting.
     served: [u64; 2],
     patterns: Arc<Patterns>,
+    io: Arc<nest_fabric::iostats::IoStats>,
     /// Dropped chunks not yet reported: bytes, and bytes of them consumed.
     dropped: (u64, u64),
     /// Captured at creation: fetches may be started from a FUSE thread that
@@ -85,6 +86,7 @@ impl Readahead {
         fabric: &Fabric,
         balancer: Arc<Balancer>,
         patterns: Arc<Patterns>,
+        io: Arc<nest_fabric::iostats::IoStats>,
         file: FileId,
         generation: Generation,
         sources: Vec<Source>,
@@ -106,6 +108,7 @@ impl Readahead {
             chunks: BTreeMap::new(),
             served: [0, 0],
             patterns,
+            io,
             dropped: (0, 0),
             rt: tokio::runtime::Handle::current(),
         }
@@ -152,6 +155,7 @@ impl Readahead {
         let task = match src {
             Source::Local => {
                 let store = self.local.clone();
+                let io = self.io.clone();
                 self.rt.spawn(async move {
                     let r = tokio::task::spawn_blocking(move || -> NestResult<Vec<u8>> {
                         let store =
@@ -164,6 +168,7 @@ impl Readahead {
                             })?;
                         let mut buf = vec![0u8; len];
                         let mut got = 0;
+                        let t = std::time::Instant::now();
                         while got < len {
                             let n = f
                                 .read_at(&mut buf[got..], start + got as u64)
@@ -174,6 +179,7 @@ impl Readahead {
                             got += n;
                         }
                         buf.truncate(got);
+                        io.record(nest_fabric::iostats::Kind::Disk, len as u64, t.elapsed());
                         Ok(buf)
                     })
                     .await
@@ -257,6 +263,7 @@ impl Readahead {
         };
         self.dropped.0 += bytes;
         self.dropped.1 += used;
+        self.io.readahead(bytes, used);
         if self.dropped.0 >= 8 * self.chunk {
             self.report();
         }

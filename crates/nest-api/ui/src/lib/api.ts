@@ -88,6 +88,8 @@ export interface NodeInfo {
   /** Readahead chunks fetched and dropped, and bytes of them used. */
   readahead_dropped_bytes?: number;
   readahead_used_bytes?: number;
+  /** Read latencies by kind and size, readahead waste: last 10 s, 1 min, 10 min. */
+  io_windows?: IoWindow[];
   io?: SourceReport[];
   disk_read_bps?: number;
   link_bps?: number;
@@ -149,6 +151,23 @@ export interface Job {
   notes?: string[];
   /** The host that runs it. */
   node?: string;
+}
+export interface IoClass {
+  kind: "Disk" | "Fabric" | "Served";
+  /** Upper bound of the size class, bytes (0: larger). */
+  max_bytes: number;
+  count: number;
+  bytes: number;
+  mean_us: number;
+  p50_us: number;
+  p90_us: number;
+  p99_us: number;
+}
+export interface IoWindow {
+  ms: number;
+  classes: IoClass[];
+  readahead_dropped: number;
+  readahead_used: number;
 }
 export interface Readiness {
   host: string;

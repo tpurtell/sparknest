@@ -182,6 +182,8 @@ pub struct Vfs {
     balancer: Arc<crate::balance::Balancer>,
     /// Which files are read in scattered pieces (read directly).
     patterns: Arc<crate::pattern::Patterns>,
+    /// Read latencies by kind and size, over recent windows.
+    io: Arc<nest_fabric::iostats::IoStats>,
     /// This host's measured disk read rate (bytes/s; 0 until measured).
     disk_bps: Arc<AtomicU64>,
     /// Revocation state per (file, epoch) this node was granted.
@@ -278,6 +280,7 @@ impl Vfs {
             usage: Arc::new(crate::usage::Usage::open(d.store().root())),
             balancer: Arc::new(crate::balance::Balancer::default()),
             patterns: Arc::default(),
+            io: Arc::default(),
             disk_bps: Arc::new(AtomicU64::new(
                 crate::diskprobe::load(d.store().root()).map_or(0, |b| b.bytes_per_s),
             )),
@@ -318,6 +321,7 @@ impl Vfs {
         // by the data node; nothing to adopt here.
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(fold_usage(Arc::downgrade(&vfs)));
+            tokio::spawn(roll_io_stats(Arc::downgrade(&vfs.io)));
             tokio::spawn(probe_disk(Arc::downgrade(&vfs)));
         }
         vfs
@@ -430,6 +434,11 @@ impl Vfs {
         self.patterns.readahead_totals()
     }
 
+    /// Read latencies and readahead waste over the last 10 s, 1 min, 10 min.
+    pub fn io_windows(&self) -> Vec<nest_fabric::iostats::Window> {
+        self.io.windows()
+    }
+
     /// Files this host currently reads directly (scattered reads).
     pub fn scattered_files(&self) -> usize {
         self.patterns.random_files()
@@ -456,6 +465,7 @@ impl Vfs {
     pub fn attach_fabric(self: &Arc<Self>, fabric: Arc<nest_fabric::Fabric>) {
         let src: Arc<dyn nest_fabric::ReadSource> = self.clone();
         fabric.set_source(Arc::downgrade(&src));
+        fabric.set_io_stats(self.io.clone());
         // The fabric holds a Weak; keep the trait object alive with us.
         std::mem::forget(src);
         *self.fabric.lock() = Some(fabric);
@@ -1727,6 +1737,7 @@ impl Vfs {
                         &fab,
                         self.balancer.clone(),
                         self.patterns.clone(),
+                        self.io.clone(),
                         h.file,
                         a.generation,
                         route.sources.clone(),
@@ -1775,10 +1786,17 @@ impl Vfs {
                     }
                 };
                 let kind = self.source_kind(&src);
-                let r = tokio::task::spawn_blocking(move || pread(&f, offset, size))
-                    .await
-                    .expect("blocking task");
+                let (r, took) = tokio::task::spawn_blocking(move || {
+                    let t = std::time::Instant::now();
+                    (pread(&f, offset, size), t.elapsed())
+                })
+                .await
+                .expect("blocking task");
                 if let Ok(b) = &r {
+                    if kind == crate::usage::Source::Local {
+                        self.io
+                            .record(nest_fabric::iostats::Kind::Disk, size as u64, took);
+                    }
                     self.count_read(&h, kind, b.len() as u64);
                     if scattered {
                         self.note_direct(&h, offset, b.len() as u64);
@@ -1842,6 +1860,7 @@ impl Vfs {
                                 &fab,
                                 self.balancer.clone(),
                                 self.patterns.clone(),
+                                self.io.clone(),
                                 h.file,
                                 a.generation,
                                 vec![crate::balance::Source::Peer(s)],
@@ -2020,8 +2039,13 @@ impl Vfs {
                     }
                 }
             };
+            let t = std::time::Instant::now();
             let r = from_file(&f);
             if r.is_ok() {
+                if self.source_kind(&src) == crate::usage::Source::Local {
+                    self.io
+                        .record(nest_fabric::iostats::Kind::Disk, size as u64, t.elapsed());
+                }
                 // The bytes a read at `offset` can return, without asking
                 // the caller's result type for its length.
                 let n = a.size.saturating_sub(offset).min(size as u64);
@@ -2873,5 +2897,15 @@ async fn probe_disk(vfs: Weak<Vfs>) {
             drop(v);
             tokio::time::sleep(Duration::from_secs(if due { 30 } else { 3600 })).await;
         }
+    }
+}
+
+/// Snapshot read latencies once a second (windows are differences).
+async fn roll_io_stats(io: std::sync::Weak<nest_fabric::iostats::IoStats>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let Some(io) = io.upgrade() else { return };
+        io.roll();
     }
 }

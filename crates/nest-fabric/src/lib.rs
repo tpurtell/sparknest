@@ -5,6 +5,7 @@
 //! protocol live in `link` and `engine`.
 
 mod engine;
+pub mod iostats;
 mod pool;
 pub mod rail;
 pub(crate) mod sys;

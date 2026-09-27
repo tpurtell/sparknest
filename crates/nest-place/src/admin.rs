@@ -51,6 +51,10 @@ pub struct NodeInfo {
     pub readahead_dropped_bytes: u64,
     #[serde(default)]
     pub readahead_used_bytes: u64,
+    /// Read latencies by kind and size, and readahead waste, over the last
+    /// 10 s, 1 min and 10 min.
+    #[serde(default)]
+    pub io_windows: Vec<nest_data::iostats::Window>,
     /// What this host has learned about the sources it reads from
     /// (ADR-030): latency, in flight, recent rate.
     #[serde(default)]
@@ -323,6 +327,7 @@ impl Admin {
             }),
             local_read_bytes: self.vfs.local_read_bytes(),
             scattered_files: self.vfs.scattered_files() as u64,
+            io_windows: self.vfs.io_windows(),
             readahead_dropped_bytes: self.vfs.readahead_totals().0,
             readahead_used_bytes: self.vfs.readahead_totals().1,
             io: self.vfs.io_report(),

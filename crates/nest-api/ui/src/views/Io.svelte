@@ -1,7 +1,7 @@
 <script lang="ts">
   import { app } from "../lib/state.svelte";
   import { human, rate } from "../lib/format";
-  import type { SourceReport } from "../lib/api";
+  import type { IoWindow, SourceReport } from "../lib/api";
 
   const nodes = $derived(app.status?.nodes ?? []);
   const nameOf = (id: number) => nodes.find((n) => n.node === id)?.name ?? `node${id}`;
@@ -16,21 +16,25 @@
   const fromDisk = $derived([...nodes].reduce((a, n) => a + (n.info?.io ?? []).filter((s) => s.source === "Local").reduce((b, s) => b + s.bytes_per_s, 0), 0));
   const fromNet = $derived([...nodes].reduce((a, n) => a + (n.info?.io ?? []).filter((s) => s.source !== "Local").reduce((b, s) => b + s.bytes_per_s, 0), 0));
   const ms = (us: number) => (us / 1000).toFixed(us < 10_000 ? 2 : 1) + " ms";
-  // Cluster-wide readahead waste over the last ~10 s, weighted by what each
-  // host dropped (hosts report shares; weight by their fetch rates).
+  // Hosts report windows of 10 s, 1 min and 10 min.
+  const WINDOWS = ["10 s", "1 min", "10 min"];
+  let win = $state(0);
+  const winOf = (n: (typeof nodes)[number]): IoWindow | undefined => n.info?.io_windows?.[win];
+  const wasteOf = (w?: IoWindow) => (w && w.readahead_dropped > 0 ? 1 - w.readahead_used / w.readahead_dropped : null);
+  // Cluster-wide readahead waste over the chosen window.
   const wasteAll = $derived.by(() => {
-    let w = 0;
-    let tot = 0;
+    let d = 0;
+    let u = 0;
     for (const n of nodes) {
-      const r = app.rates[n.name];
-      const f = (n.info?.io ?? []).reduce((a, s) => a + s.bytes_per_s, 0);
-      if (r?.waste != null && f > 0) {
-        w += r.waste * f;
-        tot += f;
-      }
+      const w = winOf(n);
+      d += w?.readahead_dropped ?? 0;
+      u += w?.readahead_used ?? 0;
     }
-    return tot > 0 ? w / tot : null;
+    return d > 0 ? 1 - u / d : null;
   });
+  const us = (u: number) => (u >= 10_000 ? `${(u / 1000).toFixed(0)} ms` : u >= 1000 ? `${(u / 1000).toFixed(1)} ms` : `${u} µs`);
+  const sizeOf = (b: number) => (b === 0 ? ">128K" : `≤${b >> 10}K`);
+  const kindOf = { Disk: "disk", Fabric: "fabric", Served: "served" } as const;
   const pctOf = (x: number) => `${Math.round(100 * x)}%`;
 </script>
 
@@ -41,7 +45,35 @@
   <div class="tiles">
     <div class="tile panel"><div class="caps">From local disks</div><div class="big">{rate(fromDisk)}</div><div class="small muted">spread reads, last 10 s</div></div>
     <div class="tile panel" class:hot={fromNet > 1e8}><div class="caps">From other hosts</div><div class="big">{rate(fromNet)}</div><div class="small muted">over the fabric</div></div>
-    <div class="tile panel" class:bad={wasteAll != null && wasteAll > 0.5}><div class="caps">Readahead waste</div><div class="big">{wasteAll == null ? "—" : pctOf(wasteAll)}</div><div class="small muted">fetched ahead, never read (last 10 s)</div></div>
+    <div class="tile panel" class:bad={wasteAll != null && wasteAll > 0.5}><div class="caps">Readahead waste</div><div class="big">{wasteAll == null ? "—" : pctOf(wasteAll)}</div><div class="small muted">fetched ahead, never read (last {WINDOWS[win]})</div></div>
+  </div>
+
+  <div class="panel pad">
+    <div class="row"><h3 class="sec" style="margin:0">Read latency by size</h3><span class="spacer"></span>
+      <div class="seg">{#each WINDOWS as w, i}<button class:on={win === i} onclick={() => (win = i)}>{w}</button>{/each}</div>
+    </div>
+    <div class="small muted">each read's time on this host: its own disk, a fabric read from request to bytes, or reading bytes it serves to others; by size (4 KiB rows and page faults, kernel requests up to 128 KiB, readahead chunks)</div>
+    <div class="scroll-x">
+      <table class="lat">
+        <thead><tr><th>host</th><th>kind</th><th>size</th><th class="n">per s</th><th class="n">rate</th><th class="n">mean</th><th class="n">p50</th><th class="n">p90</th><th class="n">p99</th></tr></thead>
+        <tbody>
+          {#each nodes as n (n.name)}
+            {@const w = winOf(n)}
+            {@const secs = Math.max(0.001, (w?.ms ?? 0) / 1000)}
+            {#each w?.classes ?? [] as c, i}
+              <tr class:first={i === 0}>
+                <td>{i === 0 ? n.name : ""}</td><td class="muted">{kindOf[c.kind]}</td><td class="mono muted">{sizeOf(c.max_bytes)}</td>
+                <td class="n mono">{Math.round(c.count / secs)}</td><td class="n mono">{rate(c.bytes / secs)}</td>
+                <td class="n mono">{us(c.mean_us)}</td><td class="n mono">{us(c.p50_us)}</td><td class="n mono">{us(c.p90_us)}</td><td class="n mono" class:warn={c.p99_us >= 10_000}>{us(c.p99_us)}</td>
+              </tr>
+            {/each}
+            {#if wasteOf(w) != null}
+              <tr class:first={!(w?.classes?.length)}><td>{w?.classes?.length ? "" : n.name}</td><td class="muted" colspan="2">readahead</td><td class="n mono" colspan="2">{human(w?.readahead_dropped ?? 0)} dropped</td><td class="n mono" colspan="4" class:warn={(wasteOf(w) ?? 0) > 0.5}>{pctOf(wasteOf(w) ?? 0)} unused</td></tr>
+            {/if}
+          {/each}
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="panel pad">
@@ -102,6 +134,15 @@
   .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
   .tile.bad { border-color: rgba(255, 79, 123, 0.5); box-shadow: 0 0 30px rgba(255, 79, 123, 0.15); }
   .waste { color: var(--muted); }
+  .seg { display: flex; gap: 2px; border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
+  .seg button { background: none; border: 0; color: var(--muted); font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
+  .seg button.on { background: rgba(56, 232, 255, 0.15); color: var(--spark); }
+  .lat { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 8px; }
+  .lat th { text-align: left; font-weight: 500; color: var(--faint); font-size: 11px; padding: 4px 8px; }
+  .lat td { padding: 3px 8px; }
+  .lat .n { text-align: right; }
+  .lat tr.first td { border-top: 1px solid var(--line); }
+  .lat .warn { color: #ffb3c5; }
   .waste.bad { color: #ffb3c5; }
   .tile { padding: 14px 16px; }
   .tile.hot { border-color: rgba(56, 232, 255, 0.5); box-shadow: 0 0 30px rgba(56, 232, 255, 0.2); }
