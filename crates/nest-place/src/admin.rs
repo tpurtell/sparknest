@@ -295,17 +295,24 @@ impl Handler for AdminService {
                     }
                 }
                 AdminReq::StoreHealth { store } => {
-                    let d = a.vfs.data();
-                    AdminResp::Health(match d.archive(store) {
+                    let d = a.vfs.data().clone();
+                    // Marker and free space only: counting objects comes from
+                    // the metadata (listing an archive over SMB takes seconds).
+                    let usage = d
+                        .meta()
+                        .open_reader()
+                        .ok()
+                        .and_then(|c| nest_meta::query::store_usage(&c, store).ok())
+                        .unwrap_or((0, 0));
+                    let health = tokio::task::spawn_blocking(move || match d.archive(store) {
                         Some(arch) => {
                             let cap = arch.store.capacity().ok();
-                            let objs = arch.store.scan().unwrap_or_default();
                             StoreHealth {
                                 healthy: arch.healthy(),
                                 total_bytes: cap.map(|c| c.total).unwrap_or(0),
                                 free_bytes: cap.map(|c| c.free).unwrap_or(0),
-                                objects: objs.len() as u64,
-                                object_bytes: objs.iter().map(|o| o.size).sum(),
+                                objects: usage.0,
+                                object_bytes: usage.1,
                                 error: None,
                             }
                         }
@@ -314,6 +321,9 @@ impl Handler for AdminService {
                             ..Default::default()
                         },
                     })
+                    .await
+                    .unwrap_or_default();
+                    AdminResp::Health(health)
                 }
                 AdminReq::JobStatus { job } => match a.jobs.lock().get(&job) {
                     Some(p) => AdminResp::Job(p.lock().clone()),

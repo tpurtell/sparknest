@@ -463,8 +463,9 @@ impl Placer {
             .collect();
         let mut out = Vec::new();
         for (id, name, cfg) in self.archive_stores()? {
-            let mut gateways = Vec::new();
-            for g in &cfg.gateways {
+            // All gateways at once.
+            let names = &names;
+            let checks = cfg.gateways.iter().map(|g| async move {
                 let h = self
                     .store_health(*g, id)
                     .await
@@ -472,11 +473,12 @@ impl Placer {
                         error: Some(e.to_string()),
                         ..Default::default()
                     });
-                gateways.push((
+                (
                     names.get(g).cloned().unwrap_or_else(|| format!("node{g}")),
                     h,
-                ));
-            }
+                )
+            });
+            let gateways = futures::future::join_all(checks).await;
             out.push(StoreStatus {
                 id,
                 name,

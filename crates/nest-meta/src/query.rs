@@ -166,6 +166,19 @@ pub fn store_inventory(
 }
 
 /// Files currently OWNED by `node`: the working objects it must hold.
+/// Live copies held by `store` and their total size (from the metadata;
+/// no directory scan).
+pub fn store_usage(c: &Connection, store: StoreId) -> rusqlite::Result<(u64, u64)> {
+    c.prepare_cached(
+        "SELECT count(*), coalesce(sum(f.size), 0) FROM replicas r \
+         JOIN files f ON f.id = r.file AND f.gen = r.gen \
+         WHERE r.store = ?1 AND r.state = ?2",
+    )?
+    .query_row(params![store.0 as i64, ReplicaState::Live.as_i64()], |r| {
+        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+    })
+}
+
 pub fn owned_by(c: &Connection, node: NodeId) -> rusqlite::Result<Vec<FileAttr>> {
     let mut st = c.prepare_cached(&format!(
         "SELECT {ATTR_COLS} FROM files WHERE owner = ?1 ORDER BY id"
