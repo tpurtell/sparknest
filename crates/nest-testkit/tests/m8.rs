@@ -224,3 +224,83 @@ async fn fsync_waits_for_a_durable_majority() {
     );
     assert!(t.elapsed() < Duration::from_secs(30));
 }
+
+/// `remove_tree` removes a whole tree, children before directories, many
+/// entries per commit; dry run counts without changing anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn remove_tree_in_batches() {
+    let c = ready(3).await;
+    let v = c.node(1).vfs.clone();
+    let top = v.mkdir(FileId::ROOT, b"tree", 0o755).await.unwrap().id;
+    let mut want_files = 0u64;
+    for d in 0..50 {
+        let dir = v
+            .mkdir(top, format!("d{d}").as_bytes(), 0o755)
+            .await
+            .unwrap()
+            .id;
+        let sub = v.mkdir(dir, b"sub", 0o755).await.unwrap().id;
+        for f in 0..30 {
+            let parent = if f % 2 == 0 { dir } else { sub };
+            let (_, fh, _) = v
+                .create(parent, format!("f{f}").as_bytes(), 0o644, oflags::WRONLY)
+                .await
+                .unwrap();
+            v.release(fh, None).await;
+            want_files += 1;
+        }
+        v.symlink(dir, b"link", b"sub/f1").await.unwrap();
+        want_files += 1;
+    }
+    let want_dirs = 1 + 50 * 2;
+
+    let e = v
+        .remove_tree(FileId::ROOT, b"tree", false, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, NestError::Invalid(_)), "{e:?}");
+    let dry = v
+        .remove_tree(FileId::ROOT, b"tree", true, true)
+        .await
+        .unwrap();
+    assert_eq!((dry.files, dry.dirs), (want_files, want_dirs));
+    assert!(
+        c.lookup(1, FileId::ROOT, "tree").is_some(),
+        "dry run changes nothing"
+    );
+
+    let t = std::time::Instant::now();
+    let r = v
+        .remove_tree(FileId::ROOT, b"tree", true, false)
+        .await
+        .unwrap();
+    let batched = t.elapsed();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!((r.files, r.dirs), (want_files, want_dirs));
+    c.converge().await;
+    for n in 1..=3 {
+        assert!(c.lookup(n, FileId::ROOT, "tree").is_none());
+    }
+
+    // For scale: the same number of single unlinks.
+    let d = v.mkdir(FileId::ROOT, b"flat", 0o755).await.unwrap().id;
+    for f in 0..200 {
+        let (_, fh, _) = v
+            .create(d, format!("f{f}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v.release(fh, None).await;
+    }
+    let t = std::time::Instant::now();
+    for f in 0..200 {
+        v.unlink(d, format!("f{f}").as_bytes()).await.unwrap();
+    }
+    let single = t.elapsed() / 200;
+    eprintln!(
+        "remove_tree: {} entries in {:?} ({:?} each); single unlink {:?} each",
+        want_files + want_dirs,
+        batched,
+        batched / (want_files + want_dirs) as u32,
+        single
+    );
+}

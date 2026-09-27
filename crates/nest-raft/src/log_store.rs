@@ -103,6 +103,7 @@ impl LogStore {
         c.pragma_update(None, "journal_mode", "WAL")?;
         c.pragma_update(None, "synchronous", "NORMAL")?;
         c.pragma_update(None, "wal_autocheckpoint", 0)?;
+        c.pragma_update(None, "journal_size_limit", crate::checkpoint::WAL_LIMIT)?;
         c.execute_batch(
             "CREATE TABLE IF NOT EXISTS log (idx INTEGER PRIMARY KEY, entry BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;",

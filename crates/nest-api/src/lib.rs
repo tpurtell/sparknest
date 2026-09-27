@@ -121,6 +121,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/ls", get(ls))
         .route("/v1/seal", post(seal))
+        .route("/v1/rm", post(remove))
         .route("/v1/seal-policy", post(seal_policy))
         .route("/v1/where", get(where_))
         .route("/v1/replicate", post(replicate))
@@ -286,6 +287,32 @@ async fn ls(State(api): State<Api>, Query(q): Query<PathQ>) -> R<serde_json::Val
         out.push(entry(path.rsplit('/').next().unwrap_or("").to_string(), a)?);
     }
     Ok(Json(json!({ "path": path, "entries": out })))
+}
+
+#[derive(Deserialize)]
+struct RmReq {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Remove a file or (recursive) a tree, many entries per commit.
+async fn remove(State(api): State<Api>, Json(r): Json<RmReq>) -> R<serde_json::Value> {
+    let path = api.ns(&r.path);
+    let name = path
+        .rsplit('/')
+        .find(|c| !c.is_empty())
+        .ok_or_else(|| NestError::Invalid("refusing to remove the root".into()))?
+        .as_bytes()
+        .to_vec();
+    let (_, parent) = selector::resolve_path(&api.conn()?, &path)?;
+    let rep = api
+        .vfs
+        .remove_tree(parent, &name, r.recursive, r.dry_run)
+        .await?;
+    Ok(Json(serde_json::to_value(rep).unwrap_or_default()))
 }
 
 #[derive(Deserialize)]

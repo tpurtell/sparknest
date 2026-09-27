@@ -162,6 +162,14 @@ impl Drop for Inflight<'_> {
     }
 }
 
+/// What `Vfs::remove_tree` removed (or, dry run, would remove).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct RemoveReport {
+    pub files: u64,
+    pub dirs: u64,
+    pub errors: Vec<String>,
+}
+
 fn pread_into(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> NestResult<usize> {
     let mut done = 0;
     while done < buf.len() {
@@ -569,6 +577,106 @@ impl Vfs {
         })
         .await?;
         Ok(())
+    }
+
+    /// Remove `name` from `parent`, a whole tree with `recursive`, many
+    /// entries per Raft commit (children before their directory). One
+    /// POSIX unlink per file costs a commit each; this costs one per
+    /// `REMOVE_BATCH` entries. With `dry_run` nothing changes and the report
+    /// counts what would go.
+    pub async fn remove_tree(
+        &self,
+        parent: FileId,
+        name: &[u8],
+        recursive: bool,
+        dry_run: bool,
+    ) -> NestResult<RemoveReport> {
+        const REMOVE_BATCH: usize = 512;
+        let root = self
+            .q(|c| query::lookup(c, parent, name))?
+            .ok_or(NestError::NotFound)?;
+        let root_kind = self.raw_attr(root)?.kind;
+        let root_name = String::from_utf8_lossy(name).into_owned();
+        // Post-order: every directory after everything inside it.
+        let mut order: Vec<(FileId, Vec<u8>, bool, String)> = Vec::new();
+        if root_kind == FileKind::Directory {
+            if !recursive {
+                return Err(NestError::Invalid(format!(
+                    "{root_name} is a directory (use recursive)"
+                )));
+            }
+            // (dir, its parent, its name, its path, children listed?)
+            let mut stack = vec![(root, parent, name.to_vec(), root_name.clone(), false)];
+            while let Some((dir, dparent, dname, dpath, listed)) = stack.pop() {
+                if listed {
+                    order.push((dparent, dname, true, dpath));
+                    continue;
+                }
+                stack.push((dir, dparent, dname, dpath.clone(), true));
+                let mut after = 0u64;
+                loop {
+                    let page = self.q(|c| query::readdir(c, dir, after, 1024))?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    for (cookie, e) in page {
+                        after = cookie;
+                        let path = format!("{dpath}/{}", String::from_utf8_lossy(&e.name));
+                        if e.kind == FileKind::Directory {
+                            stack.push((e.id, dir, e.name, path, false));
+                        } else {
+                            order.push((dir, e.name, false, path));
+                        }
+                    }
+                }
+            }
+        } else {
+            order.push((parent, name.to_vec(), false, root_name));
+        }
+        let mut report = RemoveReport::default();
+        if dry_run {
+            for (_, _, is_dir, _) in &order {
+                if *is_dir {
+                    report.dirs += 1;
+                } else {
+                    report.files += 1;
+                }
+            }
+            return Ok(report);
+        }
+        for chunk in order.chunks(REMOVE_BATCH) {
+            let now = Timestamp::now();
+            let cmds = chunk
+                .iter()
+                .map(|(p, n, is_dir, _)| {
+                    if *is_dir {
+                        Command::Rmdir {
+                            parent: *p,
+                            name: n.clone(),
+                            now,
+                        }
+                    } else {
+                        Command::Unlink {
+                            parent: *p,
+                            name: n.clone(),
+                            now,
+                        }
+                    }
+                })
+                .collect();
+            let results = match self.propose(Command::Batch(cmds)).await? {
+                Reply::Batch(r) => r,
+                other => return Err(NestError::Io(format!("unexpected {other:?}"))),
+            };
+            for ((_, _, is_dir, path), r) in chunk.iter().zip(results) {
+                match r {
+                    Ok(_) if *is_dir => report.dirs += 1,
+                    Ok(_) => report.files += 1,
+                    Err(e) => report.errors.push(format!("{path}: {e}")),
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub async fn rename(

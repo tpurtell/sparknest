@@ -128,6 +128,7 @@ impl StateMachine {
         })?;
         let c = nest_meta::open_write(&meta_path)?;
         c.pragma_update(None, "wal_autocheckpoint", 0)?;
+        c.pragma_update(None, "journal_size_limit", crate::checkpoint::WAL_LIMIT)?;
         c.execute_batch(SM_SCHEMA)?;
         match sm_format(&c)? {
             None => {
@@ -231,7 +232,10 @@ fn apply_entries(
     c: &mut Connection,
     entries: Vec<Entry>,
 ) -> rusqlite::Result<(Vec<Response>, Vec<Effect>, u64)> {
-    let tx = c.transaction()?;
+    // IMMEDIATE: take the write lock up front. A deferred transaction that
+    // reads first cannot upgrade if the WAL moved underneath it (SQLite then
+    // fails at once instead of waiting).
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut responses = Vec::with_capacity(entries.len());
     let mut effects = Vec::new();
     let mut last = None;
@@ -311,11 +315,26 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             return Ok(());
         }
         let db = self.db.clone();
-        let (responses, effects, index) =
-            tokio::task::spawn_blocking(move || apply_entries(&mut db.lock(), batch))
-                .await
-                .map_err(io::Error::other)?
-                .map_err(sm_err)?;
+        let (responses, effects, index) = tokio::task::spawn_blocking(move || {
+            // A busy database is transient (a reader or checkpoint in the
+            // way); the transaction rolled back, so retrying is safe. Anything
+            // else is fatal for this node, as openraft requires.
+            let mut attempt = 0;
+            loop {
+                match apply_entries(&mut db.lock(), batch.clone()) {
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::DatabaseBusy && attempt < 20 =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(5 * attempt));
+                    }
+                    r => break r,
+                }
+            }
+        })
+        .await
+        .map_err(io::Error::other)?
+        .map_err(sm_err)?;
         self.handler.on_event(&SmEvent::Applied { index, effects });
         for (responder, resp) in responders.into_iter().zip(responses) {
             if let Some(r) = responder {

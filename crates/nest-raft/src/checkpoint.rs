@@ -4,8 +4,9 @@
 //! automatic checkpoints off, so a commit costs no fsync. A checkpoint
 //! fsyncs the WAL before copying it into the database, so the interval
 //! between checkpoints is how much can be lost if every host loses power
-//! at once. One thread per database checkpoints about once a second when
-//! the WAL has grown, and truncates the WAL once it passes a size cap.
+//! at once. One thread per database runs a passive checkpoint (it never
+//! blocks writers) about once a second when the WAL has grown. Writers set
+//! `journal_size_limit` so the WAL file is cut back when it restarts.
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -14,8 +15,8 @@ use std::time::Duration;
 
 /// Default time between checkpoints while there are pending changes.
 pub const INTERVAL: Duration = Duration::from_secs(1);
-/// WAL size past which a checkpoint also truncates the file.
-pub const TRUNCATE_ABOVE: u64 = 64 << 20;
+/// Size the WAL file is cut back to when it restarts (`journal_size_limit`).
+pub const WAL_LIMIT: i64 = 8 << 20;
 
 /// Keeps the checkpoint thread alive; the thread stops once every clone is
 /// dropped.
@@ -64,14 +65,9 @@ pub fn start(db: &Path, interval: Duration) -> Checkpointer {
                     continue;
                 };
                 let _ = c.busy_timeout(Duration::from_millis(200));
-                let mode = if len > TRUNCATE_ABOVE {
-                    "TRUNCATE"
-                } else {
-                    "PASSIVE"
-                };
-                if let Err(e) =
-                    c.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |_| Ok(()))
-                {
+                // PASSIVE only: TRUNCATE/RESTART take the write lock, and a
+                // writer's read-to-write upgrade then fails with SQLITE_BUSY.
+                if let Err(e) = c.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(())) {
                     tracing::debug!(db = %path.display(), error = %e, "checkpoint deferred");
                 }
                 drop(c);

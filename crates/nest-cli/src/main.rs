@@ -42,6 +42,17 @@ enum Cmd {
         #[arg(long)]
         unseal: bool,
     },
+    /// Remove files or trees in bulk: many entries per metadata commit,
+    /// far faster than `rm -r` through the mount.
+    Rm {
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(short, long)]
+        recursive: bool,
+        /// Count what would be removed; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Set a directory's automatic sealing policy.
     Policy {
         path: String,
@@ -547,6 +558,56 @@ async fn main() -> Result<()> {
                 json!({ "path": abspath(path), "recursive": recursive, "sealed": !unseal }),
             )
             .await?
+        }
+        Cmd::Rm {
+            paths,
+            recursive,
+            dry_run,
+        } => {
+            let mut failed = false;
+            let mut all = Vec::new();
+            for p in paths {
+                let v = c
+                    .post(
+                        "/v1/rm",
+                        json!({ "path": abspath(p), "recursive": recursive, "dry_run": dry_run }),
+                    )
+                    .await;
+                match v {
+                    Ok(v) => {
+                        let errs = v["errors"].as_array().cloned().unwrap_or_default();
+                        if !cli.json {
+                            println!(
+                                "{p}: {} {} files, {} directories{}",
+                                if *dry_run { "would remove" } else { "removed" },
+                                v["files"],
+                                v["dirs"],
+                                if errs.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(", {} not removed", errs.len())
+                                }
+                            );
+                            for e in errs.iter().take(20) {
+                                println!("  {}", e.as_str().unwrap_or(""));
+                            }
+                        }
+                        failed |= !errs.is_empty();
+                        all.push(v);
+                    }
+                    Err(e) => {
+                        eprintln!("{p}: {e:#}");
+                        failed = true;
+                    }
+                }
+            }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+            }
+            if failed {
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         Cmd::Policy { path, policy } => {
             let p = match policy.as_str() {
