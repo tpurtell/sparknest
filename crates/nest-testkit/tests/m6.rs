@@ -582,3 +582,59 @@ fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// Cancelling an offload stops new copies and never drops live copies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cancelled_offload_keeps_every_live_copy() {
+    let c = ready(2).await;
+    let p = &c.node(1).placer;
+    let nas = c.state_dir(2).join("nas-cancel");
+    std::fs::create_dir_all(&nas).unwrap();
+    p.add_store("nas", nas.to_str().unwrap(), &["n2".into()])
+        .await
+        .unwrap();
+    let v = c.node(1).vfs.clone();
+    let dir = v.mkdir(FileId::ROOT, b"many", 0o755).await.unwrap().id;
+    let mut files = Vec::new();
+    for i in 0..40 {
+        let (a, fh, _) = v
+            .create(dir, format!("f{i}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v.write(fh, 0, vec![i as u8; 4 << 20]).await.unwrap();
+        v.release(fh, None).await;
+        files.push(a.id);
+    }
+    c.eventually("stable", Duration::from_secs(10), |c| {
+        files.iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+
+    let id = p
+        .offload(Selector::parse("/many", "/hub").unwrap(), "nas".into(), 1)
+        .await
+        .unwrap();
+    p.cancel_job(id).await.unwrap();
+    let job = wait_job(&c, id).await;
+    assert!(job.cancelled, "{job:?}");
+    assert!(
+        job.error
+            .as_deref()
+            .is_some_and(|e| e.contains("cancelled")),
+        "{job:?}"
+    );
+    let nas_id = p.archive_stores().unwrap()[0].0.0;
+    let archived = files
+        .iter()
+        .filter(|f| stores_of(&c, **f).contains(&nas_id))
+        .count();
+    assert!(archived < files.len(), "stopped before copying everything");
+    for f in &files {
+        assert!(stores_of(&c, *f).contains(&1), "live copy of {f:?} kept");
+    }
+    // A finished job cannot be cancelled.
+    assert!(p.cancel_job(id).await.is_err());
+}

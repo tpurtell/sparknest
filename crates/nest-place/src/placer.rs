@@ -50,6 +50,20 @@ pub struct ClusterJob {
     pub started_ms: u64,
     #[serde(default)]
     pub finished_ms: Option<u64>,
+    #[serde(default)]
+    pub cancelled: bool,
+    /// Node-side jobs to tell when cancelled.
+    #[serde(skip)]
+    host_jobs: Vec<(NodeId, u64)>,
+}
+
+fn cancelled(job: &Mutex<ClusterJob>) -> NestResult<()> {
+    if job.lock().cancelled {
+        return Err(NestError::Io(
+            "cancelled; files already copied stay, nothing was removed".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -679,6 +693,9 @@ impl Placer {
         job.lock().pending = m.entries.iter().filter(|e| !e.stable).count() as u64;
         let mut started = Vec::new();
         for h in &hosts {
+            if job.lock().cancelled {
+                break;
+            }
             let files: Vec<(FileId, u64)> = m
                 .entries
                 .iter()
@@ -713,6 +730,21 @@ impl Placer {
                 Duration::from_secs(10),
             )
             .await?;
+            let late = {
+                let mut j = job.lock();
+                j.host_jobs.push((h.node, hid));
+                j.cancelled
+            };
+            if late {
+                // Cancelled while this host was starting: tell it too.
+                let _ = admin::call(
+                    self.rpc(),
+                    h.node,
+                    &AdminReq::CancelJob { job: hid },
+                    Duration::from_secs(5),
+                )
+                .await;
+            }
             started.push((h.clone(), hid));
         }
         loop {
@@ -774,6 +806,48 @@ impl Placer {
 
     pub fn job(&self, id: u64) -> Option<ClusterJob> {
         self.jobs.lock().get(&id).map(|j| j.lock().clone())
+    }
+
+    /// Cancel a running replicate, offload or plan job: no new files start
+    /// (those copying finish), and nothing is evicted afterwards.
+    pub async fn cancel_job(&self, id: u64) -> NestResult<()> {
+        let job = self
+            .jobs
+            .lock()
+            .get(&id)
+            .cloned()
+            .ok_or(NestError::NotFound)?;
+        let hosts = {
+            let mut j = job.lock();
+            if j.finished {
+                return Err(NestError::Invalid("job already finished".into()));
+            }
+            if !["replicate ", "offload ", "apply plan "]
+                .iter()
+                .any(|k| j.what.starts_with(k))
+            {
+                return Err(NestError::Invalid(format!(
+                    "{} cannot be cancelled",
+                    j.what
+                )));
+            }
+            j.cancelled = true;
+            j.host_jobs.clone()
+        };
+        tracing::info!(job = id, "job cancelled");
+        for (node, hid) in hosts {
+            if let Err(e) = admin::call(
+                self.rpc(),
+                node,
+                &AdminReq::CancelJob { job: hid },
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                tracing::warn!(job = id, node = node.0, error = %e, "could not cancel on a host");
+            }
+        }
+        Ok(())
     }
 
     pub fn jobs(&self) -> Vec<ClusterJob> {
@@ -845,6 +919,8 @@ impl Placer {
         tokio::spawn(async move {
             let r = async {
                 me.run_replicate(&job, m.clone(), targets, parallel).await?;
+                // Never drop live copies for an offload that did not finish.
+                cancelled(&job)?;
                 let failed: usize = job.lock().hosts.values().map(|p| p.failed.len()).sum();
                 if failed > 0 {
                     return Err(NestError::Io(format!(
@@ -984,6 +1060,7 @@ impl Placer {
         tokio::spawn(async move {
             let r: NestResult<()> = async {
                 for step in &plan.steps {
+                    cancelled(&job)?;
                     let (host, node, copies, store) = match step {
                         crate::plan::Step::Evict {
                             host, node, copies, ..
@@ -1035,6 +1112,7 @@ impl Placer {
                             dangling: vec![],
                         };
                         me.run_replicate(&job, m, targets, 8).await?;
+                        cancelled(&job)?;
                     }
                     let files = copies.iter().map(|c| (c.file, c.generation)).collect();
                     match admin::call(

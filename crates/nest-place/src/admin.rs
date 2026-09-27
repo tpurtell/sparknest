@@ -46,6 +46,10 @@ pub struct JobProgress {
     pub done_bytes: u64,
     pub failed: Vec<(FileId, String)>,
     pub finished: bool,
+    /// Cancelled: files not yet started are skipped (counted in neither
+    /// done nor failed); files already copying finish.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,6 +110,10 @@ pub(crate) enum AdminReq {
     },
     /// Recent log lines kept in memory on this node.
     Logs(crate::logs::LogQuery),
+    /// Stop starting new files for this node-side job.
+    CancelJob {
+        job: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -217,10 +225,19 @@ impl Admin {
             futures::stream::iter(files)
                 .map(|(f, size)| {
                     let vfs = vfs.clone();
-                    async move { (f, size, vfs.replicate_into(f, target).await) }
+                    let progress = progress.clone();
+                    async move {
+                        if progress.lock().cancelled {
+                            return (f, size, None);
+                        }
+                        (f, size, Some(vfs.replicate_into(f, target).await))
+                    }
                 })
                 .buffer_unordered(parallel.max(1))
                 .for_each(|(f, size, r)| {
+                    let Some(r) = r else {
+                        return futures::future::ready(());
+                    };
                     let mut p = progress.lock();
                     p.done_files += 1;
                     p.done_bytes += size;
@@ -343,6 +360,13 @@ impl Handler for AdminService {
                 },
                 AdminReq::Evict { files, store } => a.evict(files, store).await,
                 AdminReq::Logs(q) => AdminResp::Logs(crate::logs::recent(&q)),
+                AdminReq::CancelJob { job } => match a.jobs.lock().get(&job) {
+                    Some(p) => {
+                        p.lock().cancelled = true;
+                        AdminResp::Started
+                    }
+                    None => AdminResp::Err(format!("no job {job}")),
+                },
                 AdminReq::EvictExact { files, store } => {
                     let mut removed = 0;
                     let mut refused = Vec::new();

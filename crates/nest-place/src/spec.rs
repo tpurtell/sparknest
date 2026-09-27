@@ -56,10 +56,23 @@ impl Selector {
     pub fn describe(&self) -> String {
         match self {
             Selector::Path { path } => path.clone(),
-            Selector::Hf { repo, revision, .. } => match revision {
-                Some(r) => format!("hf:{repo}@{r}"),
-                None => format!("hf:{repo}"),
-            },
+            // Round-trips through `parse`: a dataset keeps its prefix.
+            Selector::Hf {
+                repo,
+                revision,
+                repo_type,
+                ..
+            } => {
+                let prefix = if repo_type == "dataset" {
+                    "hf-dataset"
+                } else {
+                    "hf"
+                };
+                match revision {
+                    Some(r) => format!("{prefix}:{repo}@{r}"),
+                    None => format!("{prefix}:{repo}"),
+                }
+            }
         }
     }
 }
@@ -74,4 +87,24 @@ pub struct RuleSpec {
     /// Re-apply automatically (debounced) after files finish being written.
     #[serde(default)]
     pub auto: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_round_trips_through_parse() {
+        for s in [
+            "hf:org/model",
+            "hf:org/model@main",
+            "hf-dataset:org/data",
+            "hf-dataset:org/data@abc",
+            "/hub/x",
+        ] {
+            let sel = Selector::parse(s, "/hub").unwrap();
+            assert_eq!(sel.describe(), s);
+            assert_eq!(Selector::parse(&sel.describe(), "/hub").unwrap(), sel);
+        }
+    }
 }

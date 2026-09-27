@@ -61,6 +61,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cell.partial { background: var(--warn-weak); color: var(--warn); }
 .cell.none { color: var(--muted); border-color: var(--line); }
 .cell:hover { outline: 2px solid var(--accent-weak); }
+.cell.copying { background: var(--accent-weak); color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { .cell.copying { animation: none; } }
 .badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--accent-weak); color: var(--accent); margin-right: 3px; }
 .badge.store { background: var(--warn-weak); color: var(--warn); }
 .badge.writing { background: var(--bad-weak); color: var(--bad); }
@@ -222,8 +225,28 @@ function overview() {
   return `<h2>Nodes</h2><div class="grid">${nodes}</div><h2>Archive stores</h2>${st ? `<div class="grid">${st}</div>` : `<div class="empty">No archive stores. <code>nest store add NAME PATH --gateways …</code></div>`}`;
 }
 
+// Running jobs, with a Cancel button each (Models and Jobs views).
+function runningStrip(jobs) {
+  const run = jobs.filter(j => !j.finished);
+  if (!run.length) return "";
+  return `<div class="card">${run.map(j => {
+    const ps = Object.values(j.hosts || {});
+    const done = ps.reduce((a, p) => a + p.done_bytes, 0), total = ps.reduce((a, p) => a + p.total_bytes, 0);
+    const pct = total ? 100 * done / total : 0;
+    return `<div class="row small"><span style="flex:1">${esc(j.what)} → ${esc(Object.keys(j.hosts || {}).join(", ") || "starting")}
+      <span class="jobbar"><div style="width:${pct.toFixed(0)}%"></div></span> ${human(done)} / ${human(total)}</span>
+      ${j.cancelled ? `<span class="muted">cancelling…</span>` : `<button class="btn danger" data-act="canceljob" data-id="${j.id}">Cancel</button>`}</div>`;
+  }).join("")}</div>`;
+}
+
 async function models() {
-  const v = await get("/v1/hf");
+  const [v, jv] = await Promise.all([get("/v1/hf"), get("/v1/jobs")]);
+  // (selector, target) pairs with a copy in flight.
+  const copying = new Set();
+  for (const j of jv.jobs.filter(j => !j.finished)) {
+    const m = /^(?:replicate|offload) (\S+)/.exec(j.what);
+    if (m) for (const [h, p] of Object.entries(j.hosts || {})) if (!p.finished) copying.add(m[1] + " " + h);
+  }
   if (!v.repos.length) return `<div class="empty">No Hugging Face repos under ${esc(v.hub)}.</div>`;
   const cols = targets();
   const head = `<tr><th>Repo</th><th class="num">Size</th><th class="num">Revs</th>${cols.map(c => `<th>${esc(c.name)}${c.kind === "store" ? " ⧉" : ""}</th>`).join("")}<th></th></tr>`;
@@ -233,10 +256,11 @@ async function models() {
     const cells = cols.map(c => {
       const h = byHost[c.name];
       if (!h) return `<td></td>`;
-      const cls = h.ready ? "ready" : h.missing_files < h.files ? "partial" : "none";
+      const busy = !h.ready && copying.has(r.selector + " " + c.name);
+      const cls = h.ready ? "ready" : busy ? "copying" : h.missing_files < h.files ? "partial" : "none";
       // Files, not bytes: shared weights without the small config files read as "99%" yet are not usable.
-      const label = h.ready ? "✓" : cls === "partial" ? `${h.files - h.missing_files}/${h.files}` : "—";
-      return `<td><span class="cell ${cls}" data-act="cell" data-sel="${esc(r.selector)}" data-host="${esc(c.name)}" data-kind="${c.kind}" data-ready="${h.ready}"
+      const label = h.ready ? "✓" : busy || cls === "partial" ? `${busy ? "⟳ " : ""}${h.files - h.missing_files}/${h.files}` : "—";
+      return `<td><span class="cell ${cls}" data-act="cell" data-sel="${esc(r.selector)}" data-host="${esc(c.name)}" data-kind="${c.kind}" data-ready="${h.ready}" data-busy="${busy}"
         title="${esc(c.name)}: ${h.ready ? "complete" : `has ${h.files - h.missing_files} of ${h.files} files; missing ${h.missing_files} (${human(h.missing_bytes)})`}">${label}</span></td>`;
     }).join("");
     return `<tr><td>${esc(r.repo)} ${r.kind === "dataset" ? `<span class="badge">dataset</span>` : ""}${r.writing ? `<span class="badge writing">${r.writing} writing</span>` : ""}</td>
@@ -244,7 +268,7 @@ async function models() {
       <td><button class="btn" data-act="everywhere" data-sel="${esc(r.selector)}">All nodes</button>
       ${stores.length ? `<button class="btn" data-act="offload" data-sel="${esc(r.selector)}">Offload…</button>` : ""}</td></tr>`;
   }).join("");
-  return `<h2>Hugging Face repos <span class="muted small">(click a cell to copy there or remove from there)</span></h2><div class="tablewrap"><table>${head}${rows}</table></div>`;
+  return `${runningStrip(jv.jobs)}<h2>Hugging Face repos <span class="muted small">(click a cell to copy there or remove from there)</span></h2><div class="tablewrap"><table>${head}${rows}</table></div>`;
 }
 
 async function files() {
@@ -295,7 +319,9 @@ async function jobs() {
         ${p.done_files}/${p.total_files} files · ${human(p.done_bytes)} / ${human(p.total_bytes)}${p.failed.length ? ` · <span style="color:var(--bad)">${p.failed.length} failed</span>` : ""}</div>
         ${fails ? `<details><summary class="small">why</summary>${fails}</details>` : ""}`;
     }).join("");
-    const state = !j.finished ? "running" : j.error ? `<span style="color:var(--bad)">${esc(j.error)}</span>` : "done";
+    const state = !j.finished
+      ? (j.cancelled ? "cancelling…" : `running <button class="btn danger" data-act="canceljob" data-id="${j.id}">Cancel</button>`)
+      : j.cancelled ? `<span class="muted">cancelled</span>` : j.error ? `<span style="color:var(--bad)">${esc(j.error)}</span>` : "done";
     // Duration and aggregate rate (every host's bytes over wall time).
     let timing = "";
     if (j.started_ms) {
@@ -414,7 +440,7 @@ function pickHosts(title, kinds) {
 }
 
 async function startJob(path, body, what) {
-  try { await post(path, body); toast(what + " started"); view = "Jobs"; renderNav(); render(); }
+  try { await post(path, body); toast(what + " started"); render(); }
   catch (e) { toast(e.message, true); }
 }
 
@@ -431,9 +457,8 @@ function bind() {
         try { const v = await post("/v1/evict", { selector: d.sel, hosts: [d.host] }); const r = v.hosts[0];
           toast(`${d.host}: removed ${r.removed}${r.refused.length ? `, kept ${r.refused.length} (last copies)` : ""}`); render(); }
         catch (err) { toast(err.message, true); }
-      } else {
-        const ok = await modal(`Copy ${d.sel} to ${d.host}?`, `<p class="muted">Whole files are copied over RDMA; nothing is removed elsewhere.</p>`, [["Copy", "primary", true]]);
-        if (ok) startJob("/v1/replicate", { selector: d.sel, hosts: [d.host] }, "Copy to " + d.host);
+      } else if (d.busy !== "true") {
+        startJob("/v1/replicate", { selector: d.sel, hosts: [d.host] }, `Copy ${d.sel} to ${d.host}`);
       }
     }
     else if (d.act === "everywhere") startJob("/v1/replicate", { selector: d.sel, hosts: ["@all"] }, "Copy to all nodes");
@@ -467,6 +492,9 @@ function bind() {
       } catch (err) { toast(err.message, true); }
     }
     else if (d.act === "clearplan") { lastPlan = null; render(); }
+    else if (d.act === "canceljob") {
+      try { await post(`/v1/jobs/${d.id}/cancel`, {}); toast("Cancelling"); render(); } catch (err) { toast(err.message, true); }
+    }
     else if (d.act === "logsfor") { logState = { ...logState, host: (status?.nodes || []).some(n => n.name === d.host) ? d.host : "", level: "info", q: d.q }; view = "Logs"; renderNav(); render(); }
     else if (d.act === "applyplan") {
       if (await modal(`Apply plan ${d.id}?`, `<p class="muted">Offloads copy into the archive before anything is removed. Each step is rechecked against current rules and generations first.</p>`, [["Apply", "primary", true]])) {
@@ -499,9 +527,9 @@ async function start() {
   clearInterval(timer);
   timer = setInterval(async () => {
     await refreshStatus();
-    if (view === "Overview" || view === "Jobs") render();
+    if (view === "Overview" || view === "Jobs" || view === "Models") render();
     else if (view === "Logs" && logState.follow && document.activeElement?.id !== "lq") loadLogs().catch(() => {});
-  }, 3000);
+  }, 2000);
 }
 start();
 </script>

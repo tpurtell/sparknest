@@ -173,6 +173,10 @@ enum Cmd {
         id: Option<u64>,
         #[arg(long)]
         wait: bool,
+        /// Cancel job ID: files not yet started are skipped, nothing is
+        /// removed afterwards.
+        #[arg(long, requires = "id")]
+        cancel: bool,
     },
     /// Import a local directory into the namespace without copying (hard
     /// links into this node's store; must be on the same filesystem).
@@ -1220,7 +1224,8 @@ async fn main() -> Result<()> {
             }
             v
         }
-        Cmd::Jobs { id, wait } => match id {
+        Cmd::Jobs { id, wait, cancel } => match id {
+            Some(id) if *cancel => c.post(&format!("/v1/jobs/{id}/cancel"), json!({})).await?,
             Some(id) if *wait => wait_job(&c, *id).await?,
             Some(id) => c.get(&format!("/v1/jobs/{id}")).await?,
             None => c.get("/v1/jobs").await?,
@@ -1252,8 +1257,11 @@ async fn main() -> Result<()> {
 }
 
 fn job_line(j: &Value) -> String {
+    let cancelled = j["cancelled"].as_bool() == Some(true);
     let state = if j["finished"].as_bool() != Some(true) {
-        "running".to_string()
+        if cancelled { "cancelling" } else { "running" }.to_string()
+    } else if cancelled {
+        "cancelled".to_string()
     } else if let Some(e) = j["error"].as_str() {
         format!("failed: {e}")
     } else {

@@ -134,6 +134,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/reconcile", post(reconcile))
         .route("/v1/jobs", get(jobs))
         .route("/v1/jobs/{id}", get(job))
+        .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/import", post(import))
         .route("/v1/stores", get(stores).post(add_store))
         .route("/v1/offload", post(offload))
@@ -816,6 +817,11 @@ async fn logs(
         })
         .collect();
     Ok(Json(json!({ "lines": lines, "unreachable": missing })))
+}
+
+async fn cancel_job(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json::Value> {
+    api.placer.cancel_job(id).await?;
+    Ok(Json(json!({ "cancelled": id })))
 }
 
 async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_json::Value> {
