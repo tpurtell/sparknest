@@ -129,6 +129,10 @@ struct Handle {
     route: Mutex<Option<(Generation, Option<Route>)>>,
     /// Where this handle's previous direct read ended (u64::MAX: none).
     last_end: AtomicU64,
+    /// The file's attributes for fast-path reads of a STABLE generation,
+    /// trusted for `ATTR_TTL`: every read names its exact generation, so a
+    /// rewrite in between fails as Stale and the slow path refreshes.
+    stable_attr: Mutex<Option<(FileAttr, std::time::Instant)>>,
 }
 
 /// A generation readable from several copies.
@@ -397,6 +401,21 @@ impl Vfs {
             self.local_read_bytes.fetch_add(n, Ordering::Relaxed);
         }
         h.count(src, n);
+    }
+
+    /// Attributes for a fast-path read: cached on the handle for STABLE
+    /// generations (no query per page fault), else read.
+    fn fast_attr(&self, h: &Handle) -> Option<FileAttr> {
+        if let Some((a, at)) = h.stable_attr.lock().as_ref()
+            && at.elapsed() < ATTR_TTL
+        {
+            return Some(a.clone());
+        }
+        let a = self.raw_attr(h.file).ok()?;
+        if a.gen_state == GenState::Stable {
+            *h.stable_attr.lock() = Some((a.clone(), std::time::Instant::now()));
+        }
+        Some(a)
     }
 
     /// A direct read of a scattered file: note whether it continued the
@@ -1493,6 +1512,7 @@ impl Vfs {
             read_bytes: Default::default(),
             route: Mutex::new(None),
             last_end: AtomicU64::new(u64::MAX),
+            stable_attr: Mutex::new(None),
         });
         self.handles.lock().insert(fh, h);
         self.d.handle_opened(file);
@@ -1965,7 +1985,7 @@ impl Vfs {
         from_readahead: impl FnOnce(Vec<u8>) -> NestResult<R>,
     ) -> Option<NestResult<R>> {
         let h = self.handle(fh).ok()?;
-        let a = self.raw_attr(h.file).ok()?;
+        let a = self.fast_attr(&h)?;
         let key = ObjectKey::new(h.file, a.generation);
         // Until the first read has decided how this generation is served,
         // the slow path decides; a spread read only serves ready chunks here.
@@ -2011,6 +2031,45 @@ impl Vfs {
                 }
             }
             return Some(r);
+        }
+        // Scattered, no copy here: fetch exactly this range from the least
+        // busy copy on this thread, parked until the answer arrives (a page
+        // fault served without a trip through the runtime).
+        if scattered && a.gen_state == GenState::Stable {
+            let fab = self.fabric()?;
+            let route = self.route(&h, &a)?;
+            let peers: Vec<crate::balance::Source> = route
+                .sources
+                .iter()
+                .copied()
+                .filter(|s| matches!(s, crate::balance::Source::Peer(_)))
+                .collect();
+            if peers.is_empty() {
+                return None;
+            }
+            let n = a.size.saturating_sub(offset).min(size as u64) as usize;
+            let mut buf = vec![0u8; n];
+            let ticket = self.balancer.pick_least_busy(&peers);
+            let crate::balance::Source::Peer(node) = ticket.source() else {
+                return None;
+            };
+            let _t = self.track(h.file);
+            return match fab.read_now(node, h.file, a.generation, offset, &mut buf) {
+                Some(Ok(got)) => {
+                    ticket.finish(got as u64);
+                    buf.truncate(got);
+                    self.count_read(&h, crate::usage::Source::Remote, got as u64);
+                    self.note_direct(&h, offset, got as u64);
+                    Some(from_readahead(buf))
+                }
+                // Let the async path handle it (and its retries).
+                Some(Err(_)) => {
+                    ticket.fail();
+                    *h.stable_attr.lock() = None;
+                    None
+                }
+                None => None,
+            };
         }
         // Only STABLE generations are cached ahead: their bytes never change.
         if a.gen_state != GenState::Stable || scattered {
@@ -2676,6 +2735,10 @@ impl Vfs {
         Ok((cap, t.files + t.dirs))
     }
 }
+
+/// How long a handle trusts a STABLE generation's attributes on the fast
+/// path.
+const ATTR_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long an open served object is trusted before a full re-check.
 const SERVE_TTL: std::time::Duration = std::time::Duration::from_secs(2);

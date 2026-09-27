@@ -151,6 +151,8 @@ const KIND_ERR: u8 = 2;
 /// (`ReadSource::try_read_now`); larger ones go to the async path. The
 /// largest FUSE request is 128 KiB.
 const FAST_SERVE_MAX: usize = 128 << 10;
+/// How long `read_now` spins for its answer before parking.
+const READ_NOW_SPIN: Duration = Duration::from_micros(50);
 /// Unit of the in-flight byte budget.
 const BUDGET_UNIT: usize = 4 << 10;
 
@@ -255,19 +257,48 @@ struct Lane {
 struct Waiter {
     lane: u32,
     slot: Slot,
-    tx: oneshot::Sender<Result<(usize, Slot), NestError>>,
+    tx: Notify,
+}
+
+type Answer = Result<(usize, Slot), NestError>;
+
+/// How the reader waits: a task (`read`), or a thread that sent the request
+/// itself and parks until the completion thread hands it the answer
+/// (`read_now`: one wake instead of a trip through the runtime).
+enum Notify {
+    Task(oneshot::Sender<Answer>),
+    Thread(Arc<ThreadWait>),
+}
+
+struct ThreadWait {
+    answer: Mutex<Option<Answer>>,
+    thread: std::thread::Thread,
+}
+
+impl Notify {
+    fn send(self, a: Answer) {
+        match self {
+            Notify::Task(tx) => {
+                let _ = tx.send(a);
+            }
+            Notify::Thread(w) => {
+                *w.answer.lock() = Some(a);
+                w.thread.unpark();
+            }
+        }
+    }
 }
 
 impl Waiter {
     /// The peer wrote `len` bytes: hand the slot to the reader, or free it
     /// if the reader has gone.
     fn complete(self, len: usize) {
-        let _ = self.tx.send(Ok((len, self.slot)));
+        self.tx.send(Ok((len, self.slot)));
     }
 
     /// The peer will not write: the slot is free again.
     fn fail(self, e: NestError) {
-        let _ = self.tx.send(Err(e));
+        self.tx.send(Err(e));
     }
 }
 
@@ -343,6 +374,8 @@ pub struct Stats {
     pub serve_read_ns: AtomicU64,
     /// Reads answered on the completion thread (`try_read_now`).
     pub served_fast: AtomicU64,
+    /// Reads made on the calling thread (`read_now`).
+    pub read_now: AtomicU64,
 }
 
 impl Fabric {
@@ -743,7 +776,7 @@ impl Fabric {
             Waiter {
                 lane: lane.id,
                 slot,
-                tx,
+                tx: Notify::Task(tx),
             },
         );
         // SAFETY: inline send copies the message at post time.
@@ -789,6 +822,116 @@ impl Fabric {
         }
     }
 
+    /// A small read done on the calling thread, which parks until the
+    /// completion thread hands it the answer: for a FUSE thread serving a
+    /// page fault, one wake instead of a round trip through the runtime.
+    /// `None` when it cannot start at once (no link yet, no free slot,
+    /// budget or window room, or too large): use `read`. Never call it on
+    /// an async executor thread.
+    pub fn read_now(
+        &self,
+        peer: NodeId,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Option<Result<usize, NestError>> {
+        let len = dst.len();
+        if len > FAST_SERVE_MAX {
+            return None;
+        }
+        let link = self
+            .links
+            .lock()
+            .get(&peer)
+            .cloned()
+            .filter(|l| l.lanes.iter().all(|x| !x.dead.load(Ordering::SeqCst)))?;
+        let lane = link.lanes
+            [link.next.fetch_add(1, Ordering::Relaxed) as usize % link.lanes.len()]
+        .clone();
+        let t0 = std::time::Instant::now();
+        let _cap = self
+            .inflight
+            .try_acquire_many(len.div_ceil(BUDGET_UNIT).max(1) as u32)
+            .ok()?;
+        let slot = lane.dev.landing.try_acquire(len)?;
+        let _permit = lane.window.try_acquire().ok()?;
+        let key = (lane.dev.id, slot.id());
+        let mut msg = [0u8; MSG_SIZE];
+        ReadReq {
+            slot: slot.id(),
+            file: file.0,
+            generation: generation.0,
+            offset,
+            len: len as u32,
+            addr: slot.addr(),
+            rkey: slot.rkey(),
+        }
+        .encode(&mut msg);
+        let wait = Arc::new(ThreadWait {
+            answer: Mutex::new(None),
+            thread: std::thread::current(),
+        });
+        self.pending.lock().insert(
+            key,
+            Waiter {
+                lane: lane.id,
+                slot,
+                tx: Notify::Thread(wait.clone()),
+            },
+        );
+        // SAFETY: inline send copies the message at post time.
+        let posted = unsafe {
+            lane.qp.post_send(
+                wr(WR_SEND, lane.id, 0),
+                msg.as_mut_ptr(),
+                MSG_SIZE as u32,
+                0,
+                true,
+            )
+        };
+        if let Err(e) = posted {
+            drop(self.pending.lock().remove(&key));
+            self.fail_lane(&lane);
+            return Some(Err(NestError::Unavailable(e.to_string())));
+        }
+        // Spin briefly (the answer usually comes within a disk read), then
+        // park; the completion thread unparks us.
+        let answer = loop {
+            if let Some(a) = wait.answer.lock().take() {
+                break a;
+            }
+            let waited = t0.elapsed();
+            if waited < READ_NOW_SPIN {
+                std::hint::spin_loop();
+                continue;
+            }
+            if waited > Duration::from_secs(30) {
+                match self.pending.lock().remove(&key) {
+                    Some(w) => {
+                        // As in `read`: the slot may still be written.
+                        std::mem::forget(w.slot);
+                        self.fail_lane(&lane);
+                        return Some(Err(NestError::Unavailable("RDMA read timed out".into())));
+                    }
+                    // Answered just now: take it.
+                    None => continue,
+                }
+            }
+            std::thread::park_timeout(Duration::from_millis(10));
+        };
+        self.stats
+            .read_rtt_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Some(answer.map(|(n, slot)| {
+            dst[..n].copy_from_slice(slot.as_slice(n));
+            self.stats.reads.fetch_add(1, Ordering::Relaxed);
+            self.stats.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            self.stats.read_now.fetch_add(1, Ordering::Relaxed);
+            n
+        }))
+    }
+
     /// Take a lane out of service: the QP enters the error state (so the
     /// NIC stops touching its buffers) and requests sent on it fail.
     fn fail_lane(&self, lane: &Lane) {
@@ -807,7 +950,7 @@ impl Fabric {
                     // As on a timeout: a write may still land in the slot.
                     let Waiter { slot, tx, .. } = w;
                     std::mem::forget(slot);
-                    let _ = tx.send(Err(NestError::Unavailable("RDMA link failed".into())));
+                    tx.send(Err(NestError::Unavailable("RDMA link failed".into())));
                 }
             }
         }

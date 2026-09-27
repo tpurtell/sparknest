@@ -426,3 +426,75 @@ async fn mixed_sizes_share_the_tiers() {
         .unwrap();
     assert_eq!(b.len(), 0);
 }
+
+/// `read_now` from plain threads (as FUSE threads call it): right bytes and
+/// lengths, the file's tail, and `None` before a link exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_now_from_a_plain_thread() {
+    let Some((rpc1, f1)) = node(1, FabricConfig::default()).await else {
+        return;
+    };
+    let (rpc2, f2) = node(2, FabricConfig::default()).await.unwrap();
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+    let src: Arc<dyn ReadSource> = Arc::new(Quick);
+    f1.set_source(Arc::downgrade(&src));
+    // No link yet: the caller must use the async path.
+    let f = f2.clone();
+    let none = std::thread::spawn(move || {
+        let mut b = [0u8; 4096];
+        f.read_now(NodeId(1), FileId(7), Generation(3), 0, &mut b)
+            .is_none()
+    })
+    .join()
+    .unwrap();
+    assert!(none);
+    f2.read(NodeId(1), FileId(7), Generation(3), 0, 16)
+        .await
+        .unwrap();
+    let threads: Vec<_> = (0..8u64)
+        .map(|t| {
+            let f = f2.clone();
+            std::thread::spawn(move || {
+                for i in 0..200u64 {
+                    let off = ((t * 1000 + i) * 104_729) % (SIZE - 8192);
+                    let mut b = vec![0u8; 4096];
+                    let n = f
+                        .read_now(NodeId(1), FileId(7), Generation(3), off, &mut b)
+                        .expect("link and slots available")
+                        .unwrap();
+                    assert_eq!(n, 4096);
+                    assert!(
+                        b.iter()
+                            .enumerate()
+                            .all(|(k, v)| *v == byte(off + k as u64))
+                    );
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let f = f2.clone();
+    let tail = std::thread::spawn(move || {
+        let mut b = [0u8; 4096];
+        f.read_now(NodeId(1), FileId(7), Generation(3), SIZE - 5, &mut b)
+            .unwrap()
+            .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(tail, 5);
+    let f = f2.clone();
+    let stale = std::thread::spawn(move || {
+        let mut b = [0u8; 16];
+        f.read_now(NodeId(1), FileId(7), Generation(2), 0, &mut b)
+            .unwrap()
+            .err()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(stale, Some(NestError::Stale));
+    assert!(f2.stats.read_now.load(std::sync::atomic::Ordering::Relaxed) >= 1600);
+}

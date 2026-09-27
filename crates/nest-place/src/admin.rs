@@ -35,6 +35,9 @@ pub struct NodeInfo {
     /// Of the reads served, those answered on the completion thread.
     #[serde(default)]
     pub fabric_served_fast: u64,
+    /// Of the reads made, those made on the requesting FUSE thread.
+    #[serde(default)]
+    pub fabric_read_now: u64,
     /// Bytes this host read from its own disk through sparknest (tracked
     /// reads; rates come from differences between polls).
     #[serde(default)]
@@ -314,6 +317,9 @@ impl Admin {
                 f.stats
                     .served_fast
                     .load(std::sync::atomic::Ordering::Relaxed)
+            }),
+            fabric_read_now: fab.as_ref().map_or(0, |f| {
+                f.stats.read_now.load(std::sync::atomic::Ordering::Relaxed)
             }),
             local_read_bytes: self.vfs.local_read_bytes(),
             scattered_files: self.vfs.scattered_files() as u64,
