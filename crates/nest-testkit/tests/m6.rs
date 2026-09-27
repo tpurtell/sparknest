@@ -648,3 +648,33 @@ async fn cancelled_offload_keeps_every_live_copy() {
     // A finished job cannot be cancelled.
     assert!(p.cancel_job(id).await.is_err());
 }
+
+/// A store added before its folder existed (the gateway could not write the
+/// marker) is added again once it does: the same folder initializes; a
+/// different folder under the same name is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn adding_a_store_again_initializes_its_folder() {
+    let c = ready(2).await;
+    let p = &c.node(1).placer;
+    let dir = c.state_dir(1).join("late-nas");
+    let r = p
+        .add_store("nas", dir.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    assert!(r[0].1.is_err(), "{r:?}");
+    assert!(!p.stores().await.unwrap()[0].gateways[0].1.healthy);
+    std::fs::create_dir_all(&dir).unwrap();
+    let r = p
+        .add_store("nas", dir.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    assert!(r.iter().all(|(_, r)| r.is_ok()), "{r:?}");
+    let st = p.stores().await.unwrap();
+    assert_eq!(st.len(), 1);
+    assert!(st[0].gateways[0].1.healthy);
+    assert!(
+        p.add_store("nas", "/somewhere/else", &["n1".into()])
+            .await
+            .is_err()
+    );
+}

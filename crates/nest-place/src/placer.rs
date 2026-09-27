@@ -502,7 +502,7 @@ impl Placer {
             gateways: gws.iter().map(|g| g.node).collect(),
         };
         let json = serde_json::to_string(&cfg).map_err(|e| NestError::Io(e.to_string()))?;
-        let id = match self
+        let registered = self
             .vfs
             .data()
             .meta()
@@ -512,10 +512,28 @@ impl Placer {
                 node: None,
                 config: json,
             })
-            .await?
-        {
-            nest_meta::Reply::Store(id) => id,
-            other => return Err(NestError::Io(format!("unexpected {other:?}"))),
+            .await;
+        let id = match registered {
+            Ok(nest_meta::Reply::Store(id)) => id,
+            Ok(other) => return Err(NestError::Io(format!("unexpected {other:?}"))),
+            // Added before (perhaps with a gateway that could not write the
+            // marker then): the same folder initializes again, anything
+            // else is a conflict.
+            Err(NestError::Exists) => {
+                let (id, _, old) = self
+                    .archive_stores()?
+                    .into_iter()
+                    .find(|(_, n, _)| n == name)
+                    .ok_or(NestError::Exists)?;
+                if old.path != path {
+                    return Err(NestError::Invalid(format!(
+                        "store {name} exists with folder {}",
+                        old.path
+                    )));
+                }
+                id
+            }
+            Err(e) => return Err(e),
         };
         let mut out = Vec::new();
         for g in gws {
