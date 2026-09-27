@@ -127,8 +127,10 @@ struct Handle {
     /// How reads of a generation are served, decided on its first read:
     /// `Some(sources)` when spread over several copies.
     route: Mutex<Option<(Generation, Option<Route>)>>,
-    /// Where this handle's previous direct read ended (u64::MAX: none).
+    /// Where this handle's previous direct read ended (u64::MAX: none), and
+    /// the bytes of the sequential run it continued.
     last_end: AtomicU64,
+    run: AtomicU64,
     /// The file's attributes for fast-path reads of a STABLE generation,
     /// trusted for `ATTR_TTL`: every read names its exact generation, so a
     /// rewrite in between fails as Stale and the slow path refreshes.
@@ -425,8 +427,14 @@ impl Vfs {
     /// A direct read of a scattered file: note whether it continued the
     /// handle's previous one (streams switch back to readahead).
     fn note_direct(&self, h: &Handle, offset: u64, n: u64) {
-        let seq = h.last_end.swap(offset + n, Ordering::Relaxed) == offset;
-        self.patterns.direct(h.file, n, seq);
+        if h.last_end.swap(offset + n, Ordering::Relaxed) == offset {
+            h.run.fetch_add(n, Ordering::Relaxed);
+        } else {
+            let run = h.run.swap(n, Ordering::Relaxed);
+            if run > 0 {
+                self.patterns.run_ended(h.file, run);
+            }
+        }
     }
 
     /// Readahead chunks dropped on this host, and bytes of them consumed.
@@ -1522,6 +1530,7 @@ impl Vfs {
             read_bytes: Default::default(),
             route: Mutex::new(None),
             last_end: AtomicU64::new(u64::MAX),
+            run: AtomicU64::new(0),
             stable_attr: Mutex::new(None),
         });
         self.handles.lock().insert(fh, h);
@@ -1629,6 +1638,10 @@ impl Vfs {
             return;
         };
         self.fold_handle(&h);
+        let run = h.run.swap(0, Ordering::Relaxed);
+        if run > 0 {
+            self.patterns.run_ended(h.file, run);
+        }
         let owners: Vec<u64> = h.lock_owners.lock().drain().chain(lock_owner).collect();
         for owner in owners {
             self.release_locks(h.file, owner).await;

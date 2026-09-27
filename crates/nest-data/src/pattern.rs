@@ -28,10 +28,15 @@ use std::time::{Duration, Instant};
 const JUDGE_BYTES: u64 = 64 << 20;
 /// Random: readers consumed less than this share of the discarded chunks.
 const USED_SHARE: f64 = 0.25;
-/// Back to readahead after this many direct bytes...
-const SEQ_JUDGE_BYTES: u64 = 256 << 20;
-/// ...if at least this share of them continued the previous read.
-const SEQ_SHARE: f64 = 0.9;
+/// Back to readahead after direct reads in sequential runs of this many
+/// bytes in all (at least `JUDGE_RUNS` runs)...
+const RUN_JUDGE_BYTES: u64 = 256 << 20;
+const JUDGE_RUNS: u64 = 4;
+/// ...if the runs average this long: readahead pays only when a reader
+/// goes on well past its window. A loader reading one tensor per open reads
+/// sequentially too, but in runs of a few MiB, and readahead past each
+/// tensor's end is wasted (the files flapped between the two modes).
+const LONG_RUN: u64 = 64 << 20;
 /// Forget files not read for this long (and keep the table bounded).
 const IDLE: Duration = Duration::from_secs(30 * 60);
 const MAX_FILES: usize = 1 << 16;
@@ -46,8 +51,10 @@ struct Profile {
     discarded: u64,
     consumed: u64,
     /// Direct reads since switching, and those continuing the one before.
-    direct: u64,
-    sequential: u64,
+    /// Sequential runs of direct reads that ended since switching, and
+    /// their bytes.
+    runs: u64,
+    run_bytes: u64,
     last: Instant,
     /// When this host last changed its verdict (its record may be in flight).
     changed: Option<Instant>,
@@ -59,8 +66,8 @@ impl Profile {
             random: false,
             discarded: 0,
             consumed: 0,
-            direct: 0,
-            sequential: 0,
+            runs: 0,
+            run_bytes: 0,
             last: Instant::now(),
             changed: None,
         }
@@ -113,8 +120,8 @@ impl Patterns {
                 let settling = p.changed.is_some_and(|t| t.elapsed() < SETTLE);
                 if p.random != scattered && !settling {
                     p.random = scattered;
-                    p.direct = 0;
-                    p.sequential = 0;
+                    p.runs = 0;
+                    p.run_bytes = 0;
                     p.discarded = 0;
                     p.consumed = 0;
                 }
@@ -157,8 +164,8 @@ impl Patterns {
         if random {
             p.random = true;
             p.changed = Some(Instant::now());
-            p.direct = 0;
-            p.sequential = 0;
+            p.runs = 0;
+            p.run_bytes = 0;
             tracing::info!(
                 file = file.0,
                 "reads of this file are scattered: reading it directly"
@@ -171,21 +178,20 @@ impl Patterns {
         random
     }
 
-    /// A direct read of a random file; `sequential` when it started where
-    /// the handle's previous read ended.
-    pub fn direct(&self, file: FileId, bytes: u64, sequential: bool) {
+    /// A sequential run of direct reads of a scattered file ended (a read
+    /// elsewhere, or the handle closed) after `bytes`. Files whose runs
+    /// are long go back to readahead.
+    pub fn run_ended(&self, file: FileId, bytes: u64) {
         let mut m = self.files.lock();
-        let Some(p) = m.get_mut(&file) else {
+        let Some(p) = m.get_mut(&file).filter(|p| p.random) else {
             return;
         };
-        let mut streams = false;
         p.last = Instant::now();
-        p.direct += bytes;
-        if sequential {
-            p.sequential += bytes;
-        }
-        if p.direct >= SEQ_JUDGE_BYTES {
-            if p.sequential as f64 >= p.direct as f64 * SEQ_SHARE {
+        p.runs += 1;
+        p.run_bytes += bytes;
+        let mut streams = false;
+        if p.run_bytes >= RUN_JUDGE_BYTES && p.runs >= JUDGE_RUNS {
+            if p.run_bytes / p.runs >= LONG_RUN {
                 p.random = false;
                 p.changed = Some(Instant::now());
                 p.discarded = 0;
@@ -196,8 +202,8 @@ impl Patterns {
                     "reads of this file stream again: reading ahead"
                 );
             }
-            p.direct = 0;
-            p.sequential = 0;
+            p.runs = 0;
+            p.run_bytes = 0;
         }
         drop(m);
         if streams {
@@ -278,14 +284,21 @@ mod tests {
             p.discarded(F, CHUNK, 0);
         }
         assert!(p.is_random(F));
-        // Mostly scattered: stays direct.
-        for i in 0..512u64 {
-            p.direct(F, 1 << 20, i % 2 == 0);
+        // Scattered rows: stays direct.
+        for _ in 0..100_000 {
+            p.run_ended(F, 4096);
         }
         assert!(p.is_random(F));
-        // Streaming: back to readahead.
-        for _ in 0..256 {
-            p.direct(F, 1 << 20, true);
+        // One tensor per open, read front to back: still direct (the runs
+        // are short; this flapped under a sequential-share rule).
+        for _ in 0..200 {
+            p.run_ended(F, 6 << 20);
+        }
+        assert!(p.is_random(F));
+        // Long streams: back to readahead (after the short runs' tally
+        // clears, within a few).
+        for _ in 0..8 {
+            p.run_ended(F, 128 << 20);
         }
         assert!(!p.is_random(F));
     }
@@ -311,8 +324,8 @@ mod tests {
         // Its own fresh verdict is not undone by the old record.
         p.seed(FileId(10), false);
         assert!(p.is_random(FileId(10)));
-        for _ in 0..256 {
-            p.direct(F, 1 << 20, true);
+        for _ in 0..4 {
+            p.run_ended(F, 128 << 20);
         }
         assert_eq!(*seen.lock(), vec![(FileId(10), true), (F, false)]);
     }

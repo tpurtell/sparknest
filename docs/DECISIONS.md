@@ -853,3 +853,19 @@ for slots or the in-flight cap. A cold small read can stall a completion
 thread for about one disk read (~0.1–0.2 ms); if that shows under load,
 serve page-cache hits inline (RWF_NOWAIT) and send misses to the pool.
 Tier sizes and the budget are starting points, to be tuned by benchmark.
+
+## ADR-033 — Scattered files return to readahead only for long runs (2026-09-27)
+
+**Context.** ADR-031 switched a scattered file back to readahead when 90%
+of 256 MiB of direct reads continued the previous one. A loader that opens
+a shard per tensor reads each tensor front to back, so the weight shards
+looked like streams, went back to readahead, wasted it past every short
+tensor's end, and were judged scattered again: files flipped several times
+a minute, each flip a metadata write and a burst of 75–97% waste.
+
+**Decision.** Judge by run length instead: a handle's sequential run of
+direct reads ends at a read elsewhere or at close; a file returns to
+readahead only when its runs (at least 4, 256 MiB in all) average 64 MiB
+or more, well past readahead's window. Short sequential runs stay direct,
+where the kernel's own readahead requests (up to 128 KiB) pipeline them
+without waste.
