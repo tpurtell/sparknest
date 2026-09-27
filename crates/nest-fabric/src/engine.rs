@@ -158,6 +158,8 @@ const SERVE_DEPTH: usize = 256;
 /// A read the reader still waits for after this is failed (and its lane
 /// retired), as `read` does.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A completion thread keeps spinning this long after its last work.
+const HOT: Duration = Duration::from_millis(10);
 /// Unit of the in-flight byte budget.
 const BUDGET_UNIT: usize = 4 << 10;
 
@@ -1179,6 +1181,18 @@ impl Fabric {
         busy
     }
 
+    /// Whether this device has reads in flight: served reads in its ring or
+    /// waiting, or reads of ours awaiting answers on it.
+    fn outstanding(&self, dev: &Device) -> bool {
+        {
+            let s = dev.serve.lock();
+            if s.free.len() < SERVE_DEPTH || !s.waiting.is_empty() {
+                return true;
+            }
+        }
+        !dev.resolved.lock().is_empty() || self.pending.lock().keys().any(|(d, _)| *d == dev.id)
+    }
+
     /// Start waiting reads that have a staging slot and ring room.
     fn pump(&self, dev: &Device) {
         let mut g = dev.serve.lock();
@@ -1409,6 +1423,7 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
     let fd = dev.cq.fd();
     let mut idle_spins = 0u32;
     let mut armed = false;
+    let mut last_work = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let n = match dev.cq.poll(&mut wcs) {
             Ok(n) => n,
@@ -1425,10 +1440,21 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
         drop(f);
         if n > 0 || served {
             idle_spins = 0;
+            last_work = std::time::Instant::now();
             continue;
         }
         idle_spins += 1;
         if idle_spins < 2000 {
+            std::hint::spin_loop();
+            continue;
+        }
+        idle_spins = 0;
+        // Stay awake while hot: with work outstanding (reads in the ring,
+        // answers awaited) or within `HOT` of the last. A sleeping thread on
+        // the Sparks' deep idle states took hundreds of microseconds to
+        // wake, several times per read: a lone reader's 4 KiB row took
+        // ~790 us against ~150 us with the threads awake.
+        if last_work.elapsed() < HOT || weak.upgrade().is_some_and(|f| f.outstanding(&dev)) {
             std::hint::spin_loop();
             continue;
         }
@@ -1468,13 +1494,7 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
     }
 }
 
-/// The rails' links in bytes per second: each device port once (a port
-/// carrying two subnets is two rails but one link).
+/// The rails' links in bytes per second: each physical port once.
 fn link_bytes_per_s(rails: &[Rail]) -> u64 {
-    let mut seen = std::collections::HashSet::new();
-    rails
-        .iter()
-        .filter(|r| seen.insert((r.ibdev.clone(), r.port)))
-        .map(|r| r.rate_gbps as u64 * 1_000_000_000 / 8)
-        .sum()
+    crate::rail::link_gbps(rails) * 1_000_000_000 / 8
 }

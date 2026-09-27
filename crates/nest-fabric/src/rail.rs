@@ -5,6 +5,12 @@
 //! port carries both 10.55.0.22 and 10.55.1.22, which become two rails that
 //! pair with a Spark's two functions by subnet (ported from rdmapipe's
 //! discovery, generalized to several addresses per netdevice).
+//!
+//! Functions sharing one physical port are used only as far as the port
+//! needs (`trim`): a Spark's single cable reaches two PCIe functions, each
+//! capped by its PCIe x4 link (~115 Gb/s). At 100 Gb one function carries
+//! the whole port; at 200 Gb both are needed. Each port's rate counts once
+//! toward the host's link rate (`link_gbps`).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -131,5 +137,172 @@ pub fn discover(filter: &[String]) -> Vec<Rail> {
         }
     }
     rails.sort_by_key(|r| r.addr);
+    if filter.is_empty() {
+        trim(rails)
+    } else {
+        rails
+    }
+}
+
+/// The physical port a device's port 1 is on: functions of one NIC (same
+/// switch id) with the same PCI function number share it.
+fn port_key(ibdev: &str) -> String {
+    let dev = Path::new("/sys/class/infiniband")
+        .join(ibdev)
+        .join("device");
+    let func = fs::canonicalize(&dev)
+        .ok()
+        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+        .and_then(|pci| pci.rsplit('.').next().map(str::to_string));
+    let switch = fs::read_dir(dev.join("net"))
+        .ok()
+        .and_then(|mut d| d.next())
+        .and_then(|n| n.ok())
+        .and_then(|n| read(n.path().join("phys_switch_id")))
+        .filter(|s| !s.is_empty());
+    match (switch, func) {
+        (Some(s), Some(f)) => format!("{s}/{f}"),
+        _ => ibdev.to_string(),
+    }
+}
+
+/// A device's PCIe bandwidth in Gb/s: lanes × transfer rate, 90% of it
+/// usable (0: unknown).
+fn pcie_gbps(ibdev: &str) -> u32 {
+    let dev = Path::new("/sys/class/infiniband")
+        .join(ibdev)
+        .join("device");
+    let gts: f64 = read(dev.join("current_link_speed"))
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
+        .unwrap_or(0.0);
+    let width: f64 = read(dev.join("current_link_width"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    (gts * width * 0.9) as u32
+}
+
+/// One device's part in choosing: its port, the port's rate, its PCIe
+/// capacity (Gb/s), and its lowest rail address (the tie-break every host
+/// shares, so hosts pick matching subnets).
+#[derive(Clone, Debug)]
+struct DevInfo {
+    ibdev: String,
+    port: String,
+    rate: u32,
+    pcie: u32,
+    first: Ipv4Addr,
+}
+
+/// Per port, the fewest devices (lowest addresses first) whose PCIe
+/// capacity covers the port's rate; unknown capacity keeps them all.
+fn choose(devs: &[DevInfo]) -> std::collections::HashSet<String> {
+    let mut by_port: std::collections::BTreeMap<&str, Vec<&DevInfo>> = Default::default();
+    for d in devs {
+        by_port.entry(d.port.as_str()).or_default().push(d);
+    }
+    let mut keep = std::collections::HashSet::new();
+    for (_, mut ds) in by_port {
+        ds.sort_by_key(|d| d.first);
+        let rate = ds.iter().map(|d| d.rate).max().unwrap_or(0);
+        let mut cap = 0u32;
+        for d in &ds {
+            keep.insert(d.ibdev.clone());
+            if d.pcie == 0 {
+                continue;
+            }
+            cap += d.pcie;
+            if cap >= rate {
+                break;
+            }
+        }
+    }
+    keep
+}
+
+fn infos(rails: &[Rail]) -> Vec<DevInfo> {
+    let mut out: Vec<DevInfo> = Vec::new();
+    for r in rails {
+        match out.iter_mut().find(|d| d.ibdev == r.ibdev) {
+            Some(d) => d.first = d.first.min(r.addr),
+            None => out.push(DevInfo {
+                ibdev: r.ibdev.clone(),
+                port: port_key(&r.ibdev),
+                rate: r.rate_gbps,
+                pcie: pcie_gbps(&r.ibdev),
+                first: r.addr,
+            }),
+        }
+    }
+    out
+}
+
+/// Drop rails of functions the port does not need (see the module doc).
+pub fn trim(rails: Vec<Rail>) -> Vec<Rail> {
+    let devs = infos(&rails);
+    let keep = choose(&devs);
+    for d in devs.iter().filter(|d| !keep.contains(&d.ibdev)) {
+        tracing::info!(
+            device = %d.ibdev,
+            port_gbit = d.rate,
+            "not using this RDMA function: another on the same port carries its rate"
+        );
+    }
     rails
+        .into_iter()
+        .filter(|r| keep.contains(&r.ibdev))
+        .collect()
+}
+
+/// This host's link rate in Gb/s: each physical port once.
+pub fn link_gbps(rails: &[Rail]) -> u64 {
+    let mut ports = std::collections::HashMap::new();
+    for d in infos(rails) {
+        let e = ports.entry(d.port).or_insert(0u32);
+        *e = (*e).max(d.rate);
+    }
+    ports.values().map(|r| *r as u64).sum()
+}
+
+#[cfg(test)]
+mod choose_tests {
+    use super::*;
+
+    fn dev(ibdev: &str, port: &str, rate: u32, pcie: u32, first: [u8; 4]) -> DevInfo {
+        DevInfo {
+            ibdev: ibdev.into(),
+            port: port.into(),
+            rate,
+            pcie,
+            first: Ipv4Addr::from(first),
+        }
+    }
+
+    #[test]
+    fn a_spark_uses_one_function_at_100g_and_both_at_200g() {
+        let at = |rate| {
+            let mut k: Vec<String> = choose(&[
+                dev("roceP2p1s0f0", "sw/0", rate, 115, [10, 55, 1, 1]),
+                dev("rocep1s0f0", "sw/0", rate, 115, [10, 55, 0, 1]),
+            ])
+            .into_iter()
+            .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            at(100),
+            vec!["rocep1s0f0"],
+            "the lower subnet, on every host"
+        );
+        assert_eq!(at(200), vec!["roceP2p1s0f0", "rocep1s0f0"]);
+    }
+
+    #[test]
+    fn separate_ports_and_unknown_capacity_are_kept() {
+        let k = choose(&[
+            dev("mlx5_0", "a/0", 400, 460, [10, 55, 0, 22]),
+            dev("mlx5_1", "b/0", 100, 0, [10, 56, 0, 22]),
+        ]);
+        assert_eq!(k.len(), 2);
+    }
 }

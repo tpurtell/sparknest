@@ -905,3 +905,28 @@ sat unused at 36 ms).
 **Consequences.** One serve path to reason about and measure; the async
 serve and inline reads are gone. The fabric tests serve a real file.
 Readahead's 4 MiB chunks still use the awaiting `read`.
+
+## ADR-035 — Use only the RDMA functions a port needs; completion threads stay awake while hot (2026-09-27)
+
+**Context.** A Spark's one cable reaches two PCIe functions (10.55.0.x and
+10.55.1.x), each capped by its PCIe x4 link at ~115 Gb/s; both report the
+port's rate. At 200 Gb both are needed (the dual-rail finding); at the
+current 100 Gb one carries the port, and the second only costs a completion
+thread, and its rate was counted twice (200 Gb), inflating the in-flight
+budget and the source cap, as raptor's two subnets on one 400 Gb port had.
+Separately, a lone reader's 4 KiB row took ~790 µs against ~150 µs when the
+completion threads were busy: each request woke a sleeping thread on a
+deep-idle core, several times per read.
+
+**Decision.**
+- Rails are grouped by physical port (same NIC switch id and PCI function
+  number). Per port, the fewest functions (lowest subnet first, the same
+  choice on every host) whose PCIe capacity (lanes × GT/s × 0.9) covers the
+  port rate are used; the rest are not opened. A host's link rate counts
+  each port once. An explicit `[fabric] devices` filter overrides this.
+- A completion thread keeps spinning while it has reads outstanding and for
+  10 ms after its last work, then sleeps as before. At most one core per
+  used function spins, only while reads keep coming.
+
+**Measured.** Lone reader, cold 4 KiB rows from other hosts: 790 → 127 µs
+median (p99 299 µs); 32 readers: ~70k rows/s, median ~410 µs.
