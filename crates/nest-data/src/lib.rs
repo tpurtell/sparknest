@@ -13,6 +13,7 @@
 //! - Sessions, orphan release, and (later milestones) ranged reads,
 //!   owner-routed writes and whole-file transfers.
 
+pub mod fsck;
 mod local;
 mod readahead;
 mod remote;

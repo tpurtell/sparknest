@@ -107,6 +107,9 @@ pub struct DataNode {
     /// Set once this node has passed a leader read barrier after start:
     /// before that its view may predate invalidations and it serves nothing.
     caught_up: std::sync::atomic::AtomicBool,
+    /// False while a host that crashed is being checked (fsck): it serves
+    /// nothing until admitted.
+    admitted: std::sync::atomic::AtomicBool,
     /// Read lease: local copies may be served until this instant. Renewed
     /// by periodic leader read barriers, so a node cut off from the leader
     /// stops serving within one lease period (owners rely on this when a
@@ -164,6 +167,7 @@ impl DataNode {
             stopping,
             deletions: AtomicU64::new(0),
             caught_up: std::sync::atomic::AtomicBool::new(false),
+            admitted: std::sync::atomic::AtomicBool::new(true),
             lease_until: Mutex::new(None),
             lease,
             readers: Mutex::new(Vec::new()),
@@ -306,9 +310,11 @@ impl DataNode {
 
     /// Whether the read lease is currently valid.
     pub fn lease_valid(&self) -> bool {
-        self.lease_until
-            .lock()
-            .is_some_and(|t| std::time::Instant::now() < t)
+        self.admitted.load(Ordering::SeqCst)
+            && self
+                .lease_until
+                .lock()
+                .is_some_and(|t| std::time::Instant::now() < t)
     }
 
     /// The configured lease period.
@@ -323,15 +329,35 @@ impl DataNode {
 
     /// Wire up the meta node, reconcile local objects with committed
     /// metadata, open the workers, and start background duties.
-    pub async fn attach(self: &Arc<Self>, meta: Arc<MetaNode>) -> anyhow::Result<ReconcileReport> {
+    /// Start serving on top of `meta`. With `trust_local` the local metadata
+    /// is complete enough to reconcile the object store against right away.
+    /// Without it (the host crashed, ADR-026) nothing is served until
+    /// [`DataNode::admit`], after catching up and an fsck.
+    pub async fn attach(
+        self: &Arc<Self>,
+        meta: Arc<MetaNode>,
+        trust_local: bool,
+    ) -> anyhow::Result<ReconcileReport> {
         meta.wait_startup_replay().await?;
         let _ = self.meta.set(meta);
-        let report = self.reconcile().await?;
+        let report = if trust_local {
+            self.reconcile().await?
+        } else {
+            self.admitted.store(false, Ordering::SeqCst);
+            ReconcileReport::default()
+        };
         let _ = self.gate.send(true);
         self.clone().spawn_catch_up();
-        self.clone().spawn_startup_duties(report.clone());
+        if trust_local {
+            self.clone().spawn_startup_duties(report.clone());
+        }
         crate::session::spawn(self.clone());
         Ok(report)
+    }
+
+    /// Start serving (after the recovery fsck of a host that crashed).
+    pub fn admit(&self) {
+        self.admitted.store(true, Ordering::SeqCst);
     }
 
     pub fn shutdown(&self) {

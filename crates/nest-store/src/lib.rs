@@ -161,6 +161,15 @@ impl ObjectStore {
 
     /// Remove an object. Missing objects are not an error: deletion is
     /// idempotent. Readers holding descriptors keep reading until they close.
+    /// Give an object a different key, file id included (fsck moving an
+    /// orphan into lost+found). Refuses to overwrite.
+    pub fn move_object(&self, from: ObjectKey, to: ObjectKey) -> io::Result<()> {
+        if let Some(d) = self.path(to).parent() {
+            fs::create_dir_all(d)?;
+        }
+        rename_noreplace(&self.path(from), &self.path(to))
+    }
+
     pub fn delete(&self, k: ObjectKey) -> io::Result<bool> {
         match fs::remove_file(self.path(k)) {
             Ok(()) => Ok(true),

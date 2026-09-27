@@ -260,7 +260,7 @@ impl Vfs {
     }
 
     /// Run a closure with a pooled read-only metadata connection.
-    fn q<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> NestResult<T> {
+    pub(crate) fn q<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> NestResult<T> {
         let c = self.readers.lock().pop();
         let c = match c {
             Some(c) => c,
@@ -274,16 +274,16 @@ impl Vfs {
         r
     }
 
-    fn raw_attr(&self, file: FileId) -> NestResult<FileAttr> {
+    pub(crate) fn raw_attr(&self, file: FileId) -> NestResult<FileAttr> {
         self.q(|c| query::getattr(c, file))?
             .ok_or(NestError::NotFound)
     }
 
-    async fn propose(&self, cmd: Command) -> NestResult<Reply> {
+    pub(crate) async fn propose(&self, cmd: Command) -> NestResult<Reply> {
         self.d.meta().propose(cmd).await
     }
 
-    fn me(&self) -> NodeId {
+    pub(crate) fn me(&self) -> NodeId {
         self.d.id()
     }
 

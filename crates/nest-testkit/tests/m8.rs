@@ -304,3 +304,152 @@ async fn remove_tree_in_batches() {
         single
     );
 }
+
+async fn write_file(v: &nest_data::Vfs, name: &[u8], len: usize) -> FileId {
+    let (a, fh, _) = v
+        .create(FileId::ROOT, name, 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    v.write(fh, 0, vec![7u8; len]).await.unwrap();
+    v.release(fh, None).await;
+    a.id
+}
+
+/// A minority host loses power (its disk rolls back to an earlier durable
+/// point): it notices, catches up with the healthy quorum, settles its
+/// objects against the now-authoritative metadata, and serves again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn crashed_minority_host_recovers_against_the_quorum() {
+    use nest_data::fsck::{Action, Issue};
+    let mut c = ready(3).await;
+    let v1 = c.node(1).vfs.clone();
+    let doomed = write_file(&v1, b"doomed", 1000).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        c.attr(1, doomed)
+            .is_some_and(|a| a.gen_state == GenState::Stable)
+    })
+    .await;
+    let p = c.node(1).placer.clone();
+    let j = p
+        .replicate(
+            Selector::parse("/doomed", "/hub").unwrap(),
+            vec!["n3".into()],
+            2,
+        )
+        .await
+        .unwrap();
+    c.eventually("job", Duration::from_secs(10), |c| {
+        c.node(1).placer.job(j).is_some_and(|x| x.finished)
+    })
+    .await;
+
+    // What host 3's disk durably holds.
+    c.stop(3).await;
+    let durable = c.save_disk(3);
+    c.restart(3).await;
+    c.eventually("n3 serving", Duration::from_secs(8), |c| {
+        c.node(3).data.caught_up()
+    })
+    .await;
+
+    // After that point: a file only on host 3, a copy onto host 3, and a
+    // delete of a file host 3 held.
+    let v3 = c.node(3).vfs.clone();
+    let only3 = write_file(&v3, b"only-on-3", 2000).await;
+    let copied = write_file(&v1, b"copied", 3000).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        [only3, copied].iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|a| a.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    let j = p
+        .replicate(
+            Selector::parse("/copied", "/hub").unwrap(),
+            vec!["n3".into()],
+            2,
+        )
+        .await
+        .unwrap();
+    c.eventually("job", Duration::from_secs(10), |c| {
+        c.node(1).placer.job(j).is_some_and(|x| x.finished)
+    })
+    .await;
+    v1.unlink(FileId::ROOT, b"doomed").await.unwrap();
+    c.converge().await;
+
+    c.power_loss(3, Some(&durable)).await;
+    c.restart(3).await;
+    let n3 = c.node(3);
+    assert!(n3.prior.dirty());
+    let rep = n3
+        .recovery
+        .clone()
+        .expect("a crashed host runs the recovery fsck");
+    let find =
+        |pred: &dyn Fn(&Issue) -> bool| rep.findings.iter().find(|f| pred(&f.issue)).cloned();
+    // Written only on host 3 after its durable point: gone (catching up
+    // recreates an empty working object, which fsck reports as damaged).
+    let lost = find(&|i| {
+        matches!(i, Issue::Missing { file, .. } | Issue::Damaged { file, .. } if *file == only3.0)
+    })
+    .expect("only-on-3");
+    assert!(matches!(lost.action, Action::Lost { .. }), "{lost:?}");
+    let retired =
+        find(&|i| matches!(i, Issue::Missing { file, .. } if *file == copied.0)).expect("copied");
+    assert!(matches!(retired.action, Action::Retired), "{retired:?}");
+    // The deleted file's object went with the replayed delete.
+    let k = nest_store::ObjectKey::new(doomed, Generation(1));
+    assert!(!n3.data.store().exists(k));
+
+    // Host 3 agrees with the others and serves again.
+    c.converge().await;
+    assert!(c.lookup(3, FileId::ROOT, "doomed").is_none());
+    assert!(c.lookup(3, FileId::ROOT, "copied").is_some());
+    assert!(c.node(3).data.lease_valid());
+    let (fh, _) = v1.open(copied, 0).await.unwrap();
+    assert_eq!(v1.read(fh, 0, 10).await.unwrap(), vec![7u8; 10]);
+    v1.release(fh, None).await;
+
+    // An object nothing refers to: an online fsck quarantines it.
+    let stray = nest_store::ObjectKey::new(FileId(9_999_999), Generation(3));
+    std::fs::write(c.node(3).data.store().path(stray), b"stray bytes").unwrap();
+    let rep = c
+        .node(3)
+        .vfs
+        .fsck(&nest_data::fsck::FsckOptions {
+            repair: true,
+            orphans: nest_data::fsck::Orphans::Quarantine,
+            deep: false,
+            settle_owned: false,
+            min_age: Duration::ZERO,
+            host: "n3".into(),
+        })
+        .await
+        .unwrap();
+    let q = rep
+        .findings
+        .iter()
+        .find(|f| {
+            matches!(
+                f.issue,
+                Issue::Orphan {
+                    file: 9_999_999,
+                    ..
+                }
+            )
+        })
+        .expect("stray");
+    let Action::Quarantined { to } = &q.action else {
+        panic!("{q:?}")
+    };
+    assert_eq!(to, "/.lost+found/n3/000000000098967f.3");
+    c.converge().await;
+    let lf = c.lookup(1, FileId::ROOT, ".lost+found").unwrap();
+    let dir = c.lookup(1, lf, "n3").unwrap();
+    let f = c.lookup(1, dir, "000000000098967f.3").unwrap();
+    let (fh, _) = v1.open(f, 0).await.unwrap();
+    assert_eq!(v1.read(fh, 0, 64).await.unwrap(), b"stray bytes");
+    v1.release(fh, None).await;
+}

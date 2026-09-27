@@ -53,6 +53,16 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Check this host's objects against the metadata; report by default.
+    Fsck {
+        /// Apply the standard resolutions (never deletes data that might be
+        /// the only copy: such objects go to /.lost+found/<host>/).
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+        /// Also verify Hugging Face blobs against the SHA-256 in their names.
+        #[arg(long)]
+        deep: bool,
+    },
     /// Set a directory's automatic sealing policy.
     Policy {
         path: String,
@@ -605,6 +615,60 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&all)?);
             }
             if failed {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Cmd::Fsck { yes, deep } => {
+            let v = c
+                .post("/v1/fsck", json!({ "repair": yes, "deep": deep }))
+                .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                let findings = v["findings"].as_array().cloned().unwrap_or_default();
+                println!(
+                    "{}: {} objects checked, {} findings, {} files lost",
+                    v["host"].as_str().unwrap_or("?"),
+                    v["objects"],
+                    findings.len(),
+                    v["lost"]
+                );
+                for f in &findings {
+                    let what = f["issue"].as_str().unwrap_or("?");
+                    let path = f["path"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("object {}.{}", f["file"], f["generation"]));
+                    let mut line = format!("  {what:<10} {path}");
+                    if let Some(n) = f["note"].as_str() {
+                        line += &format!(" ({n})");
+                    }
+                    if what == "damaged" {
+                        line += &format!(" [{} bytes, expected {}]", f["found"], f["expected"]);
+                    }
+                    let act = f["action"].as_str().unwrap_or("?");
+                    line += &match act {
+                        "quarantined" => format!(" -> {}", f["to"].as_str().unwrap_or("")),
+                        "lost" => match f["to"].as_str() {
+                            Some(t) => format!(" -> LOST (bytes kept at {t})"),
+                            None => " -> LOST".into(),
+                        },
+                        "failed" => format!(" -> failed: {}", f["error"].as_str().unwrap_or("")),
+                        "reported" => String::new(),
+                        other => format!(" -> {other}"),
+                    };
+                    println!("{line}");
+                }
+                if !yes && !findings.is_empty() {
+                    println!("run with -y to apply the standard resolutions");
+                }
+            }
+            let bad = v["lost"].as_u64().unwrap_or(0) > 0
+                || v["findings"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|f| f["action"] == "failed"));
+            if bad {
                 std::process::exit(1);
             }
             return Ok(());

@@ -20,6 +20,7 @@ rusqlite.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 serde.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 serde_bytes.workspace = true
 bytes.workspace = true

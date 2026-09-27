@@ -40,6 +40,7 @@ pub fn fast_tuning() -> Tuning {
         lease: Duration::from_millis(800),
         mount: false,
         fabric: None,
+        boot_id: None,
     }
 }
 
@@ -48,6 +49,8 @@ pub struct TestCluster {
     pub tuning: Tuning,
     addrs: BTreeMap<u64, SocketAddr>,
     nodes: BTreeMap<u64, Node>,
+    /// Simulated kernel boot id per host (see [`TestCluster::power_loss`]).
+    boots: BTreeMap<u64, u64>,
 }
 
 impl TestCluster {
@@ -63,6 +66,7 @@ impl TestCluster {
             tuning,
             addrs: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            boots: BTreeMap::new(),
         };
         for id in 1..=n {
             c.boot(id, "127.0.0.1:0".parse().unwrap()).await;
@@ -129,7 +133,9 @@ impl TestCluster {
 
     async fn boot(&mut self, id: u64, listen: SocketAddr) {
         let cfg = self.config(id, listen);
-        let node = Node::start(cfg, b"testkit-secret".to_vec(), self.tuning.clone(), false)
+        let mut tuning = self.tuning.clone();
+        tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
+        let node = Node::start(cfg, b"testkit-secret".to_vec(), tuning, false)
             .await
             .unwrap();
         self.addrs.insert(id, node.rpc.local_addr());
@@ -165,6 +171,37 @@ impl TestCluster {
     pub async fn restart(&mut self, id: u64) {
         let addr = self.addrs[&id];
         self.boot(id, addr).await;
+    }
+
+    /// Copy a stopped node's state directory: what its disk holds at this
+    /// point (see [`TestCluster::power_loss`]).
+    pub fn save_disk(&self, id: u64) -> PathBuf {
+        assert!(!self.nodes.contains_key(&id), "stop the node first");
+        let to = self
+            .dir
+            .path()
+            .join(format!("saved-node{id}-{}", rand_suffix()));
+        copy_dir(&self.state_dir(id), &to);
+        to
+    }
+
+    /// Simulate the host losing power: the node stops without an orderly
+    /// shutdown, and with `durable` its disk goes back to that saved copy
+    /// (everything written since was only in memory). The next start sees a
+    /// new boot id, i.e. a host that crashed.
+    pub async fn power_loss(&mut self, id: u64, durable: Option<&std::path::Path>) {
+        if self.nodes.contains_key(&id) {
+            self.stop(id).await;
+        }
+        let dir = self.state_dir(id);
+        if let Some(saved) = durable {
+            let _ = std::fs::remove_dir_all(&dir);
+            copy_dir(saved, &dir);
+        }
+        let boot = self.boots.entry(id).or_insert(0);
+        let marker = serde_json::json!({ "boot_id": format!("test-boot-{boot}"), "clean": false });
+        std::fs::write(dir.join("run.json"), marker.to_string()).unwrap();
+        *boot += 1;
     }
 
     /// Delete a stopped node's entire state directory (disk loss).
@@ -253,5 +290,26 @@ impl TestCluster {
     pub fn attr(&self, id: u64, file: FileId) -> Option<nest_types::FileAttr> {
         let c = self.nodes[&id].meta.open_reader().unwrap();
         nest_meta::query::getattr(&c, file).unwrap()
+    }
+}
+
+fn rand_suffix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let p = e.path();
+        let dest = to.join(e.file_name());
+        if p.is_dir() {
+            copy_dir(&p, &dest);
+        } else if p.is_file() {
+            std::fs::copy(&p, &dest).unwrap();
+        }
     }
 }

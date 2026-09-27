@@ -25,6 +25,8 @@ pub struct Tuning {
     pub mount: bool,
     /// RDMA fabric settings; `None` disables it (TCP data path only).
     pub fabric: Option<nest_fabric::FabricConfig>,
+    /// Kernel boot id override (tests simulate a host crash with it).
+    pub boot_id: Option<String>,
 }
 
 impl Default for Tuning {
@@ -40,6 +42,7 @@ impl Default for Tuning {
             lease: Duration::from_secs(2),
             mount: true,
             fabric: Some(nest_fabric::FabricConfig::default()),
+            boot_id: None,
         }
     }
 }
@@ -55,6 +58,11 @@ pub struct Node {
     pub placer: Arc<nest_place::Placer>,
     api_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     mounted: parking_lot::Mutex<Option<nest_fuse::Mounted>>,
+    runstate: parking_lot::Mutex<crate::runstate::RunState>,
+    /// How the previous run ended.
+    pub prior: crate::runstate::Prior,
+    /// What the recovery fsck of a crashed host found, if one ran.
+    pub recovery: Option<nest_data::fsck::FsckReport>,
 }
 
 impl Node {
@@ -83,6 +91,18 @@ impl Node {
             if m.id != id {
                 rpc.set_peer(m.id, m.addr);
             }
+        }
+        let boot = tuning
+            .boot_id
+            .clone()
+            .unwrap_or_else(crate::runstate::boot_id);
+        let (runstate, prior) = crate::runstate::RunState::begin(&cfg.node.state_dir, &boot)
+            .context("recording the run state")?;
+        if prior.dirty() {
+            tracing::warn!(
+                "this host went down while sparknestd was running: unsynced writes may be lost; \
+                 it will catch up with the cluster and check its objects before serving"
+            );
         }
         let store =
             Arc::new(ObjectStore::open(&cfg.node.state_dir).context("opening object store")?);
@@ -114,9 +134,14 @@ impl Node {
                 tracing::info!("initialized new cluster");
             }
         }
-        let report = data.attach(meta.clone()).await?;
+        let report = data.attach(meta.clone(), !prior.dirty()).await?;
         tracing::info!(?report, "local store reconciled");
         let vfs = Vfs::new(data.clone(), tuning.vfs.clone());
+        let recovery = if prior.dirty() {
+            Some(Self::recover(&cfg, &data, &vfs).await?)
+        } else {
+            None
+        };
         let fabric = match (cfg.fabric.mode, &tuning.fabric) {
             (crate::config::FabricMode::Tcp, _) | (_, None) => None,
             (mode, Some(fc)) => {
@@ -156,6 +181,7 @@ impl Node {
             hub: "/hub".into(),
             web_token: nest_api::web_token(&secret_for_web),
             web_addr: cfg.node.api_listen,
+            host: cfg.node.name.clone(),
         };
         let sock = cfg.api_socket();
         let web_addr = cfg.node.api_listen;
@@ -185,6 +211,9 @@ impl Node {
             placer,
             api_task: parking_lot::Mutex::new(Some(api_task)),
             mounted: parking_lot::Mutex::new(None),
+            runstate: parking_lot::Mutex::new(runstate),
+            prior,
+            recovery,
         };
         if tuning.mount
             && let Some(mp) = node.cfg.node.mountpoint.clone()
@@ -223,6 +252,42 @@ impl Node {
         }
     }
 
+    /// A host that crashed: wait until caught up with the cluster, so the
+    /// metadata is complete, then settle the object store against it and
+    /// start serving (ADR-026).
+    async fn recover(
+        cfg: &Config,
+        data: &Arc<DataNode>,
+        vfs: &Arc<Vfs>,
+    ) -> anyhow::Result<nest_data::fsck::FsckReport> {
+        let mut waited = 0u64;
+        while !data.wait_caught_up(Duration::from_secs(10)).await {
+            waited += 10;
+            tracing::warn!(
+                seconds = waited,
+                "recovery: still waiting to reach the cluster"
+            );
+        }
+        let report = vfs
+            .fsck(&nest_data::fsck::FsckOptions {
+                repair: true,
+                orphans: nest_data::fsck::Orphans::Delete,
+                deep: false,
+                settle_owned: true,
+                min_age: Duration::ZERO,
+                host: cfg.node.name.clone(),
+            })
+            .await?;
+        tracing::info!(
+            objects = report.objects,
+            findings = report.findings.len(),
+            lost = report.lost(),
+            "recovery fsck done; serving"
+        );
+        data.admit();
+        Ok(report)
+    }
+
     pub async fn shutdown(&self) {
         if let Some(t) = self.api_task.lock().take() {
             t.abort();
@@ -234,5 +299,8 @@ impl Node {
         self.data.shutdown();
         self.meta.shutdown().await;
         self.rpc.shutdown();
+        if let Err(e) = self.runstate.lock().end_clean() {
+            tracing::warn!(error = %e, "could not record a clean shutdown");
+        }
     }
 }

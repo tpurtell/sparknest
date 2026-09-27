@@ -31,6 +31,8 @@ pub struct Api {
     pub web_token: String,
     /// Network listener address, if any (for `nest ui`).
     pub web_addr: Option<std::net::SocketAddr>,
+    /// This host's name (for lost+found).
+    pub host: String,
 }
 
 /// The web/API bearer token: HMAC of a fixed label under the cluster secret,
@@ -122,6 +124,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/ls", get(ls))
         .route("/v1/seal", post(seal))
         .route("/v1/rm", post(remove))
+        .route("/v1/fsck", post(fsck))
         .route("/v1/seal-policy", post(seal_policy))
         .route("/v1/where", get(where_))
         .route("/v1/replicate", post(replicate))
@@ -287,6 +290,43 @@ async fn ls(State(api): State<Api>, Query(q): Query<PathQ>) -> R<serde_json::Val
         out.push(entry(path.rsplit('/').next().unwrap_or("").to_string(), a)?);
     }
     Ok(Json(json!({ "path": path, "entries": out })))
+}
+
+#[derive(Deserialize)]
+struct FsckReq {
+    /// Apply the standard, non-destructive resolutions.
+    #[serde(default)]
+    repair: bool,
+    #[serde(default)]
+    deep: bool,
+}
+
+/// Check this host's objects against the metadata (ADR-026).
+async fn fsck(State(api): State<Api>, Json(r): Json<FsckReq>) -> R<serde_json::Value> {
+    use nest_data::fsck::{FsckOptions, Orphans};
+    let rep = api
+        .vfs
+        .fsck(&FsckOptions {
+            repair: r.repair,
+            // Never delete what might be the only copy of data the metadata
+            // forgot: keep it in lost+found.
+            orphans: if r.repair {
+                Orphans::Quarantine
+            } else {
+                Orphans::Report
+            },
+            deep: r.deep,
+            settle_owned: false,
+            min_age: std::time::Duration::from_secs(600),
+            host: api.host.clone(),
+        })
+        .await?;
+    Ok(Json(serde_json::json!({
+        "host": api.host,
+        "objects": rep.objects,
+        "lost": rep.lost(),
+        "findings": rep.findings,
+    })))
 }
 
 #[derive(Deserialize)]
