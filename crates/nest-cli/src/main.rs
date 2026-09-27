@@ -109,7 +109,7 @@ enum Cmd {
     Plan {
         #[command(subcommand)]
         cmd: Option<PlanCmd>,
-        /// HOST_OR_@GROUP=SIZE (repeatable)
+        /// HOST_OR_@GROUP=SIZE (repeatable); a bare number is GiB (600 = 600 GiB)
         #[arg(long)]
         free: Vec<String>,
     },
@@ -204,10 +204,11 @@ fn parse_size(s: &str) -> Result<u64> {
     let (num, unit) = s.split_at(split);
     let n: f64 = num.parse().with_context(|| format!("bad size {s:?}"))?;
     let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1.0,
+        // A free-space floor in bytes is never meant: "600" is 600 GiB.
+        "" | "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "b" => 1.0,
         "k" | "kb" | "kib" => 1024.0,
         "m" | "mb" | "mib" => 1024.0 * 1024.0,
-        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
         "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
         other => bail!("unknown size unit {other:?}"),
     };

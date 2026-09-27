@@ -294,26 +294,43 @@ async function jobs() {
   }).join("") + `</table></div>`;
 }
 
+// "600" means 600 GiB here: nobody sets a free-space floor in bytes.
 function parseSize(s) {
   const m = /^\s*([\d.]+)\s*([kmgt]?)(i?b)?\s*$/i.exec(s);
-  if (!m) throw new Error(`bad size "${s}" (e.g. 400GiB, 1.5T)`);
-  return Math.floor(parseFloat(m[1]) * 1024 ** " kmgt".indexOf((m[2] || " ").toLowerCase()));
+  if (!m) throw new Error(`bad size "${s}" (e.g. 600, 600G, 1.5T)`);
+  const unit = (m[2] || "g").toLowerCase();
+  return Math.floor(parseFloat(m[1]) * 1024 ** " kmgt".indexOf(unit));
 }
 
 async function space() {
   groups = (await get("/v1/groups")).groups;
-  const input = k => `<input class="free" data-k="${esc(k)}" placeholder="—" value="${esc(planInputs[k] || "")}" style="width:110px">`;
-  const grows = groups.map(g => `<tr><td><b>@${esc(g.name)}</b></td><td class="small muted">${esc(g.members.join(", "))}</td><td></td><td>${input("@" + g.name)}</td></tr>`).join("");
-  const nrows = (status?.nodes || []).map(n => `<tr><td>${esc(n.name)}</td><td class="num">${n.info ? human(n.info.free_bytes) : "?"}</td>
-    <td class="num">${n.info ? human(n.info.total_bytes) : "?"}</td><td>${input(n.name)}</td></tr>`).join("");
-  let out = `<h2>Desired free space</h2><p class="muted small">Set a floor for hosts or groups; a host set directly beats its group. Planning moves nothing:
+  const nodes = status?.nodes || [];
+  const ours = n => n.info ? n.info.object_bytes : 0;
+  const byHost = Object.fromEntries(nodes.map(n => [n.name, n]));
+  const input = k => `<input class="free" data-k="${esc(k)}" placeholder="e.g. 600" value="${esc(planInputs[k] || "")}" style="width:110px">`;
+  const grows = groups.map(g => `<tr><td><b>@${esc(g.name)}</b></td><td colspan="3" class="small muted">${esc(g.members.join(", "))}</td><td>${input("@" + g.name)}</td></tr>`).join("");
+  const nrows = nodes.map(n => `<tr><td>${esc(n.name)}</td><td class="num"><b>${n.info ? human(ours(n)) : "?"}</b> <span class="muted small">${n.info ? n.info.objects + " files" : ""}</span></td>
+    <td class="num">${n.info ? human(n.info.free_bytes) : "?"}</td><td class="num">${n.info ? human(n.info.total_bytes) : "?"}</td><td>${input(n.name)}</td></tr>`).join("");
+  const live = nodes.reduce((a, n) => a + ours(n), 0);
+  const archived = stores.reduce((a, s) => a + ((s.gateways[0] || [])[1]?.object_bytes || 0), 0);
+  let out = `<h2>Space</h2><p class="muted small">sparknest holds <b>${human(live)}</b> on the hosts (all copies) and <b>${human(archived)}</b> in archive stores.
+    "Free" is the whole disk; only sparknest's own copies can be moved to make room.</p>
+    <h2>Desired free space</h2><p class="muted small">Set a floor in GiB (or 1.5T, 800G …) for hosts or groups; a host set directly beats its group. Planning moves nothing:
     it lists redundant copies to remove, then sole copies to offload to an archive store. Last copies and copies a rule requires are never removed.</p>
-    <div class="tablewrap"><table><tr><th>Host</th><th class="num">Free</th><th class="num">Total</th><th>Keep free</th></tr>${grows}${nrows}</table></div>
+    <div class="tablewrap"><table><tr><th>Host</th><th class="num">sparknest here</th><th class="num">Free</th><th class="num">Total</th><th>Keep free</th></tr>${grows}${nrows}</table></div>
     <div class="row"><button class="btn primary" data-act="mkplan">Make plan</button>${lastPlan ? ` <button class="btn" data-act="clearplan">Clear</button>` : ""}</div>`;
   if (lastPlan) {
     const p = lastPlan;
-    const hosts = p.hosts.map(h => `<tr><td>${esc(h.host)}</td><td class="num">${human(h.free_now)}</td><td class="num">${human(h.projected_free)}${h.projected_free > h.free_now ? ` <span class="muted small">+${human(h.projected_free - h.free_now)}</span>` : ""}</td>
-      <td class="num">${human(h.target)}</td><td>${h.projected_free >= h.target ? "✓" : `<span style="color:var(--bad)">short ${human(h.target - h.projected_free)}</span>`}</td></tr>`).join("");
+    const hosts = p.hosts.map(h => {
+      const n = byHost[h.host];
+      const met = h.projected_free >= h.target;
+      const state = met
+        ? (h.free_now >= h.target ? `<span class="muted">already met</span>` : "✓ met by this plan")
+        : `<span style="color:var(--bad)">short ${human(h.target - h.projected_free)}</span>`;
+      return `<tr><td>${esc(h.host)}</td><td class="num">${n ? human(ours(n)) : "?"}</td><td class="num">${human(h.free_now)}</td>
+        <td class="num">${human(h.projected_free)}${h.projected_free > h.free_now ? ` <span class="muted small">+${human(h.projected_free - h.free_now)}</span>` : ""}</td>
+        <td class="num">${human(h.target)}</td><td>${state}</td></tr>`;
+    }).join("");
     const steps = p.steps.map(st => {
       const what = st.kind === "evict" ? `Remove ${st.copies.length} redundant copies from <b>${esc(st.host)}</b>`
         : `Offload ${st.copies.length} sole copies from <b>${esc(st.host)}</b> to <b>${esc(st.store)}</b>`;
@@ -322,7 +339,7 @@ async function space() {
     }).join("");
     const blocked = p.blocked.map(b => `<div class="card" style="color:var(--bad)">${esc(b)}</div>`).join("");
     out += `<h2>Plan ${p.id} ${p.feasible ? "" : `<span class="pill" style="color:var(--bad)">not fully feasible</span>`}</h2>
-      <div class="tablewrap"><table><tr><th>Host</th><th class="num">Free now</th><th class="num">After</th><th class="num">Target</th><th></th></tr>${hosts}</table></div>
+      <div class="tablewrap"><table><tr><th>Host</th><th class="num">sparknest here</th><th class="num">Free now</th><th class="num">After</th><th class="num">Target</th><th></th></tr>${hosts}</table></div>
       ${steps || `<div class="empty">Nothing to do: every target is already met or nothing can safely move.</div>`}${blocked}
       ${p.steps.length ? `<div class="row"><button class="btn primary" data-act="applyplan" data-id="${p.id}">Apply plan</button></div>` : ""}`;
   }
