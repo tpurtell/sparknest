@@ -162,6 +162,9 @@ struct Owned {
 }
 
 pub struct Vfs {
+    /// Bytes read through sparknest from this host's own disk (tracked
+    /// reads; passthrough bypasses us), for live rates.
+    local_read_bytes: AtomicU64,
     d: Arc<DataNode>,
     cfg: VfsConfig,
     weak: Weak<Vfs>,
@@ -251,6 +254,7 @@ impl Vfs {
     /// observer of ownership and session effects.
     pub fn new(d: Arc<DataNode>, cfg: VfsConfig) -> Arc<Vfs> {
         let vfs = Arc::new_cyclic(|weak| Vfs {
+            local_read_bytes: AtomicU64::new(0),
             d: d.clone(),
             cfg,
             weak: weak.clone(),
@@ -367,6 +371,19 @@ impl Vfs {
     }
 
     /// Where `src` sits for usage accounting.
+    /// Count bytes a handle read, by origin (usage) and host-wide (local).
+    fn count_read(&self, h: &Handle, src: crate::usage::Source, n: u64) {
+        if src == crate::usage::Source::Local {
+            self.local_read_bytes.fetch_add(n, Ordering::Relaxed);
+        }
+        h.count(src, n);
+    }
+
+    /// Bytes read from this host's own disk through sparknest so far.
+    pub fn local_read_bytes(&self) -> u64 {
+        self.local_read_bytes.load(Ordering::Relaxed)
+    }
+
     fn source_kind(&self, src: &Arc<nest_store::ObjectStore>) -> crate::usage::Source {
         if Arc::ptr_eq(src, self.d.store()) {
             crate::usage::Source::Local
@@ -1623,8 +1640,8 @@ impl Vfs {
                 match r.read(&fab, offset, size).await {
                     Ok(b) => {
                         let (l, rem) = r.take_served();
-                        h.count(crate::usage::Source::Local, l);
-                        h.count(crate::usage::Source::Remote, rem);
+                        self.count_read(&h, crate::usage::Source::Local, l);
+                        self.count_read(&h, crate::usage::Source::Remote, rem);
                         return Ok(b);
                     }
                     Err(e) => {
@@ -1663,7 +1680,7 @@ impl Vfs {
                     .await
                     .expect("blocking task");
                 if let Ok(b) = &r {
-                    h.count(kind, b.len() as u64);
+                    self.count_read(&h, kind, b.len() as u64);
                 }
                 return r;
             }
@@ -1706,7 +1723,7 @@ impl Vfs {
                     };
                     match r {
                         Ok(b) => {
-                            h.count(crate::usage::Source::Remote, b.len() as u64);
+                            self.count_read(&h, crate::usage::Source::Remote, b.len() as u64);
                             return Ok(b);
                         }
                         Err(NestError::Stale) => {
@@ -1737,7 +1754,7 @@ impl Vfs {
                     .await
                 {
                     Ok(DataResp::Data(b)) => {
-                        h.count(crate::usage::Source::Remote, b.len() as u64);
+                        self.count_read(&h, crate::usage::Source::Remote, b.len() as u64);
                         return Ok(b);
                     }
                     Ok(other) => last = NestError::Io(format!("unexpected response {other:?}")),
@@ -1757,7 +1774,7 @@ impl Vfs {
                     .await
                     .expect("blocking task");
                 if let Ok(b) = &r {
-                    h.count(crate::usage::Source::Archive, b.len() as u64);
+                    self.count_read(&h, crate::usage::Source::Archive, b.len() as u64);
                 }
                 return r;
             }
@@ -1865,7 +1882,7 @@ impl Vfs {
                 // The bytes a read at `offset` can return, without asking
                 // the caller's result type for its length.
                 let n = a.size.saturating_sub(offset).min(size as u64);
-                h.count(self.source_kind(&src), n);
+                self.count_read(&h, self.source_kind(&src), n);
             }
             return Some(r);
         }
@@ -1882,8 +1899,8 @@ impl Vfs {
         let out = r.try_ready(offset, size)?;
         r.advance(&fab, offset, size);
         let (l, rem) = r.take_served();
-        h.count(crate::usage::Source::Local, l);
-        h.count(crate::usage::Source::Remote, rem);
+        self.count_read(&h, crate::usage::Source::Local, l);
+        self.count_read(&h, crate::usage::Source::Remote, rem);
         Some(from_readahead(out))
     }
 

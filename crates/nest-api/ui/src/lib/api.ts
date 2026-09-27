@@ -81,6 +81,8 @@ export interface NodeInfo {
   version: string;
   fabric_read_bytes: number;
   fabric_served_bytes: number;
+  /** Read from its own disk through sparknest (tracked, not passthrough). */
+  local_read_bytes?: number;
   io?: SourceReport[];
   disk_read_bps?: number;
   link_bps?: number;

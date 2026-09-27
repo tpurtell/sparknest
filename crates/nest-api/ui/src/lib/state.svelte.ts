@@ -34,6 +34,8 @@ export function singleFlight<A extends unknown[]>(fn: (...a: A) => Promise<unkno
 export interface Rates {
   read: number;
   served: number;
+  /** From its own disk, tracked by sparknest. */
+  local: number;
 }
 
 export const app = $state({
@@ -54,7 +56,7 @@ export const app = $state({
   live: false,
 });
 
-const prev: Record<string, { t: number; r: number; s: number }> = {};
+const prev: Record<string, { t: number; r: number; s: number; l: number }> = {};
 
 let runningIds = new Set<number>();
 
@@ -75,9 +77,10 @@ function apply(status: Status, stores: Store[], jobs: Job[], groups: { name: str
         rates[n.name] = {
           read: Math.max(0, (i.fabric_read_bytes - p.r) / dt),
           served: Math.max(0, (i.fabric_served_bytes - p.s) / dt),
+          local: Math.max(0, ((i.local_read_bytes ?? 0) - p.l) / dt),
         };
       }
-      prev[n.name] = { t: now, r: i.fabric_read_bytes, s: i.fabric_served_bytes };
+      prev[n.name] = { t: now, r: i.fabric_read_bytes, s: i.fabric_served_bytes, l: i.local_read_bytes ?? 0 };
     }
     app.status = status;
     app.stores = stores;

@@ -11,6 +11,7 @@
   const cap = $derived(hosts.reduce((a, h) => a + (h.info?.total_bytes ?? 0), 0));
   const archived = $derived(app.stores.reduce((a, s) => a + (s.gateways.find(([, h]) => h.healthy)?.[1].object_bytes ?? 0), 0));
   const flow = $derived(Object.values(app.rates).reduce((a, r) => a + r.read, 0));
+  const direct = $derived(Object.values(app.rates).reduce((a, r) => a + r.local, 0));
   // Spread-read rates a host measured: from its disk and from other hosts.
   const spread = (i: NonNullable<(typeof hosts)[number]["info"]>) => ({
     disk: (i.io ?? []).filter((s) => s.source === "Local").reduce((a, s) => a + s.bytes_per_s, 0),
@@ -24,6 +25,7 @@
     <div class="tile panel"><div class="caps">In archives</div><div class="big">{human(archived)}</div><div class="small muted">{app.stores.length} archive store{app.stores.length === 1 ? "" : "s"}</div></div>
     <div class="tile panel"><div class="caps">Free on hosts</div><div class="big">{human(free)}</div><div class="small muted">of {human(cap)} ({pct(free, cap).toFixed(0)}%)</div></div>
     <div class="tile panel" class:hot={flow > 1e6}><div class="caps">Fabric now</div><div class="big">{rate(flow)}</div><div class="small muted">reads between hosts</div></div>
+    <div class="tile panel" class:hot={direct > 1e6}><div class="caps">Tracked direct</div><div class="big">{rate(direct)}</div><div class="small muted">hosts reading their own disks</div></div>
   </div>
 
   <JobStrip />
@@ -48,6 +50,7 @@
           <div class="row tiny muted mono"><span>{human(i.object_bytes)} held · {i.objects} files</span><span class="spacer"></span>
             {#if spread(i).disk + spread(i).net > 1e6}<span class="live" title="spread reads, last 10 s">disk {rate(spread(i).disk)} · net {rate(spread(i).net)}</span>
             {:else if app.rates[h.name]?.read > 1e5}<span class="live">↓{rate(app.rates[h.name].read)}</span>{/if}
+            {#if !(spread(i).disk > 1e6) && app.rates[h.name]?.local > 1e5}<span class="live" title="read from its own disk">disk {rate(app.rates[h.name].local)}</span>{/if}
             {#if app.rates[h.name]?.served > 1e5}<span class="live">↑{rate(app.rates[h.name].served)}</span>{/if}</div>
         {/if}
       </button>
@@ -76,7 +79,7 @@
 </div>
 
 <style>
-  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
   .tile { padding: 14px 16px; }
   .tile.hot { border-color: rgba(56, 232, 255, 0.5); box-shadow: 0 0 30px rgba(56, 232, 255, 0.2); }
   .big { font-size: clamp(20px, 2.6vw, 30px); font-weight: 650; font-family: var(--mono); letter-spacing: -0.02em; background: linear-gradient(90deg, #f1fbff, #8fe9ff); -webkit-background-clip: text; background-clip: text; color: transparent; }
@@ -95,5 +98,8 @@
   .live { color: var(--spark); }
   .sec { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
   .ell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  @media (max-width: 899px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 899px) {
+    .tiles { grid-template-columns: repeat(2, 1fr); }
+    .tiles > :last-child:nth-child(odd) { grid-column: span 2; }
+  }
 </style>

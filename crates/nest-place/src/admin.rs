@@ -32,6 +32,10 @@ pub struct NodeInfo {
     pub fabric_read_bytes: u64,
     #[serde(default)]
     pub fabric_served_bytes: u64,
+    /// Bytes this host read from its own disk through sparknest (tracked
+    /// reads; rates come from differences between polls).
+    #[serde(default)]
+    pub local_read_bytes: u64,
     /// What this host has learned about the sources it reads from
     /// (ADR-030): latency, in flight, recent rate.
     #[serde(default)]
@@ -294,6 +298,7 @@ impl Admin {
             version: env!("CARGO_PKG_VERSION").to_string(),
             fabric_read_bytes,
             fabric_served_bytes,
+            local_read_bytes: self.vfs.local_read_bytes(),
             io: self.vfs.io_report(),
             disk_read_bps: self.vfs.disk_read_bps(),
             fabric_timing: fab

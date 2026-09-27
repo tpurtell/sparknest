@@ -53,7 +53,7 @@ impl FileUsage {
 }
 
 /// Where read bytes came from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Local,
     Remote,
