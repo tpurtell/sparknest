@@ -1227,7 +1227,14 @@ async fn main() -> Result<()> {
         Cmd::Jobs { id, wait, cancel } => match id {
             Some(id) if *cancel => c.post(&format!("/v1/jobs/{id}/cancel"), json!({})).await?,
             Some(id) if *wait => wait_job(&c, *id).await?,
-            Some(id) => c.get(&format!("/v1/jobs/{id}")).await?,
+            Some(id) => {
+                let v = c.get(&format!("/v1/jobs/{id}")).await?;
+                if !cli.json {
+                    println!("{}", job_line(&v["job"]));
+                    return Ok(());
+                }
+                v
+            }
             None => c.get("/v1/jobs").await?,
         },
         Cmd::Import {
