@@ -142,7 +142,7 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
             file,
             generation,
             store,
-        } => publish_replica(c, *file, *generation, *store),
+        } => publish_replica(c, *file, *generation, *store, fx),
         Command::RetireReplica {
             file,
             generation,
@@ -1156,16 +1156,25 @@ fn publish_replica(
     file: FileId,
     generation: Generation,
     store: StoreId,
+    fx: &mut Vec<Effect>,
 ) -> R<Reply> {
     let a = attr(c, file)?;
     if a.kind != FileKind::Regular || a.gen_state != GenState::Stable || a.generation != generation
     {
         return err(NestError::Stale);
     }
-    c.prepare_cached(
-        "INSERT OR IGNORE INTO replicas (file, gen, store, state) VALUES (?1, ?2, ?3, 1)",
-    )?
-    .execute(params![file.0 as i64, generation.0 as i64, store.0 as i64])?;
+    let n = c
+        .prepare_cached(
+            "INSERT OR IGNORE INTO replicas (file, gen, store, state) VALUES (?1, ?2, ?3, 1)",
+        )?
+        .execute(params![file.0 as i64, generation.0 as i64, store.0 as i64])?;
+    if n > 0 {
+        fx.push(Effect::ReplicaPublished {
+            file,
+            generation,
+            store,
+        });
+    }
     Ok(Reply::Done)
 }
 

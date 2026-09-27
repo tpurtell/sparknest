@@ -538,6 +538,9 @@ fn make_tidy(mut w: World, goal: Goal, days: u64, nodes: &[NodeId]) -> Plan {
     let cutoff = w.now_ms.saturating_sub(days * DAY_MS);
     let mut cands: Vec<(NodeId, Copy, u64)> = Vec::new();
     let mut kept_required: HashMap<NodeId, u64> = HashMap::new();
+    // Not opened, but written within the window (just downloaded): kept,
+    // and said so.
+    let mut kept_fresh: HashMap<NodeId, u64> = HashMap::new();
     for &node in nodes {
         if !w.usage.contains_key(&node) {
             let h = w.host(node);
@@ -548,7 +551,11 @@ fn make_tidy(mut w: World, goal: Goal, days: u64, nodes: &[NodeId]) -> Plan {
         for cp in w.copies_on.get(&node).cloned().unwrap_or_default() {
             let last = w.last_open(node, cp.file);
             let created = w.created_ms.get(&cp.file).copied().unwrap_or(0);
-            if last >= cutoff || created >= cutoff {
+            if last >= cutoff {
+                continue;
+            }
+            if created >= cutoff {
+                *kept_fresh.entry(node).or_default() += cp.size;
                 continue;
             }
             if w.required(cp.file, node).is_some() {
@@ -598,6 +605,14 @@ fn make_tidy(mut w: World, goal: Goal, days: u64, nodes: &[NodeId]) -> Plan {
                 }
             ));
         }
+    }
+    for (node, b) in kept_fresh {
+        let h = w.host(node);
+        w.notes.push(format!(
+            "{h}: {} not opened, but written within the last {days} day{} (new downloads stay); kept",
+            human(b),
+            if days == 1 { "" } else { "s" }
+        ));
     }
     for (node, b) in kept_required {
         let h = w.host(node);

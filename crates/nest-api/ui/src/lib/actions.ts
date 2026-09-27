@@ -3,7 +3,7 @@
 
 import { post, api, type TreeNode } from "./api";
 import { app, startJob, targets, toast, go, poll } from "./state.svelte";
-import { confirm, pick, openMenu, type MenuItem } from "./ui.svelte";
+import { pick, inform, openMenu, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
 import { download, remove as deletePath } from "./files.svelte";
 
@@ -28,17 +28,23 @@ export async function removeFrom(selector: string, hosts?: string[]) {
       "The last copy of a file is never removed.",
     ));
   if (!from?.length) return;
-  if (!(await confirm(`Remove ${selLabel(selector)} from ${from.join(", ")}?`, "The last copy of a file is never removed.", "Remove", true)))
-    return;
+  // Removing a copy never loses data (the last copy always stays), so it
+  // happens at once; what was kept is explained.
   try {
     const v = await post<{ hosts: { host: string; removed: number; refused: [number, string][] }[] }>("/v1/evict", {
       selector,
       hosts: from,
     });
-    const msg = v.hosts
-      .map((r) => `${r.host}: removed ${r.removed}${r.refused.length ? `, kept ${r.refused.length} last copies` : ""}`)
-      .join("; ");
-    toast(msg);
+    const kept = v.hosts.filter((r) => r.refused.length);
+    const removed = v.hosts.reduce((a, r) => a + r.removed, 0);
+    if (removed) toast(`Removed ${removed} file${removed === 1 ? "" : "s"} of ${selLabel(selector)} from ${v.hosts.filter((r) => r.removed).map((r) => r.host).join(", ")}`);
+    if (kept.length) {
+      const n = kept.reduce((a, r) => a + r.refused.length, 0);
+      await inform(
+        removed ? `Kept ${n} file${n === 1 ? "" : "s"}` : `Not removed from ${kept.map((r) => r.host).join(", ")}`,
+        `${n === 1 ? "That file is" : "Those files are"} the last copy anywhere in sparknest, so ${n === 1 ? "it stays" : "they stay"}. Copy ${selLabel(selector)} somewhere else (or offload it to an archive) first.`,
+      );
+    }
     poll();
   } catch (e) {
     toast((e as Error).message, true);

@@ -136,12 +136,13 @@
                 {@const p = pctOf(h)}
                 {@const fly = inflight.get(r.selector + " " + c.name)}
                 {@const u = r.usage?.[c.name]}
+                {@const shownP = fly !== undefined ? Math.max(p, Math.min(99, Math.floor(fly * 100))) : p}
                 <button class="cell" class:full={h.ready} class:part={!h.ready && p > 0} class:fly={fly !== undefined}
-                  style="--p:{fly !== undefined ? Math.max(p, Math.round(fly * 100)) : p}%"
+                  style="--p:{shownP}%"
                   title="{c.name}: {h.ready ? 'complete' : `${p}% of bytes (${h.files - h.missing_files}/${h.files} files; ${human(h.missing_bytes)} missing)`}{u?.last_open_ms ? ` · opened ${ago(u.last_open_ms)}` : ''}{u?.net_bytes ? ` · ${human(u.net_bytes)} read over the network` : ''}"
                   onclick={() => cell(r, h)}>
                   <i></i>
-                  <span class="lbl">{h.ready ? "✓" : p > 0 ? p : ""}</span>
+                  <span class="lbl">{h.ready ? "✓" : shownP > 0 ? shownP : ""}</span>
                   <span class="mob tiny">{c.name.slice(0, 3)}</span>
                 </button>
               {:else}

@@ -19,6 +19,7 @@ export function openMenu(x: number, y: number, title: string, sub: string, items
 export const closeMenu = () => (menu.open = false);
 
 type Dialog =
+  | { kind: "info"; title: string; body: string }
   | { kind: "confirm"; title: string; body: string; ok: string; danger: boolean }
   | { kind: "pick"; title: string; body: string; options: { name: string; kind: string; note?: string }[]; multi: boolean };
 
@@ -44,6 +45,9 @@ export function finish(v: unknown) {
 
 export const confirm = (title: string, body = "", ok = "OK", danger = false) =>
   show<boolean>({ kind: "confirm", title, body, ok, danger }).then((v) => v === true);
+
+/** Tell the user something; resolves when dismissed. */
+export const inform = (title: string, body = "") => show<boolean>({ kind: "info", title, body }).then(() => undefined);
 
 export const pick = (
   title: string,

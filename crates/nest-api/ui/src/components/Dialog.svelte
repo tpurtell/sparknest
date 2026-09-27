@@ -29,10 +29,12 @@
         </div>
       {/if}
       <div class="row end">
-        <button class="btn ghost" onclick={() => finish(null)}>Cancel</button>
+        {#if d.kind === "info"}
+          <button class="btn primary" onclick={() => finish(true)}>OK</button>
+        {:else}<button class="btn ghost" onclick={() => finish(null)}>Cancel</button>{/if}
         {#if d.kind === "confirm"}
           <button class="btn {d.danger ? 'danger' : 'primary'}" onclick={() => finish(true)}>{d.ok}</button>
-        {:else if d.multi}
+        {:else if d.kind === "pick" && d.multi}
           <button class="btn primary" disabled={!chosen.length} onclick={() => finish(chosen)}>Go</button>
         {/if}
       </div>

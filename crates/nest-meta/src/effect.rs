@@ -66,4 +66,11 @@ pub enum Effect {
         session: SessionId,
         node: NodeId,
     },
+    /// A new LIVE copy of `generation` is in `store` (views of where things
+    /// live refresh; nothing has to act on it).
+    ReplicaPublished {
+        file: FileId,
+        generation: Generation,
+        store: StoreId,
+    },
 }

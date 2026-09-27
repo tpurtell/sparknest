@@ -3,19 +3,32 @@
 
 import { get, post, hasToken, ApiError, net, eventsUrl, type Status, type Store, type Job } from "./api";
 
-/** Run `fn` only if its previous run finished: a slow server gets one
- * request of each kind at a time, never a growing pile. */
+/** One run of `fn` at a time: a slow server gets one request of each kind,
+ * never a growing pile. A call made meanwhile is not lost: it runs once
+ * more when the current run ends (so the latest change is always shown). */
 export function singleFlight<A extends unknown[]>(fn: (...a: A) => Promise<unknown>): (...a: A) => Promise<void> {
   let busy = false;
-  return async (...a: A) => {
-    if (busy) return;
+  let again: A | null = null;
+  const run = async (...a: A): Promise<void> => {
+    if (busy) {
+      again = a;
+      return;
+    }
     busy = true;
     try {
       await fn(...a);
+    } catch {
+      /* the caller reports its own errors */
     } finally {
       busy = false;
     }
+    if (again) {
+      const next = again;
+      again = null;
+      await run(...next);
+    }
   };
+  return run;
 }
 
 export interface Rates {
