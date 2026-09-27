@@ -100,6 +100,19 @@ struct Handle {
     remote: Mutex<Option<(NodeId, Epoch)>>,
     /// Sequential readahead state for remote reads over the fabric.
     readahead: tokio::sync::Mutex<Option<crate::readahead::Readahead>>,
+    /// Bytes read through this handle not yet folded into usage: local,
+    /// remote, archive.
+    read_bytes: [AtomicU64; 3],
+}
+
+impl Handle {
+    fn count(&self, src: crate::usage::Source, n: u64) {
+        self.read_bytes[src as usize].fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn take_counts(&self) -> [u64; 3] {
+        [0, 1, 2].map(|i| self.read_bytes[i].swap(0, Ordering::Relaxed))
+    }
 }
 
 /// This node's state for a file it owns.
@@ -125,6 +138,7 @@ pub struct Vfs {
     handles: Mutex<HashMap<u64, Arc<Handle>>>,
     next_fh: AtomicU64,
     owned: Mutex<HashMap<FileId, Arc<Owned>>>,
+    usage: Arc<crate::usage::Usage>,
     /// Revocation state per (file, epoch) this node was granted.
     fences: Mutex<HashMap<(FileId, Epoch), watch::Receiver<bool>>>,
     /// Local reads in progress per file (fencing waits for them).
@@ -210,6 +224,7 @@ impl Vfs {
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             owned: Mutex::new(HashMap::new()),
+            usage: Arc::new(crate::usage::Usage::open(d.store().root())),
             fences: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
@@ -230,7 +245,30 @@ impl Vfs {
         }));
         // Ownerships granted before this VFS existed (startup) are finalized
         // by the data node; nothing to adopt here.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(fold_usage(Arc::downgrade(&vfs)));
+        }
         vfs
+    }
+
+    /// This host's file usage (ADR-028).
+    pub fn usage(&self) -> &Arc<crate::usage::Usage> {
+        &self.usage
+    }
+
+    /// Move a handle's byte counters into the usage table's pending batch.
+    fn fold_handle(&self, h: &Handle) {
+        let [l, r, a] = h.take_counts();
+        self.usage.add_bytes(h.file, l, r, a);
+    }
+
+    /// Where `src` sits for usage accounting.
+    fn source_kind(&self, src: &Arc<nest_store::ObjectStore>) -> crate::usage::Source {
+        if Arc::ptr_eq(src, self.d.store()) {
+            crate::usage::Source::Local
+        } else {
+            crate::usage::Source::Archive
+        }
     }
 
     pub fn data(&self) -> &Arc<DataNode> {
@@ -1263,6 +1301,7 @@ impl Vfs {
             lock_owners: Mutex::new(HashSet::new()),
             remote: Mutex::new(None),
             readahead: tokio::sync::Mutex::new(None),
+            read_bytes: Default::default(),
         });
         self.handles.lock().insert(fh, h);
         self.d.handle_opened(file);
@@ -1306,6 +1345,7 @@ impl Vfs {
             return Err(NestError::NotPermitted("file is sealed".into()));
         }
         self.d.wait_caught_up(self.cfg.catch_up_wait).await;
+        self.usage.record_open(file);
         let mode = self.choose_mode(&a, writable);
         let fh = self.new_handle(file, flags);
         if writable && flags & oflags::TRUNC != 0 {
@@ -1355,6 +1395,7 @@ impl Vfs {
         let Some(h) = self.handles.lock().remove(&fh) else {
             return;
         };
+        self.fold_handle(&h);
         let owners: Vec<u64> = h.lock_owners.lock().drain().chain(lock_owner).collect();
         for owner in owners {
             self.release_locks(h.file, owner).await;
@@ -1470,9 +1511,14 @@ impl Vfs {
                         },
                     }
                 };
-                return tokio::task::spawn_blocking(move || pread(&f, offset, size))
+                let kind = self.source_kind(&src);
+                let r = tokio::task::spawn_blocking(move || pread(&f, offset, size))
                     .await
                     .expect("blocking task");
+                if let Ok(b) = &r {
+                    h.count(kind, b.len() as u64);
+                }
+                return r;
             }
             let sources = match (a.gen_state, a.owner) {
                 (GenState::Owned, Some(o)) => vec![o],
@@ -1510,7 +1556,10 @@ impl Vfs {
                             .await
                     };
                     match r {
-                        Ok(b) => return Ok(b),
+                        Ok(b) => {
+                            h.count(crate::usage::Source::Remote, b.len() as u64);
+                            return Ok(b);
+                        }
                         Err(NestError::Stale) => {
                             last = NestError::Stale;
                             break; // generation moved: refresh
@@ -1538,7 +1587,10 @@ impl Vfs {
                     )
                     .await
                 {
-                    Ok(DataResp::Data(b)) => return Ok(b),
+                    Ok(DataResp::Data(b)) => {
+                        h.count(crate::usage::Source::Remote, b.len() as u64);
+                        return Ok(b);
+                    }
                     Ok(other) => last = NestError::Io(format!("unexpected response {other:?}")),
                     Err(NestError::Stale) => {
                         last = NestError::Stale;
@@ -1552,9 +1604,13 @@ impl Vfs {
                 && let Some(src) = self.local_source(&a)
             {
                 let f = src.open_read(key).map_err(io)?;
-                return tokio::task::spawn_blocking(move || pread(&f, offset, size))
+                let r = tokio::task::spawn_blocking(move || pread(&f, offset, size))
                     .await
                     .expect("blocking task");
+                if let Ok(b) = &r {
+                    h.count(crate::usage::Source::Archive, b.len() as u64);
+                }
+                return r;
             }
         }
         Err(last)
@@ -1645,7 +1701,14 @@ impl Vfs {
                     }
                 }
             };
-            return Some(from_file(&f));
+            let r = from_file(&f);
+            if r.is_ok() {
+                // The bytes a read at `offset` can return, without asking
+                // the caller's result type for its length.
+                let n = a.size.saturating_sub(offset).min(size as u64);
+                h.count(self.source_kind(&src), n);
+            }
+            return Some(r);
         }
         // Only STABLE generations are cached ahead: their bytes never change.
         if a.gen_state != GenState::Stable {
@@ -1659,6 +1722,7 @@ impl Vfs {
         }
         let out = r.try_ready(offset, size)?;
         r.advance(&fab, offset, size);
+        h.count(crate::usage::Source::Remote, out.len() as u64);
         Some(from_readahead(out))
     }
 
@@ -2358,4 +2422,22 @@ enum OwnerOp {
     Fsync {
         data_only: bool,
     },
+}
+
+/// Every few seconds fold open handles' read counters into usage and write
+/// the batch on a blocking thread (ADR-028).
+async fn fold_usage(vfs: Weak<Vfs>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let Some(v) = vfs.upgrade() else { return };
+        let handles: Vec<Arc<Handle>> = v.handles.lock().values().cloned().collect();
+        for h in &handles {
+            v.fold_handle(h);
+        }
+        let usage = v.usage.clone();
+        drop(v);
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || usage.flush()).await {
+            tracing::warn!(error = %e, "writing usage statistics failed");
+        }
+    }
 }

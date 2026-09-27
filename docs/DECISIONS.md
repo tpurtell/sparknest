@@ -666,3 +666,45 @@ outages are rare, and file data is what matters.
   `tests/recovery.rs` covers a full outage with uneven loss, a lossless
   whole-cluster upgrade, a lone upgraded host (waits, then joins) and a host
   absent during a re-found.
+
+## ADR-028 — Per-host usage statistics, and goal-oriented plans (2026-09-27)
+
+**Context.** Free-space plans removed copies by count and size alone, with
+no idea which copies anyone used. The user wants plans that tidy what has
+not been used for a day, a week or a month, and plans that add copies where
+hosts keep pulling a file over the network.
+
+**Decision.**
+- Every host records, per file and per UTC day: opens, last open time, and
+  bytes read from its own store, from other hosts, and from an archive it
+  gateways. Rows live in `usage.sqlite` in the state directory, **not** in
+  the replicated metadata, and are pruned after 30 days.
+- Readers count bytes on their open handle (one relaxed atomic add, cheap
+  enough for the io_uring fast path); the VFS folds handle counters into a
+  pending batch every 5 s and on close, and writes it on a blocking thread.
+  Passthrough reads (sealed, local) are served by the kernel and are not
+  counted; their opens are.
+- Keyed by **file id**, not path: renames keep their history, and a file
+  deleted and re-created under the same name is new content (Hugging Face
+  re-downloads land as new blobs) and starts afresh.
+- The leader asks every host for its summary (`AdminReq::Usage`) when it
+  plans. A host that does not answer is *unknown*, never *idle*: tidy leaves
+  its copies alone.
+- Plans have goals: **free** (desired free space; redundant copies least
+  recently opened on that host first, then offload into chosen archives),
+  **tidy** (copies not opened on their host within the window and not
+  written within it, oldest use first, down to one copy anywhere; sole
+  copies move to a chosen archive or stay) and **speedup** (copy files onto
+  hosts that read them over the network at least a threshold within the
+  window, most-read first, keeping a free-space floor). Every copy in a plan
+  says why it is there.
+
+**Alternatives.** A column on the metadata row: every open would be a Raft
+commit on every host, for data only one host cares about. A path-keyed
+table: survives delete-and-recreate, but loses history on rename and would
+credit old usage to new content.
+
+**Consequences.** Usage restarts from nothing when a host's state
+directory is wiped, and passthrough-heavy workloads show opens but few
+bytes. Plans remain proposals: reading never creates a replica (invariant
+2); a person applies a speedup plan.

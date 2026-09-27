@@ -32,6 +32,13 @@ fn stores_of(c: &TestCluster, f: FileId) -> Vec<u64> {
         .collect()
 }
 
+fn free_goal(free: &[(String, u64)], archives: &[&str]) -> nest_place::plan::Goal {
+    nest_place::plan::Goal::Free {
+        free: free.to_vec(),
+        archives: archives.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 async fn wait_job(c: &TestCluster, id: u64) -> nest_place::placer::ClusterJob {
     c.eventually("job finished", Duration::from_secs(20), |c| {
         c.node(1).placer.job(id).is_some_and(|j| j.finished)
@@ -384,7 +391,7 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
     let target = [("n1".into(), free_now + 2 * size - (1 << 20))];
     // With no archive chosen, only the redundant copy goes; the sole copy
     // is reported, not offloaded.
-    let plan = p.plan(&target, &[]).await.unwrap();
+    let plan = p.plan(free_goal(&target, &[])).await.unwrap();
     assert!(!plan.feasible, "{plan:?}");
     assert!(plan.archives.is_empty());
     assert_eq!(plan.steps.len(), 1, "{plan:?}");
@@ -397,9 +404,9 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
         "{:?}",
         plan.blocked
     );
-    assert!(p.plan(&target, &["nope".into()]).await.is_err());
+    assert!(p.plan(free_goal(&target, &["nope"])).await.is_err());
 
-    let plan = p.plan(&target, &["nas".into()]).await.unwrap();
+    let plan = p.plan(free_goal(&target, &["nas"])).await.unwrap();
     assert!(plan.feasible, "{plan:?}");
     let a = &plan.archives[0];
     assert!(a.store == "nas" && a.reachable, "{a:?}");
@@ -414,6 +421,9 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
             }
             nest_place::plan::Step::Offload { copies, .. } => {
                 ("offload", copies.iter().map(|c| c.file).collect())
+            }
+            nest_place::plan::Step::Replicate { copies, .. } => {
+                ("replicate", copies.iter().map(|c| c.file).collect())
             }
         })
         .collect();
@@ -437,7 +447,7 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
 
     // A target that only removing the pinned file could meet is reported.
     let plan = p
-        .plan(&[("n1".into(), free_now + 100 * size)], &["nas".into()])
+        .plan(free_goal(&[("n1".into(), free_now + 100 * size)], &["nas"]))
         .await
         .unwrap();
     assert!(!plan.feasible);
@@ -453,7 +463,7 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
 
     // A host named directly beats its group, whichever comes first.
     let plan = p
-        .plan(&[("n1".into(), 7), ("@both".into(), 9)], &[])
+        .plan(free_goal(&[("n1".into(), 7), ("@both".into(), 9)], &[]))
         .await
         .unwrap();
     let t = |h: &str| plan.hosts.iter().find(|x| x.host == h).unwrap().target;
@@ -488,7 +498,7 @@ async fn free_space_plan_evicts_redundant_then_offloads_and_respects_rules() {
         .unwrap()
         .free_bytes;
     let plan = p
-        .plan(&[("n1".into(), free_now + size / 2)], &[])
+        .plan(free_goal(&[("n1".into(), free_now + size / 2)], &[]))
         .await
         .unwrap();
     assert_eq!(plan.steps.len(), 1, "{plan:?}");

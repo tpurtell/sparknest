@@ -962,6 +962,50 @@ impl Placer {
         Ok(())
     }
 
+    // ------------------------------------------------------------ usage
+
+    /// Every host's per-file usage since `since_ms`, by node. Hosts that do
+    /// not answer are left out (their files look unused: callers that
+    /// remove copies must treat a missing host as unknown, not idle).
+    pub async fn usage(
+        &self,
+        since_ms: u64,
+    ) -> NestResult<HashMap<NodeId, HashMap<FileId, nest_data::usage::FileUsage>>> {
+        let nodes = self.nodes()?;
+        let me = self.vfs.data().id();
+        let got = futures::future::join_all(nodes.iter().map(|h| async move {
+            if h.node == me {
+                let u = self.vfs.usage().clone();
+                let r = tokio::task::spawn_blocking(move || u.summary(since_ms))
+                    .await
+                    .map_err(|e| NestError::Io(e.to_string()))
+                    .and_then(|r| r.map_err(sql))
+                    .map(AdminResp::Usage);
+                return (h.node, r);
+            }
+            let r = admin::call(
+                self.rpc(),
+                h.node,
+                &AdminReq::Usage { since_ms },
+                Duration::from_secs(5),
+            )
+            .await;
+            (h.node, r)
+        }))
+        .await;
+        let mut out = HashMap::new();
+        for (node, r) in got {
+            match r {
+                Ok(AdminResp::Usage(v)) => {
+                    out.insert(node, v.into_iter().map(|u| (u.file, u)).collect());
+                }
+                Ok(other) => tracing::warn!(node = node.0, "unexpected usage reply {other:?}"),
+                Err(e) => tracing::warn!(node = node.0, error = %e, "usage unavailable"),
+            }
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------ logs
 
     /// Recent log lines from `host` (or every node), merged oldest first,
@@ -1023,12 +1067,8 @@ impl Placer {
     /// Propose a plan to reach `free` bytes free on each named host/@group,
     /// offloading sole copies only into the `archives` named (none: only
     /// redundant copies are removed).
-    pub async fn plan(
-        &self,
-        free: &[(String, u64)],
-        archives: &[String],
-    ) -> NestResult<crate::plan::Plan> {
-        let p = crate::plan::make(self, free, archives).await?;
+    pub async fn plan(&self, goal: crate::plan::Goal) -> NestResult<crate::plan::Plan> {
+        let p = crate::plan::make(self, goal).await?;
         self.plans.lock().insert(p.id, p.clone());
         Ok(p)
     }
@@ -1061,6 +1101,32 @@ impl Placer {
             let r: NestResult<()> = async {
                 for step in &plan.steps {
                     cancelled(&job)?;
+                    if let crate::plan::Step::Replicate {
+                        host, node, copies, ..
+                    } = step
+                    {
+                        // Speedup: whole files onto the host; nothing removed.
+                        let target = Target {
+                            name: host.clone(),
+                            store: node.live_store(),
+                            node: *node,
+                        };
+                        let m = Manifest {
+                            entries: copies
+                                .iter()
+                                .map(|c| crate::selector::Entry {
+                                    file: c.file,
+                                    generation: c.generation,
+                                    size: c.size,
+                                    stable: true,
+                                    path: c.path.clone(),
+                                })
+                                .collect(),
+                            dangling: vec![],
+                        };
+                        me.run_replicate(&job, m, vec![target], 8).await?;
+                        continue;
+                    }
                     let (host, node, copies, store) = match step {
                         crate::plan::Step::Evict {
                             host, node, copies, ..
@@ -1072,6 +1138,7 @@ impl Placer {
                             store,
                             ..
                         } => (host, *node, copies, Some(store)),
+                        crate::plan::Step::Replicate { .. } => continue, // above
                     };
                     // Revalidate: a rule made since planning may now need
                     // some of these copies here.

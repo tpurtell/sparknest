@@ -18,6 +18,7 @@ mod local;
 mod readahead;
 mod remote;
 mod session;
+pub mod usage;
 pub mod vfs;
 
 pub use local::{

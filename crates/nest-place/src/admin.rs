@@ -114,6 +114,10 @@ pub(crate) enum AdminReq {
     CancelJob {
         job: u64,
     },
+    /// This host's per-file usage since a time (Unix ms).
+    Usage {
+        since_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,6 +146,7 @@ pub(crate) enum AdminResp {
     Path(String),
     Err(String),
     Logs(Vec<crate::logs::LogLine>),
+    Usage(Vec<nest_data::usage::FileUsage>),
 }
 
 pub struct Admin {
@@ -360,6 +365,14 @@ impl Handler for AdminService {
                 },
                 AdminReq::Evict { files, store } => a.evict(files, store).await,
                 AdminReq::Logs(q) => AdminResp::Logs(crate::logs::recent(&q)),
+                AdminReq::Usage { since_ms } => {
+                    let u = a.vfs.usage().clone();
+                    match tokio::task::spawn_blocking(move || u.summary(since_ms)).await {
+                        Ok(Ok(v)) => AdminResp::Usage(v),
+                        Ok(Err(e)) => AdminResp::Err(e.to_string()),
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    }
+                }
                 AdminReq::CancelJob { job } => match a.jobs.lock().get(&job) {
                     Some(p) => {
                         p.lock().cancelled = true;

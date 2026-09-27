@@ -104,14 +104,31 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RuleCmd,
     },
-    /// Plan (and apply) reaching free-space targets:
-    /// nest plan --free raptor=800GiB --free @sparks=400GiB --to nas
+    /// Plan (and apply) changes toward a goal:
+    ///   make room:  nest plan --free raptor=800GiB --free @sparks=400GiB --to nas
+    ///   tidy:       nest plan --tidy 7d [--host dodo] [--to nas]
+    ///   speed up:   nest plan --speedup 7d [--min 1GiB] [--keep-free 200GiB]
     Plan {
         #[command(subcommand)]
         cmd: Option<PlanCmd>,
         /// HOST_OR_@GROUP=SIZE (repeatable); a bare number is GiB (600 = 600 GiB)
         #[arg(long)]
         free: Vec<String>,
+        /// Remove copies not opened on their host within this window (1d, 7d, 30d, 1w, 1m).
+        #[arg(long, value_name = "WINDOW", conflicts_with_all = ["free", "speedup"])]
+        tidy: Option<String>,
+        /// Add copies where hosts read files over the network within this window.
+        #[arg(long, value_name = "WINDOW", conflicts_with = "free")]
+        speedup: Option<String>,
+        /// Hosts or @groups for --tidy / --speedup (default: all).
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        /// --speedup: least bytes read over the network that earns a copy (default 1 GiB).
+        #[arg(long)]
+        min: Option<String>,
+        /// --speedup: free space each host keeps (default a tenth of its disk).
+        #[arg(long)]
+        keep_free: Option<String>,
         /// Archive store sole copies may be offloaded into (repeatable, filled
         /// in order). Without it the plan only removes redundant copies.
         #[arg(long = "to", value_name = "STORE")]
@@ -219,6 +236,20 @@ enum GroupCmd {
 }
 
 /// Parse "500GiB", "1.5T", "200G", "1048576".
+/// A usage window: 1d, 7d, 30d, 2w, 1m (a month is 30 days); bare days.
+fn parse_days(s: &str) -> Result<u64> {
+    let s = s.trim().to_ascii_lowercase();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().with_context(|| format!("bad window {s:?}"))?;
+    Ok(n * match unit {
+        "" | "d" | "day" | "days" => 1,
+        "w" | "week" | "weeks" => 7,
+        "m" | "month" | "months" => 30,
+        other => bail!("unknown window unit {other:?} (use d, w or m)"),
+    })
+}
+
 fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     let split = s
@@ -875,20 +906,37 @@ async fn main() -> Result<()> {
             cmd: None,
             free,
             to,
+            tidy,
+            speedup,
+            hosts,
+            min,
+            keep_free,
         } => {
-            if free.is_empty() {
-                bail!("give at least one --free HOST=SIZE");
-            }
-            let mut pairs = Vec::new();
-            for f in free {
-                let (h, sz) = f
-                    .split_once('=')
-                    .with_context(|| format!("expected HOST=SIZE, got {f:?}"))?;
-                pairs.push(json!([h, parse_size(sz)?]));
-            }
-            let v = c
-                .post("/v1/plans", json!({ "free": pairs, "archives": to }))
-                .await?;
+            let body = if let Some(w) = tidy {
+                json!({ "goal": "tidy", "days": parse_days(w)?, "hosts": hosts, "archives": to })
+            } else if let Some(w) = speedup {
+                let mut b = json!({ "goal": "speedup", "days": parse_days(w)?, "hosts": hosts });
+                if let Some(m) = min {
+                    b["min_remote_bytes"] = json!(parse_size(m)?);
+                }
+                if let Some(k) = keep_free {
+                    b["keep_free"] = json!(parse_size(k)?);
+                }
+                b
+            } else {
+                if free.is_empty() {
+                    bail!("give --free HOST=SIZE, --tidy WINDOW or --speedup WINDOW");
+                }
+                let mut pairs = Vec::new();
+                for f in free {
+                    let (h, sz) = f
+                        .split_once('=')
+                        .with_context(|| format!("expected HOST=SIZE, got {f:?}"))?;
+                    pairs.push(json!([h, parse_size(sz)?]));
+                }
+                json!({ "goal": "free", "free": pairs, "archives": to })
+            };
+            let v = c.post("/v1/plans", body).await?;
             if !cli.json {
                 println!(
                     "plan {}{}",
@@ -938,9 +986,37 @@ async fn main() -> Result<()> {
                 }
                 for st in v["steps"].as_array().into_iter().flatten() {
                     let n = st["copies"].as_array().map(|a| a.len()).unwrap_or(0);
+                    let why: Vec<String> = st["copies"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(3)
+                        .map(|c| {
+                            format!(
+                                "      {} ({}): {}",
+                                c["path"].as_str().unwrap_or(""),
+                                human(c["size"].as_u64().unwrap_or(0)),
+                                c["why"].as_str().unwrap_or("")
+                            )
+                        })
+                        .collect();
+                    let more = n.saturating_sub(why.len());
+                    let tail = move || {
+                        for w in &why {
+                            println!("{w}");
+                        }
+                        if more > 0 {
+                            println!("      … and {more} more");
+                        }
+                    };
                     match st["kind"].as_str() {
                         Some("evict") => println!(
                             "  evict {n} redundant copies ({}) from {}",
+                            human(st["bytes"].as_u64().unwrap_or(0)),
+                            st["host"].as_str().unwrap_or("")
+                        ),
+                        Some("replicate") => println!(
+                            "  copy {n} files ({}) to {}",
                             human(st["bytes"].as_u64().unwrap_or(0)),
                             st["host"].as_str().unwrap_or("")
                         ),
@@ -951,9 +1027,13 @@ async fn main() -> Result<()> {
                             st["store"].as_str().unwrap_or("")
                         ),
                     }
+                    tail();
                 }
                 for b in v["blocked"].as_array().into_iter().flatten() {
                     println!("  blocked: {}", b.as_str().unwrap_or(""));
+                }
+                for b in v["notes"].as_array().into_iter().flatten() {
+                    println!("  note: {}", b.as_str().unwrap_or(""));
                 }
                 if v["steps"].as_array().is_some_and(|s| !s.is_empty()) {
                     println!("apply with: nest plan apply {}", v["id"]);

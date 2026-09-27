@@ -773,14 +773,20 @@ async fn meta_snapshot(State(api): State<Api>, Json(r): Json<MetaReq>) -> R<serd
     ))
 }
 
+/// A goal (`{"goal": "free" | "tidy" | "speedup", ...}`), or the older
+/// free-space form without `goal`.
 #[derive(Deserialize)]
-struct PlanReq {
-    /// (host or @group, desired free bytes)
-    free: Vec<(String, u64)>,
-    /// Archive stores sole copies may be offloaded into, filled in order;
-    /// none means the plan only removes redundant copies.
-    #[serde(default)]
-    archives: Vec<String>,
+#[serde(untagged)]
+enum PlanReq {
+    Goal(nest_place::plan::Goal),
+    Free {
+        /// (host or @group, desired free bytes)
+        free: Vec<(String, u64)>,
+        /// Archive stores sole copies may be offloaded into, filled in
+        /// order; none means the plan only removes redundant copies.
+        #[serde(default)]
+        archives: Vec<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -826,7 +832,17 @@ async fn cancel_job(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json
 
 async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_json::Value> {
     Ok(Json(
-        serde_json::to_value(api.placer.plan(&r.free, &r.archives).await?).unwrap_or_default(),
+        serde_json::to_value(
+            api.placer
+                .plan(match r {
+                    PlanReq::Goal(g) => g,
+                    PlanReq::Free { free, archives } => {
+                        nest_place::plan::Goal::Free { free, archives }
+                    }
+                })
+                .await?,
+        )
+        .unwrap_or_default(),
     ))
 }
 
