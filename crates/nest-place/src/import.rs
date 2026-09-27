@@ -83,6 +83,14 @@ pub struct ImportProgress {
     /// Bytes copied (not linked) so far, counted as they are written.
     #[serde(default)]
     pub copied_bytes: u64,
+    /// Spread imports: files and bytes handed to other hosts (their copy
+    /// live, this host's staging copy gone), and those kept here.
+    #[serde(default)]
+    pub spread_files: u64,
+    #[serde(default)]
+    pub spread_bytes: u64,
+    #[serde(default)]
+    pub kept_files: u64,
 }
 
 impl ImportProgress {

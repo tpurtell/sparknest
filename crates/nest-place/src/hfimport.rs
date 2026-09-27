@@ -49,7 +49,16 @@ pub struct HfImportOptions {
     /// Copy blobs that are on another filesystem (else they are errors).
     #[serde(default = "yes")]
     pub copy: bool,
+    /// Spread the blobs over the cluster: each goes to the host with the
+    /// most free space (for caches larger than this host's disk). Blobs
+    /// are copied here in batches and handed out while the next batch
+    /// copies; the cluster's existing blobs are skipped.
+    #[serde(default)]
+    pub spread: bool,
 }
+
+/// A spread import copies about this much here before handing it out.
+const SPREAD_BATCH: u64 = 64 << 30;
 
 fn yes() -> bool {
     true
@@ -384,7 +393,11 @@ pub async fn run(
     opts: HfImportOptions,
     progress: Arc<Mutex<ImportProgress>>,
     outcomes: Arc<Mutex<Vec<RepoOutcome>>>,
+    spread: Option<Arc<crate::placer::Placer>>,
 ) -> NestResult<()> {
+    // A spread import's handing-out of the previous batch, running while
+    // the next batch copies.
+    let mut handing: Option<tokio::task::JoinHandle<NestResult<()>>> = None;
     if opts.r#move && opts.mount_hub.is_none() {
         return Err(NestError::Invalid(
             "--move leaves a link to sparknest's hub behind, so this node must have its mount"
@@ -450,7 +463,11 @@ pub async fn run(
         }
         let errs_before = progress.lock().errors.len();
         // A repo that fails is reported and the import moves on.
-        if let Err(e) = import_entries(&vfs, entries, false, opts.copy, &progress).await {
+        let placed = match &spread {
+            None => import_entries(&vfs, entries, false, opts.copy, &progress).await,
+            Some(p) => place_spread(&vfs, p, entries, opts.copy, &progress, &mut handing).await,
+        };
+        if let Err(e) = placed {
             out.status = "failed".into();
             out.note = format!("placing blobs: {e}");
             all_verified = false;
@@ -523,6 +540,14 @@ pub async fn run(
             );
         }
         outcomes.lock().push(out);
+    }
+    if let Some(h) = handing.take()
+        && let Ok(Err(e)) = h.await
+    {
+        progress
+            .lock()
+            .errors
+            .push(format!("handing out blobs: {e}"));
     }
     // 4. Move: swap in links to sparknest's hub.
     if opts.r#move
@@ -645,4 +670,62 @@ async fn fill_small_files(vfs: &Arc<Vfs>, base: &str) {
             tracing::debug!(path = %e.path, error = %err, "could not copy a small file here");
         }
     }
+}
+
+/// Place `entries` in batches of about `SPREAD_BATCH`: each batch is copied
+/// here, then handed to other hosts (`Placer::spread`) while the next one
+/// copies. At most two batches are staged here at once.
+async fn place_spread(
+    vfs: &Arc<Vfs>,
+    placer: &Arc<crate::placer::Placer>,
+    entries: Vec<Entry>,
+    copy: bool,
+    progress: &Arc<Mutex<ImportProgress>>,
+    handing: &mut Option<tokio::task::JoinHandle<NestResult<()>>>,
+) -> NestResult<()> {
+    let mut batch: Vec<Entry> = Vec::new();
+    let mut bytes = 0u64;
+    let mut rest = entries.into_iter().peekable();
+    while let Some(e) = rest.next() {
+        bytes += std::fs::metadata(&e.src).map(|m| m.len()).unwrap_or(0);
+        batch.push(e);
+        if bytes < SPREAD_BATCH && rest.peek().is_some() {
+            continue;
+        }
+        let this = std::mem::take(&mut batch);
+        bytes = 0;
+        import_entries(vfs, this.clone(), false, copy, progress).await?;
+        // The files this batch left on this host (new, or adopted here).
+        let me = vfs.data().id().live_store();
+        let files: Vec<(FileId, u64)> = vfs
+            .data()
+            .with_reader(|c| {
+                Ok(this
+                    .iter()
+                    .filter_map(|e| {
+                        let (id, _) = crate::selector::resolve_path(c, &e.dst).ok()?;
+                        let a = nest_meta::query::getattr(c, id).ok()??;
+                        nest_meta::query::has_live_replica(c, id, a.generation, me)
+                            .ok()?
+                            .then_some((id, a.size))
+                    })
+                    .collect())
+            })
+            .map_err(sql)?;
+        // Wait for the previous batch's hand-out before starting this one.
+        if let Some(h) = handing.take()
+            && let Ok(Err(e)) = h.await
+        {
+            progress
+                .lock()
+                .errors
+                .push(format!("handing out blobs: {e}"));
+        }
+        if progress.lock().cancelled {
+            break;
+        }
+        let (p, prog) = (placer.clone(), progress.clone());
+        *handing = Some(tokio::spawn(async move { p.spread(files, &prog).await }));
+    }
+    Ok(())
 }

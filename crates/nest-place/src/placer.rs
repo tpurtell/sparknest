@@ -159,6 +159,10 @@ async fn share_capacity(p: std::sync::Weak<Placer>) {
     }
 }
 
+/// Spread imports leave at least this much (or 5% of the disk) free on a
+/// host.
+const SPREAD_MARGIN: u64 = 64 << 30;
+
 /// Quiet period after the last change before automatic rules are applied.
 const AUTO_DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -884,6 +888,139 @@ impl Placer {
         }
     }
 
+    /// Hand files this node just imported to the hosts with the most free
+    /// space (a spread import): each file, largest first, goes to the host
+    /// with the most room left after what this batch already gave it,
+    /// keeping `SPREAD_MARGIN` free; the target pulls it over the fabric,
+    /// then this node's copy is removed (never the last copy: a transfer
+    /// that failed leaves the file here). Files this node wins stay.
+    pub(crate) async fn spread(
+        self: &Arc<Self>,
+        files: Vec<(FileId, u64)>,
+        progress: &Arc<Mutex<crate::import::ImportProgress>>,
+    ) -> NestResult<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let me = self.vfs.data().id();
+        let mut room: Vec<(NodeId, String, i128)> = self
+            .status_live()
+            .await?
+            .into_iter()
+            .filter_map(|n| {
+                let i = n.info.as_ref()?;
+                if !i.serving {
+                    return None;
+                }
+                let margin = SPREAD_MARGIN.max(i.total_bytes / 20);
+                Some((n.node, n.name, i.free_bytes as i128 - margin as i128))
+            })
+            .collect();
+        let mut files = files;
+        files.sort_by_key(|f| std::cmp::Reverse(f.1));
+        let mut to: HashMap<NodeId, Vec<(FileId, u64)>> = HashMap::new();
+        let mut kept = 0u64;
+        for (f, size) in files {
+            room.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+            match room.first_mut() {
+                Some((node, _, left)) if *left >= size as i128 && *node != me => {
+                    *left -= size as i128;
+                    to.entry(*node).or_default().push((f, size));
+                }
+                // This node has the most room (or nobody has room): keep it.
+                _ => {
+                    if let Some(r) = room.iter_mut().find(|r| r.0 == me) {
+                        r.2 -= size as i128;
+                    }
+                    kept += 1;
+                }
+            }
+        }
+        progress.lock().kept_files += kept;
+        // Each target pulls its files; wait for all.
+        let mut started = Vec::new();
+        for (node, files) in &to {
+            let hid = rand::random::<u64>();
+            match admin::call(
+                self.rpc(),
+                *node,
+                &AdminReq::StartReplicate {
+                    job: hid,
+                    files: files.clone(),
+                    parallel: 4,
+                    target: node.live_store(),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                Ok(_) => started.push((*node, hid)),
+                Err(e) => {
+                    tracing::warn!(node = node.0, error = %e, "spread: could not start a transfer; files stay here");
+                    progress.lock().kept_files += files.len() as u64;
+                }
+            }
+        }
+        let mut failed: std::collections::HashSet<FileId> = Default::default();
+        let mut pending = started.clone();
+        while !pending.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if progress.lock().cancelled {
+                for (node, hid) in &pending {
+                    let _ = admin::call(
+                        self.rpc(),
+                        *node,
+                        &AdminReq::CancelJob { job: *hid },
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                }
+            }
+            let mut still = Vec::new();
+            for (node, hid) in pending {
+                match admin::call(
+                    self.rpc(),
+                    node,
+                    &AdminReq::JobStatus { job: hid },
+                    Duration::from_secs(10),
+                )
+                .await
+                {
+                    Ok(AdminResp::Job(p)) if p.finished => {
+                        failed.extend(p.failed.iter().map(|(f, _)| *f));
+                    }
+                    _ => still.push((node, hid)),
+                }
+            }
+            pending = still;
+        }
+        // This node's staging copies of files now held elsewhere go.
+        let store = me.live_store();
+        for (node, files) in &to {
+            if !started.iter().any(|(n, _)| n == node) {
+                continue;
+            }
+            for (f, size) in files {
+                if failed.contains(f) {
+                    progress.lock().kept_files += 1;
+                    continue;
+                }
+                match self.vfs.evict_from(*f, store).await {
+                    Ok(_) => {
+                        let mut p = progress.lock();
+                        p.spread_files += 1;
+                        p.spread_bytes += size;
+                    }
+                    Err(e) => {
+                        tracing::warn!(file = f.0, error = %e, "spread: kept this copy");
+                        progress.lock().kept_files += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Import a local directory into the namespace (this node's store).
     pub fn import(self: &Arc<Self>, opts: crate::import::ImportOptions) -> u64 {
         let what = format!("import {} -> {}", opts.src.display(), opts.dst);
@@ -895,11 +1032,18 @@ impl Placer {
 
     /// Bring a Hugging Face cache into the hub (see `hfimport`).
     pub fn hf_import(self: &Arc<Self>, opts: crate::hfimport::HfImportOptions) -> u64 {
-        let what = format!("hf import {} -> {}", opts.src.display(), opts.hub);
+        let what = format!(
+            "hf import {} -> {}{}",
+            opts.src.display(),
+            opts.hub,
+            if opts.spread { " (spread)" } else { "" }
+        );
+        let me = self.clone();
         tracing::info!(src = %opts.src.display(), hub = %opts.hub, r#move = opts.r#move, hf = ?opts.hf, "hf import started");
         self.local_job(what, move |vfs, progress, notes| async move {
             let outcomes = Arc::new(Mutex::new(Vec::new()));
-            let r = crate::hfimport::run(vfs, opts, progress, outcomes.clone()).await;
+            let spread = opts.spread.then(|| me.clone());
+            let r = crate::hfimport::run(vfs, opts, progress, outcomes.clone(), spread).await;
             let mut n = notes.lock();
             for o in outcomes.lock().iter() {
                 n.push(format!(

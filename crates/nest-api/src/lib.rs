@@ -688,6 +688,9 @@ struct HfImportReq {
     hf: Option<String>,
     #[serde(default = "yes")]
     copy: bool,
+    /// Place each blob on the host with the most free space.
+    #[serde(default)]
+    spread: bool,
 }
 
 async fn hf_import(State(api): State<Api>, Json(r): Json<HfImportReq>) -> R<serde_json::Value> {
@@ -702,6 +705,7 @@ async fn hf_import(State(api): State<Api>, Json(r): Json<HfImportReq>) -> R<serd
         hf: r.hf.map(Into::into),
         r#move: r.r#move,
         copy: r.copy,
+        spread: r.spread,
     };
     Ok(Json(json!({ "job": api.placer.hf_import(opts) })))
 }

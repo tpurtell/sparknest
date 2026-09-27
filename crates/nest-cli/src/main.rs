@@ -338,6 +338,15 @@ enum HfCmd {
         /// Only hard-link: fail files on another filesystem than the store.
         #[arg(long)]
         no_copy: bool,
+        /// Spread the blobs over the cluster, each to the host with the
+        /// most free space (a cache larger than this host's disk)
+        ///
+        /// Blobs are copied here in batches of ~64 GiB, pulled by their
+        /// host over the fabric, and this host's copy removed; the next
+        /// batch copies meanwhile. Every host keeps 64 GiB or 5% free.
+        /// Blobs the cluster already has are skipped.
+        #[arg(long)]
+        spread: bool,
         /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
@@ -658,6 +667,15 @@ async fn wait_job(c: &Client, id: u64) -> Result<Value> {
             }
         }
         if let Some(ip) = v["import"].as_object() {
+            if ip["spread_files"].as_u64().unwrap_or(0) + ip["kept_files"].as_u64().unwrap_or(0) > 0
+            {
+                line += &format!(
+                    "  {} handed to other hosts ({}), {} kept here,",
+                    ip["spread_files"],
+                    human(ip["spread_bytes"].as_u64().unwrap_or(0)),
+                    ip["kept_files"]
+                );
+            }
             if ip["adopted"].as_u64().unwrap_or(0) > 0 {
                 line += &format!(
                     "  {} existing blobs adopted ({}),",
@@ -1624,6 +1642,7 @@ async fn main() -> Result<()> {
                     mv,
                     offline,
                     no_copy,
+                    spread,
                     wait,
                 },
         } => {
@@ -1640,7 +1659,7 @@ async fn main() -> Result<()> {
             let v = c
                 .post(
                     "/v1/hf/import",
-                    json!({ "src": src, "move": mv, "hf": hf, "copy": !no_copy }),
+                    json!({ "src": src, "move": mv, "hf": hf, "copy": !no_copy, "spread": spread }),
                 )
                 .await?;
             let id = v["job"].as_u64().unwrap_or(0);

@@ -930,3 +930,26 @@ deep-idle core, several times per read.
 
 **Measured.** Lone reader, cold 4 KiB rows from other hosts: 790 → 127 µs
 median (p99 299 µs); 32 readers: ~70k rows/s, median ~410 µs.
+
+## ADR-036 — Spread imports: a cache larger than one host goes to whoever has room (2026-09-27)
+
+**Context.** raptor's `/mnt/scratch` holds a 5.9 TB Hugging Face cache on a
+drive about to be reformatted; raptor's store has ~2 TB free and the
+Sparks ~3.3 TB each. Importing means copying (another filesystem), and the
+copies cannot all stay on raptor.
+
+**Decision.** `nest hf import SRC --spread`: blobs are copied into this
+host's store (on its NVMe; never staged on the source drive or in /tmp) in
+batches of ~64 GiB. Each batch is handed out while the next copies: each
+file, largest first, goes to the host with the most free space after what
+the batch already gave it (every host keeps 64 GiB or 5% free), that host
+pulls it over the fabric (`StartReplicate`), and this host's copy is
+removed once the target's is live (never the last copy: a failed transfer
+leaves the file here). Files this host wins stay. Blobs the cluster
+already has are skipped (adopting across filesystems is not possible, and
+not needed). The source is only read, once.
+
+**Consequences.** At most two batches are staged on the importing host.
+The import runs at the source drive's read rate. Snapshots, refs and
+verification are unchanged; placement afterwards is the placer's (rules,
+plans).

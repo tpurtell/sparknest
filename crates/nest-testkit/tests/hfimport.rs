@@ -111,6 +111,7 @@ fn opts(src: PathBuf, mv: bool, mount_hub: Option<PathBuf>) -> HfImportOptions {
         hf: None,
         r#move: mv,
         copy: true,
+        spread: false,
     }
 }
 
@@ -250,4 +251,58 @@ async fn another_filesystem_is_copied() {
         vec![3u8; 3 << 20]
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A spread import leaves exactly one copy of each blob, handed out over
+/// the hosts (the importing node keeps only what it won), all readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn spread_import_leaves_one_copy_spread_over_the_hosts() {
+    let c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    let root = c.state_dir(1).parent().unwrap().join("hf-spread");
+    let m = root.join("hub/models--org--big");
+    std::fs::create_dir_all(m.join("snapshots/c1")).unwrap();
+    for i in 0..12u8 {
+        write(
+            &m.join(format!("blobs/etag-{i}")),
+            &vec![i; (1 << 20) + i as usize],
+        );
+        symlink(
+            format!("../../blobs/etag-{i}"),
+            m.join(format!("snapshots/c1/shard-{i}.bin")),
+        )
+        .unwrap();
+    }
+    write(&m.join("refs/main"), b"c1");
+    let mut o = opts(root.clone(), false, None);
+    o.spread = true;
+    let job = wait_job(&c, p.hf_import(o)).await;
+    assert!(job.error.is_none(), "{job:?}");
+    let conn = c.node(1).meta.open_reader().unwrap();
+    let mut hosts = std::collections::HashSet::new();
+    for i in 0..12u8 {
+        let path = format!("/hub/models--org--big/blobs/etag-{i}");
+        let (id, _) = nest_place::selector::resolve_path(&conn, &path).unwrap();
+        let a = nest_meta::query::getattr(&conn, id).unwrap().unwrap();
+        let live: Vec<u64> = nest_meta::query::replicas(&conn, id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.generation == a.generation && r.state == ReplicaState::Live)
+            .map(|r| r.store.0)
+            .collect();
+        assert_eq!(live.len(), 1, "{path}: {live:?}");
+        hosts.insert(live[0]);
+        assert_eq!(
+            read_path(
+                &c,
+                &format!("/hub/models--org--big/snapshots/c1/shard-{i}.bin")
+            )
+            .await,
+            vec![i; (1 << 20) + i as usize]
+        );
+    }
+    assert!(hosts.len() >= 2, "all blobs on {hosts:?}");
+    let ip = p.import_progress(job.id).unwrap();
+    assert!(ip.spread_files > 0, "{ip:?}");
+    assert_eq!(ip.spread_files + ip.kept_files, 12, "{ip:?}");
 }
