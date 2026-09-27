@@ -132,6 +132,9 @@ async fn main() -> Result<()> {
     let node = Node::start(cfg, secret, Tuning::default(), args.bootstrap).await?;
     tracing::info!("sparknestd running");
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let node = std::sync::Arc::new(node);
+    let n2 = node.clone();
+    tokio::spawn(async move { n2.keep_mounting().await });
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}

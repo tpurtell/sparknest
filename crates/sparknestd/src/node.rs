@@ -63,6 +63,8 @@ pub struct Node {
     api_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     mounted: parking_lot::Mutex<Option<nest_fuse::Mounted>>,
     runstate: parking_lot::Mutex<crate::runstate::RunState>,
+    /// The mount was refused (e.g. a non-empty mountpoint): keep trying.
+    pub retry_mount: std::sync::atomic::AtomicBool,
     /// How the previous run ended.
     pub prior: crate::runstate::Prior,
     /// What the recovery fsck of a crashed host found, if one ran.
@@ -298,6 +300,7 @@ impl Node {
             api_task: parking_lot::Mutex::new(Some(api_task)),
             mounted: parking_lot::Mutex::new(None),
             runstate: parking_lot::Mutex::new(runstate),
+            retry_mount: std::sync::atomic::AtomicBool::new(false),
             prior,
             recovery,
         };
@@ -309,8 +312,10 @@ impl Node {
             match node.mount_at(&mp) {
                 Ok(()) => crate::sdnotify::status(&format!("serving; mounted at {}", mp.display())),
                 Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "not mounted");
+                    tracing::error!(error = %format!("{e:#}"), "not mounted; will retry");
                     crate::sdnotify::status(&format!("serving the cluster; NOT MOUNTED: {e:#}"));
+                    node.retry_mount
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         } else {
@@ -323,6 +328,24 @@ impl Node {
     /// FUSE over io_uring on this node's mount: (queues, requests served).
     pub fn io_uring(&self) -> Option<(usize, usize)> {
         self.mounted.lock().as_ref().map(|m| m.io_uring())
+    }
+
+    /// While `retry_mount` is set, try mounting every few seconds (the
+    /// operator fixes the mountpoint; no restart needed). The daemon's main
+    /// loop calls this.
+    pub async fn keep_mounting(&self) {
+        let Some(mp) = self.cfg.node.mountpoint.clone() else {
+            return;
+        };
+        while self.retry_mount.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if self.mount_at(&mp).is_ok() {
+                self.retry_mount
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                crate::sdnotify::status(&format!("serving; mounted at {}", mp.display()));
+                tracing::info!("mountpoint fixed: mounted");
+            }
+        }
     }
 
     /// The RDMA fabric, once it is up.
