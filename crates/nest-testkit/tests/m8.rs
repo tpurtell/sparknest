@@ -425,6 +425,7 @@ async fn crashed_minority_host_recovers_against_the_quorum() {
             settle_owned: false,
             min_age: Duration::ZERO,
             host: "n3".into(),
+            stamp: "run1".into(),
         })
         .await
         .unwrap();
@@ -444,10 +445,12 @@ async fn crashed_minority_host_recovers_against_the_quorum() {
     let Action::Quarantined { to } = &q.action else {
         panic!("{q:?}")
     };
-    assert_eq!(to, "/.lost+found/n3/000000000098967f.3");
+    assert_eq!(to, "/.lost+found/run1/n3/unknown/000000000098967f.3");
     c.converge().await;
     let lf = c.lookup(1, FileId::ROOT, ".lost+found").unwrap();
-    let dir = c.lookup(1, lf, "n3").unwrap();
+    let run = c.lookup(1, lf, "run1").unwrap();
+    let host = c.lookup(1, run, "n3").unwrap();
+    let dir = c.lookup(1, host, "unknown").unwrap();
     let f = c.lookup(1, dir, "000000000098967f.3").unwrap();
     let (fh, _) = v1.open(f, 0).await.unwrap();
     assert_eq!(v1.read(fh, 0, 64).await.unwrap(), b"stray bytes");

@@ -36,6 +36,9 @@ pub struct MetaNodeConfig {
     /// How long a proposal keeps retrying through elections and partitions
     /// before reporting [`NestError::NoQuorum`].
     pub propose_deadline: Duration,
+    /// Joining a running cluster with empty state: its incarnation, until
+    /// the snapshot it sends brings it along (ADR-026).
+    pub join_incarnation: Option<String>,
 }
 
 impl MetaNodeConfig {
@@ -49,6 +52,7 @@ impl MetaNodeConfig {
             election_max_ms: 1000,
             snapshot_every: 50_000,
             propose_deadline: Duration::from_secs(15),
+            join_incarnation: None,
         }
     }
 }
@@ -84,6 +88,8 @@ pub struct MetaNode {
     client: u64,
     /// Commit index recorded by the previous run.
     startup_committed: u64,
+    /// The re-found this node's metadata descends from (ADR-026).
+    incarnation: Option<String>,
     seq: AtomicU64,
 }
 
@@ -201,6 +207,10 @@ impl MetaNode {
         let startup_committed = log.persisted_committed()?.unwrap_or(0);
         let sm = StateMachine::open(&cfg.dir, handler).context("opening state machine")?;
         let meta_path = sm.meta_path().to_path_buf();
+        let incarnation = nest_meta::open_read(&meta_path)
+            .ok()
+            .and_then(|c| crate::seed::refound_of(&c))
+            .or_else(|| cfg.join_incarnation.clone());
         let config = openraft::Config {
             cluster_name: cfg.cluster.clone(),
             heartbeat_interval: cfg.heartbeat_ms,
@@ -219,12 +229,15 @@ impl MetaNode {
         let raft = Raft::new(
             cfg.node.0,
             Arc::new(config),
-            NetworkFactory { rpc: rpc.clone() },
+            NetworkFactory {
+                rpc: rpc.clone(),
+                incarnation: incarnation.clone(),
+            },
             log,
             sm,
         )
         .await?;
-        network::register(&rpc, raft.clone(), snap_dir);
+        network::register(&rpc, raft.clone(), snap_dir, incarnation.clone());
         rpc.register(
             service::META,
             Arc::new(MetaService {
@@ -241,12 +254,75 @@ impl MetaNode {
             meta_path,
             client: rand::random(),
             startup_committed,
+            incarnation,
             seq: AtomicU64::new(1),
         }))
     }
 
     pub fn id(&self) -> NodeId {
         self.cfg.node
+    }
+
+    /// The re-found this node's metadata descends from, if any.
+    pub fn incarnation(&self) -> Option<String> {
+        self.incarnation.clone()
+    }
+
+    /// Right after founding a group from a seed: snapshot and drop the log,
+    /// so hosts that join later receive the seeded state as a snapshot
+    /// rather than replaying a log that does not contain it.
+    pub async fn compact_now(&self) -> anyhow::Result<()> {
+        let last = self
+            .metrics()
+            .last_applied
+            .ok_or_else(|| anyhow::anyhow!("nothing applied yet"))?;
+        self.raft.trigger().snapshot().await?;
+        // Entries may apply meanwhile: any snapshot at or past `last` will do.
+        let m = self
+            .raft
+            .wait(Some(Duration::from_secs(30)))
+            .metrics(
+                |m| m.snapshot.is_some_and(|s| s.index() >= last.index()),
+                "re-found snapshot",
+            )
+            .await?;
+        let upto = m.snapshot.map(|s| s.index()).unwrap_or(last.index());
+        self.raft.trigger().purge_log(upto).await?;
+        self.raft
+            .wait(Some(Duration::from_secs(30)))
+            .metrics(
+                |m| m.purged.is_some_and(|p| p.index() >= upto),
+                "re-found purge",
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Make every host in `voters` a voter (adding learners first). Returns
+    /// once the change commits; absent hosts catch up when they return.
+    pub async fn expand_to(&self, voters: BTreeMap<u64, BasicNode>) -> anyhow::Result<()> {
+        let have: BTreeSet<u64> = self
+            .metrics()
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        for (id, n) in &voters {
+            if let Ok(a) = n.addr.parse() {
+                self.rpc.set_peer(NodeId(*id), a);
+            }
+            if !have.contains(id) {
+                self.raft.add_learner(*id, n.clone(), false).await?;
+            }
+        }
+        self.raft
+            .change_membership(
+                ChangeMembers::AddVoterIds(voters.keys().copied().collect()),
+                false,
+            )
+            .await?;
+        Ok(())
     }
 
     pub fn cluster(&self) -> &str {

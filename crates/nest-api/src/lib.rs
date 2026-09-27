@@ -319,6 +319,7 @@ async fn fsck(State(api): State<Api>, Json(r): Json<FsckReq>) -> R<serde_json::V
             settle_owned: false,
             min_age: std::time::Duration::from_secs(600),
             host: api.host.clone(),
+            stamp: nest_data::fsck::stamp_now(),
         })
         .await?;
     Ok(Json(serde_json::json!({

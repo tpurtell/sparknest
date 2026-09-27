@@ -50,6 +50,15 @@ struct Chunk {
     done: bool,
 }
 
+/// Every Raft message names the cluster incarnation (the re-found its
+/// metadata descends from): hosts from different incarnations must never
+/// exchange Raft traffic (ADR-026).
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    incarnation: Option<String>,
+    req: RaftReq,
+}
+
 #[derive(Serialize, Deserialize)]
 enum RaftResp {
     Append(Result<AppendEntriesResponse<TypeConfig>, RaftError<TypeConfig>>),
@@ -61,6 +70,7 @@ enum RaftResp {
 /// Serves incoming Raft RPCs into the local Raft instance.
 pub struct RaftService {
     raft: Raft,
+    incarnation: Option<String>,
     snap_dir: PathBuf,
     incoming: Mutex<HashMap<(NodeId, u64), PathBuf>>,
 }
@@ -130,8 +140,14 @@ impl Handler for RaftHandler {
     fn call(&self, peer: NodeId, body: Bytes) -> BoxFuture<'static, Result<Bytes, String>> {
         let me = self.0.clone();
         async move {
-            let req: RaftReq = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
-            let resp = match req {
+            let env: Envelope = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
+            if env.incarnation != me.incarnation {
+                return Err(format!(
+                    "different cluster incarnation ({:?}, here {:?})",
+                    env.incarnation, me.incarnation
+                ));
+            }
+            let resp = match env.req {
                 RaftReq::Append(r) => RaftResp::Append(me.raft.append_entries(r).await),
                 RaftReq::Vote(r) => RaftResp::Vote(me.raft.vote(r).await),
                 RaftReq::PreVote(r) => RaftResp::Vote(me.raft.pre_vote(r).await),
@@ -147,11 +163,12 @@ impl Handler for RaftHandler {
     }
 }
 
-pub fn register(rpc: &Rpc, raft: Raft, snap_dir: PathBuf) {
+pub fn register(rpc: &Rpc, raft: Raft, snap_dir: PathBuf, incarnation: Option<String>) {
     rpc.register(
         service::RAFT,
         Arc::new(RaftHandler(Arc::new(RaftService {
             raft,
+            incarnation,
             snap_dir,
             incoming: Mutex::new(HashMap::new()),
         }))),
@@ -160,6 +177,7 @@ pub fn register(rpc: &Rpc, raft: Raft, snap_dir: PathBuf) {
 
 pub struct NetworkFactory {
     pub rpc: Rpc,
+    pub incarnation: Option<String>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
@@ -172,6 +190,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
         Network {
             rpc: self.rpc.clone(),
             target,
+            incarnation: self.incarnation.clone(),
         }
     }
 }
@@ -179,6 +198,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
 pub struct Network {
     rpc: Rpc,
     target: u64,
+    incarnation: Option<String>,
 }
 
 fn net_err(e: &(impl std::error::Error + 'static)) -> RPCError<TypeConfig> {
@@ -188,10 +208,14 @@ fn net_err(e: &(impl std::error::Error + 'static)) -> RPCError<TypeConfig> {
 impl Network {
     async fn send(
         &self,
-        req: &RaftReq,
+        req: RaftReq,
         timeout: Duration,
     ) -> Result<RaftResp, RPCError<TypeConfig>> {
-        let body = nest_rpc::encode(req).map_err(|e| net_err(&e))?;
+        let env = Envelope {
+            incarnation: self.incarnation.clone(),
+            req,
+        };
+        let body = nest_rpc::encode(&env).map_err(|e| net_err(&e))?;
         match self
             .rpc
             .call(NodeId(self.target), service::RAFT, body.into(), timeout)
@@ -208,7 +232,7 @@ impl Network {
         req: RaftReq,
         option: &RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match self.send(&req, ttl(option)).await? {
+        match self.send(req, ttl(option)).await? {
             RaftResp::Vote(r) => r.map_err(|e| net_err(&e)),
             _ => Err(unexpected()),
         }
@@ -231,7 +255,7 @@ impl RaftNetworkV2<TypeConfig> for Network {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
-        match self.send(&RaftReq::Append(rpc), ttl(&option)).await? {
+        match self.send(RaftReq::Append(rpc), ttl(&option)).await? {
             RaftResp::Append(r) => r.map_err(|e| net_err(&e)),
             _ => Err(unexpected()),
         }
@@ -293,7 +317,7 @@ impl RaftNetworkV2<TypeConfig> for Network {
                     done,
                 });
                 let resp = self
-                    .send(&req, ttl(&option).max(Duration::from_secs(30)))
+                    .send(req, ttl(&option).max(Duration::from_secs(30)))
                     .await
                     .map_err(|e| match e {
                         RPCError::Unreachable(u) => StreamingError::Unreachable(u),

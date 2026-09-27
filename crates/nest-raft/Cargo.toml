@@ -11,6 +11,7 @@ nest-types.workspace = true
 nest-meta.workspace = true
 nest-rpc.workspace = true
 openraft.workspace = true
+sha2.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 postcard.workspace = true

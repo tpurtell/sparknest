@@ -19,6 +19,7 @@ pub mod checkpoint;
 pub mod log_store;
 pub mod network;
 pub mod node;
+pub mod seed;
 pub mod state_machine;
 
 pub use node::{MetaNode, MetaNodeConfig};

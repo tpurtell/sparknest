@@ -26,6 +26,8 @@ pub mod service {
     pub const DATA: u8 = 3;
     pub const ADMIN: u8 = 4;
     pub const FABRIC: u8 = 5;
+    /// Versions and recovery coordination before Raft starts (ADR-026).
+    pub const HELLO: u8 = 6;
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

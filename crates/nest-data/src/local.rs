@@ -392,6 +392,12 @@ impl DataNode {
                 if self.meta.get().is_none() {
                     return; // still starting: attach() reconciles anyway
                 }
+                if !self.admitted.load(Ordering::SeqCst) {
+                    // Recovering (ADR-026): the recovery fsck settles the
+                    // store, keeping unknown objects the metadata may have
+                    // rolled back past. Deleting them here would lose data.
+                    return;
+                }
                 let weak = self.weak.clone();
                 let _ = self.gate.send(false);
                 tokio::spawn(async move {

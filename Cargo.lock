@@ -1130,6 +1130,7 @@ dependencies = [
  "rand 0.9.5",
  "rusqlite",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1172,6 +1173,7 @@ name = "nest-testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "libc",
  "nest-data",
  "nest-fabric",
@@ -1181,6 +1183,7 @@ dependencies = [
  "nest-store",
  "nest-types",
  "openraft",
+ "postcard",
  "rusqlite",
  "serde_json",
  "sparknestd",
@@ -1902,7 +1905,9 @@ name = "sparknestd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "futures",
  "nest-api",
  "nest-data",
  "nest-fabric",
@@ -1915,6 +1920,8 @@ dependencies = [
  "nest-types",
  "openraft",
  "parking_lot",
+ "rand 0.9.5",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

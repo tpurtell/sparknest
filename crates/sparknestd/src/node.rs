@@ -27,6 +27,9 @@ pub struct Tuning {
     pub fabric: Option<nest_fabric::FabricConfig>,
     /// Kernel boot id override (tests simulate a host crash with it).
     pub boot_id: Option<String>,
+    /// How long a re-found coordinator waits for more members once a
+    /// majority is present (ADR-026).
+    pub recovery_grace: Duration,
 }
 
 impl Default for Tuning {
@@ -43,6 +46,7 @@ impl Default for Tuning {
             mount: true,
             fabric: Some(nest_fabric::FabricConfig::default()),
             boot_id: None,
+            recovery_grace: Duration::from_secs(10),
         }
     }
 }
@@ -96,13 +100,36 @@ impl Node {
             .boot_id
             .clone()
             .unwrap_or_else(crate::runstate::boot_id);
-        let (runstate, prior) = crate::runstate::RunState::begin(&cfg.node.state_dir, &boot)
+        let (mut runstate, prior) = crate::runstate::RunState::begin(&cfg.node.state_dir, &boot)
             .context("recording the run state")?;
         if prior.dirty() {
             tracing::warn!(
                 "this host went down while sparknestd was running: unsynced writes may be lost; \
                  it will catch up with the cluster and check its objects before serving"
             );
+        }
+        // Before Raft: how to start (normal, join afresh, or re-found).
+        let local = crate::recovery::Local::read(&cfg.node.state_dir, prior.dirty())?;
+        let hello =
+            crate::recovery::Hello::register(&rpc, local.phase(), local.incarnation.clone());
+        let outcome =
+            crate::recovery::decide(&cfg, &rpc, &hello, &local, tuning.recovery_grace).await?;
+        let mut trust_local = !prior.dirty();
+        let mut quarantine = false;
+        match &outcome {
+            crate::recovery::Outcome::Normal => {}
+            crate::recovery::Outcome::Join(_) => {
+                let aside = nest_raft::seed::discard(&cfg.node.state_dir, "join")?;
+                tracing::warn!(aside = %aside.display(), "joining the running cluster afresh");
+                trust_local = false;
+                quarantine = true;
+            }
+            crate::recovery::Outcome::Refound(plan) => {
+                crate::recovery::execute(&cfg, &rpc, &hello, plan).await?;
+                runstate.set_refound(Some(plan.id.clone()))?;
+                trust_local = false;
+                quarantine = true;
+            }
         }
         let store =
             Arc::new(ObjectStore::open(&cfg.node.state_dir).context("opening object store")?);
@@ -114,31 +141,67 @@ impl Node {
         mc.election_max_ms = tuning.election_max_ms;
         mc.snapshot_every = tuning.snapshot_every;
         mc.propose_deadline = tuning.propose_deadline;
+        if let crate::recovery::Outcome::Join(inc) = &outcome {
+            mc.join_incarnation = inc.clone();
+        }
         let meta = MetaNode::start(mc, rpc.clone(), handler).await?;
-        if bootstrap {
-            let members: BTreeMap<u64, BasicNode> = cfg
-                .cluster
-                .members
+        let voters: BTreeMap<u64, BasicNode> = cfg
+            .cluster
+            .members
+            .iter()
+            .filter(|m| m.voter)
+            .map(|m| {
+                (
+                    m.id.0,
+                    BasicNode {
+                        addr: m.addr.to_string(),
+                    },
+                )
+            })
+            .collect();
+        if let crate::recovery::Outcome::Refound(plan) = &outcome
+            && plan.seed == id.0
+        {
+            // Found alone, snapshot and drop the log before anyone joins, so
+            // every other host (participant or late) catches up from a
+            // snapshot holding the seeded state, never from a log without it.
+            let me_only: BTreeMap<u64, BasicNode> = voters
                 .iter()
-                .filter(|m| m.voter)
-                .map(|m| {
-                    (
-                        m.id.0,
-                        BasicNode {
-                            addr: m.addr.to_string(),
-                        },
-                    )
-                })
+                .filter(|(v, _)| **v == id.0)
+                .map(|(v, n)| (*v, n.clone()))
                 .collect();
+            meta.bootstrap(me_only).await?;
+            for _ in 0..600 {
+                if meta.metrics().last_applied.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            meta.compact_now().await?;
+            meta.expand_to(voters.clone()).await?;
+            tracing::warn!(plan = %plan.id, "founded the new Raft group from this host's metadata");
+        }
+        hello.running(meta.clone(), meta.incarnation());
+        if bootstrap {
+            let members = voters.clone();
             if meta.bootstrap(members).await? {
                 tracing::info!("initialized new cluster");
             }
         }
-        let report = data.attach(meta.clone(), !prior.dirty()).await?;
+        let report = data.attach(meta.clone(), trust_local).await?;
         tracing::info!(?report, "local store reconciled");
         let vfs = Vfs::new(data.clone(), tuning.vfs.clone());
-        let recovery = if prior.dirty() {
-            Some(Self::recover(&cfg, &data, &vfs).await?)
+        let recovery = if !trust_local {
+            // Unknown objects may be data the metadata forgot unless this
+            // host is catching up with the very incarnation it reconciled.
+            let orphans = if quarantine || runstate.refound() != meta.incarnation().as_deref() {
+                nest_data::fsck::Orphans::Quarantine
+            } else {
+                nest_data::fsck::Orphans::Delete
+            };
+            let r = Self::recover(&cfg, &data, &vfs, orphans).await?;
+            runstate.set_refound(meta.incarnation())?;
+            Some(r)
         } else {
             None
         };
@@ -259,6 +322,7 @@ impl Node {
         cfg: &Config,
         data: &Arc<DataNode>,
         vfs: &Arc<Vfs>,
+        orphans: nest_data::fsck::Orphans,
     ) -> anyhow::Result<nest_data::fsck::FsckReport> {
         let mut waited = 0u64;
         while !data.wait_caught_up(Duration::from_secs(10)).await {
@@ -271,11 +335,12 @@ impl Node {
         let report = vfs
             .fsck(&nest_data::fsck::FsckOptions {
                 repair: true,
-                orphans: nest_data::fsck::Orphans::Delete,
+                orphans,
                 deep: false,
                 settle_owned: true,
                 min_age: Duration::ZERO,
                 host: cfg.node.name.clone(),
+                stamp: nest_data::fsck::stamp_now(),
             })
             .await?;
         tracing::info!(

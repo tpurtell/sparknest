@@ -7,8 +7,9 @@
 //!
 //! - an object no metadata refers to is deleted when the metadata is known
 //!   complete (a crashed host that has caught up with a healthy quorum),
-//!   and otherwise moved into `/.lost+found/<host>/` (after a re-found the
-//!   metadata may have rolled back past it);
+//!   and otherwise moved into `/.lost+found/<run>/<host>/<its path>` (after
+//!   a re-found the metadata may have rolled back past it); its path comes
+//!   from earlier metadata the host set aside, if any knows it;
 //! - a copy the metadata lists but the disk lacks is retired; a file left
 //!   with no copy anywhere is reported lost;
 //! - a stable copy whose size (or, deep, HF blob hash) is wrong is retired
@@ -50,6 +51,62 @@ pub struct FsckOptions {
     pub min_age: Duration,
     /// Name used for this host's lost+found directory.
     pub host: String,
+    /// This run's directory under `/.lost+found` (a UTC date-time).
+    pub stamp: String,
+}
+
+/// A lost+found run name: the current UTC time, `2026-09-27T03-14-09Z`.
+pub fn stamp_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}-{:02}-{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// Earlier metadata this host set aside (re-found, join), newest first.
+fn previous_metadata(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(root)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("pre-"))
+                .map(|e| e.path().join("meta.sqlite"))
+                .filter(|p| p.exists())
+                .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by_key(|x| std::cmp::Reverse(x.0));
+    v.into_iter().map(|(_, p)| p).collect()
+}
+
+/// The path of `file` in earlier metadata, if any knows it.
+fn old_path(previous: &[std::path::PathBuf], file: FileId) -> Option<String> {
+    previous.iter().find_map(|p| {
+        let c =
+            rusqlite::Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .ok()?;
+        query::path_of(&c, file)
+            .ok()
+            .flatten()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -177,6 +234,7 @@ impl Vfs {
             objects: disk.len(),
             ..Default::default()
         };
+        let previous = previous_metadata(store.root());
         let path_of = |f: FileId| -> String {
             self.q(|c| query::path_of(c, f))
                 .ok()
@@ -274,7 +332,10 @@ impl Vfs {
                         error: e.to_string(),
                     },
                 },
-                (true, Orphans::Quarantine) => match self.quarantine(key, &opts.host).await {
+                (true, Orphans::Quarantine) => match self
+                    .quarantine(key, old_path(&previous, key.file), opts)
+                    .await
+                {
                     Ok(to) => Action::Quarantined { to },
                     Err(e) => Action::Failed {
                         error: e.to_string(),
@@ -366,7 +427,7 @@ impl Vfs {
                         let _ = store.delete(key);
                         Action::Lost { to: None }
                     }
-                    Ok(()) => match self.quarantine(key, &opts.host).await {
+                    Ok(()) => match self.quarantine(key, Some(path.clone()), opts).await {
                         Ok(to) => Action::Lost { to: Some(to) },
                         Err(e) => {
                             tracing::warn!(?key, error = %e, "fsck: could not keep damaged bytes");
@@ -427,12 +488,44 @@ impl Vfs {
         Ok(size)
     }
 
-    /// Move an object into `/.lost+found/<host>/<file>.<generation>` as a new
-    /// file; returns its path.
-    async fn quarantine(&self, key: ObjectKey, host: &str) -> NestResult<String> {
-        let lf = self
-            .ensure_dir_path(&[b".lost+found".as_slice(), host.as_bytes()])
-            .await?;
+    /// Move an object into `/.lost+found/<stamp>/<host>/<path>` (or
+    /// `.../unknown/<file>.<generation>` when no metadata knows its path) as
+    /// a new file; returns where it went.
+    async fn quarantine(
+        &self,
+        key: ObjectKey,
+        path: Option<String>,
+        opts: &FsckOptions,
+    ) -> NestResult<String> {
+        let tag = format!("{:016x}.{:x}", key.file.0, key.generation.0);
+        let mut parts: Vec<Vec<u8>> = vec![
+            b".lost+found".to_vec(),
+            opts.stamp.clone().into_bytes(),
+            opts.host.clone().into_bytes(),
+        ];
+        let name: Vec<u8> = match &path {
+            Some(p) if !p.starts_with("/.lost+found/") => {
+                let comps: Vec<&str> = p.split('/').filter(|c| !c.is_empty()).collect();
+                match comps.split_last() {
+                    Some((last, dirs)) => {
+                        parts.extend(dirs.iter().map(|d| d.as_bytes().to_vec()));
+                        last.as_bytes().to_vec()
+                    }
+                    None => tag.clone().into_bytes(),
+                }
+            }
+            _ => {
+                parts.push(b"unknown".to_vec());
+                tag.clone().into_bytes()
+            }
+        };
+        let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+        let dir = self.ensure_dir_path(&refs).await?;
+        let name = if self.q(|c| query::lookup(c, dir, &name))?.is_some() {
+            [name, b".".to_vec(), tag.into_bytes()].concat()
+        } else {
+            name
+        };
         let store = self.data().store().clone();
         let (size, mtime) = store.stat(key).map_err(io)?;
         let first = match self.propose(Command::ReserveFileIds { count: 1 }).await? {
@@ -441,11 +534,10 @@ impl Vfs {
         };
         let to = ObjectKey::new(first, Generation(1));
         store.move_object(key, to).map_err(io)?;
-        let name = format!("{:016x}.{:x}", key.file.0, key.generation.0);
         let r = self
             .propose(Command::Import {
-                parent: lf,
-                name: name.clone().into_bytes(),
+                parent: dir,
+                name: name.clone(),
                 file: first,
                 perm: 0o600,
                 size,
@@ -459,7 +551,12 @@ impl Vfs {
             let _ = store.move_object(to, key);
             return Err(e);
         }
-        Ok(format!("/.lost+found/{host}/{name}"))
+        let shown: Vec<String> = parts
+            .iter()
+            .chain(std::iter::once(&name))
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        Ok(format!("/{}", shown.join("/")))
     }
 
     async fn ensure_dir_path(&self, parts: &[&[u8]]) -> NestResult<FileId> {

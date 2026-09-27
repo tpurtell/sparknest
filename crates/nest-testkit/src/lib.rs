@@ -41,6 +41,7 @@ pub fn fast_tuning() -> Tuning {
         mount: false,
         fabric: None,
         boot_id: None,
+        recovery_grace: Duration::from_millis(500),
     }
 }
 
@@ -165,6 +166,43 @@ impl TestCluster {
     pub async fn stop(&mut self, id: u64) {
         let n = self.nodes.remove(&id).expect("node running");
         n.shutdown().await;
+    }
+
+    /// Start several stopped nodes at once (after a full outage each one's
+    /// start waits for the others).
+    pub async fn restart_many(&mut self, ids: &[u64]) {
+        let starts: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let cfg = self.config(id, self.addrs[&id]);
+                let mut tuning = self.tuning.clone();
+                tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
+                async move {
+                    let n = Node::start(cfg, b"testkit-secret".to_vec(), tuning, false)
+                        .await
+                        .unwrap();
+                    (id, n)
+                }
+            })
+            .collect();
+        for (id, n) in futures::future::join_all(starts).await {
+            self.addrs.insert(id, n.rpc.local_addr());
+            self.nodes.insert(id, n);
+        }
+    }
+
+    /// Start node `id` on a throwaway address without registering it, to
+    /// watch whether it would come up (e.g. under a timeout). Abandoning the
+    /// future leaves nothing on the node's real address.
+    pub fn start_detached(&mut self, id: u64) -> impl std::future::Future<Output = Node> + use<> {
+        let cfg = self.config(id, "127.0.0.1:0".parse().unwrap());
+        let mut tuning = self.tuning.clone();
+        tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
+        async move {
+            Node::start(cfg, b"testkit-secret".to_vec(), tuning, false)
+                .await
+                .unwrap()
+        }
     }
 
     /// Restart a stopped node on its original address.
