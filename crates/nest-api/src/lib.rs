@@ -5,6 +5,7 @@
 //! Paths in requests are namespace paths ("/hub/...") or paths under this
 //! node's mountpoint, which are translated.
 
+mod events;
 mod transfer;
 
 use axum::extract::{Path, Query, State};
@@ -35,6 +36,8 @@ pub struct Api {
     pub web_addr: Option<std::net::SocketAddr>,
     /// This host's name (for lost+found).
     pub host: String,
+    /// Live updates for web UI subscribers.
+    pub events: Arc<events::Events>,
 }
 
 /// The web/API bearer token: HMAC of a fixed label under the cluster secret,
@@ -152,8 +155,10 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf/detail", get(hf_detail))
         .route("/v1/hf/import", post(hf_import))
         .route("/v1/logs", get(logs))
+        .route("/v1/logs/stream", get(events::log_stream))
         .route("/v1/space/tree", get(space_tree))
         .route("/v1/download", get(transfer::download))
+        .route("/v1/events", get(events::events))
         .route(
             "/v1/upload",
             put(transfer::upload).layer(axum::extract::DefaultBodyLimit::disable()),
@@ -181,7 +186,7 @@ pub async fn serve_tcp(api: Api, addr: std::net::SocketAddr) -> anyhow::Result<(
                     .is_some_and(|v| v.strip_prefix("Bearer ").is_some_and(|t| t == token))
                     // A download is a plain link, which cannot send a
                     // header: it may carry the token in its query.
-                    || (req.uri().path() == "/v1/download"
+                    || (matches!(req.uri().path(), "/v1/download" | "/v1/events" | "/v1/logs/stream")
                         && req.uri().query().is_some_and(|q| {
                             q.split('&').any(|kv| kv.strip_prefix("token=") == Some(token.as_str()))
                         }));
@@ -218,10 +223,14 @@ pub async fn serve_unix(api: Api, path: std::path::PathBuf) -> anyhow::Result<()
 }
 
 async fn status(State(api): State<Api>) -> R<serde_json::Value> {
+    Ok(Json(status_json(&api).await?))
+}
+
+pub(crate) async fn status_json(api: &Api) -> Result<serde_json::Value, ApiError> {
     let nodes = api.placer.status().await?;
     let d = api.vfs.data();
     let t = api.vfs.statfs().map(|(_, n)| n).unwrap_or(0);
-    Ok(Json(json!({
+    Ok(json!({
         "me": d.id(),
         // This host serves: caught up, admitted after any recovery, lease valid.
         "serving": d.caught_up() && d.lease_valid(),
@@ -231,7 +240,7 @@ async fn status(State(api): State<Api>) -> R<serde_json::Value> {
         "entries": t,
         "nodes": nodes,
         "rules": api.placer.rules()?.len(),
-    })))
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1110,14 +1119,14 @@ async fn space_tree(State(api): State<Api>, Query(q): Query<TreeQ>) -> R<serde_j
 }
 
 #[derive(Deserialize)]
-struct LogsReq {
+pub(crate) struct LogsReq {
     /// One host; every node when absent.
-    host: Option<String>,
+    pub(crate) host: Option<String>,
     /// Least severe level shown: error, warn, info (default), debug.
-    level: Option<String>,
+    pub(crate) level: Option<String>,
     /// Case-insensitive text the message or target must contain.
-    q: Option<String>,
-    limit: Option<usize>,
+    pub(crate) q: Option<String>,
+    pub(crate) limit: Option<usize>,
 }
 
 async fn logs(
@@ -1132,6 +1141,7 @@ async fn logs(
                 level: r.level,
                 contains: r.q.filter(|q| !q.is_empty()),
                 after: None,
+                since_ms: None,
                 limit: r.limit,
             },
         )

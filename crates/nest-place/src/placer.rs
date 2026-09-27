@@ -1163,6 +1163,16 @@ impl Placer {
         host: Option<&str>,
         q: crate::logs::LogQuery,
     ) -> NestResult<(Vec<(String, crate::logs::LogLine)>, Vec<String>)> {
+        self.logs_since(host, q, &HashMap::new()).await
+    }
+
+    /// `logs`, with a starting time per host (for following).
+    pub async fn logs_since(
+        &self,
+        host: Option<&str>,
+        q: crate::logs::LogQuery,
+        since: &HashMap<String, u64>,
+    ) -> NestResult<(Vec<(String, crate::logs::LogLine)>, Vec<String>)> {
         let nodes: Vec<_> = self
             .nodes()?
             .into_iter()
@@ -1174,13 +1184,17 @@ impl Placer {
         let me = self.vfs.data().id();
         let q = &q;
         let got = futures::future::join_all(nodes.iter().map(|h| async move {
+            let mut q = q.clone();
+            if let Some(t) = since.get(&h.name) {
+                q.since_ms = Some(*t);
+            }
             if h.node == me {
-                return (h.name.clone(), Ok(crate::logs::recent(q)));
+                return (h.name.clone(), Ok(crate::logs::recent(&q)));
             }
             let r = admin::call(
                 self.rpc(),
                 h.node,
-                &AdminReq::Logs(q.clone()),
+                &AdminReq::Logs(q),
                 Duration::from_secs(3),
             )
             .await;

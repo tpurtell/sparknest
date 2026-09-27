@@ -46,8 +46,8 @@
   });
   // Refresh quietly while copies are running.
   $effect(() => {
-    void app.tick;
-    if (runningJobs().length && app.tick % 3 === 0) refresh();
+    void app.changed;
+    refresh();
   });
 
   const root = $derived.by<TreeNode | null>(() => {

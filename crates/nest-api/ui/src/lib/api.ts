@@ -17,6 +17,13 @@ export const hasToken = () => token !== "";
 export const downloadUrl = (path: string) =>
   `/v1/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(token)}`;
 export const authHeader = () => "Bearer " + token;
+/** The live update stream (an EventSource cannot send a header). */
+export const eventsUrl = () => `/v1/events?token=${encodeURIComponent(token)}`;
+/** A stream endpoint with the token in its query. */
+export const streamUrl = (path: string, q: URLSearchParams) => {
+  q.set("token", token);
+  return `${path}?${q}`;
+};
 export function setToken(t: string) {
   token = t.trim();
   try {
@@ -217,6 +224,7 @@ export interface Rule {
 }
 export interface LogLine {
   host: string;
+  seq?: number;
   ts_ms: number;
   level: string;
   target: string;

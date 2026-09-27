@@ -270,6 +270,7 @@ impl Node {
             web_token: nest_api::web_token(&secret_for_web),
             web_addr: cfg.node.api_listen,
             host: cfg.node.name.clone(),
+            events: Default::default(),
         };
         let sock = cfg.api_socket();
         let web_addr = cfg.node.api_listen;

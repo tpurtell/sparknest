@@ -27,8 +27,13 @@
   }
   const refresh = singleFlight(load);
   $effect(() => {
-    void app.tick;
+    void app.changed;
     refresh();
+  });
+  // Usage (who opened what) moves without metadata changes.
+  $effect(() => {
+    const t = setInterval(refresh, 15_000);
+    return () => clearInterval(t);
   });
 
   const cols = $derived(targets());

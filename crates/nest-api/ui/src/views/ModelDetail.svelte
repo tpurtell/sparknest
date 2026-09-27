@@ -33,7 +33,7 @@
   const refresh = singleFlight(load);
   $effect(() => {
     void selector;
-    void app.tick;
+    void app.changed;
     refresh();
   });
 

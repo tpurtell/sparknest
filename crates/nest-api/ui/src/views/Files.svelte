@@ -24,7 +24,7 @@
   const refresh = singleFlight(load);
   $effect(() => {
     void path;
-    void app.tick;
+    void app.changed;
     refresh();
   });
   const full = (n: string) => (path === "/" ? "" : path) + "/" + n;

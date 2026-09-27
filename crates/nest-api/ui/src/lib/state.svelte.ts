@@ -1,7 +1,7 @@
 // Cluster state shared by every view, refreshed every 2 s while the page is
 // visible, plus routing and toasts.
 
-import { get, post, hasToken, ApiError, net, type Status, type Store, type Job } from "./api";
+import { get, post, hasToken, ApiError, net, eventsUrl, type Status, type Store, type Job } from "./api";
 
 /** Run `fn` only if its previous run finished: a slow server gets one
  * request of each kind at a time, never a growing pile. */
@@ -35,6 +35,10 @@ export const app = $state({
   tick: 0,
   /** Seconds the oldest request has been waiting, when that is long. */
   slow: 0,
+  /** Bumped when the namespace or placement changed: views refetch. */
+  changed: 0,
+  /** The live stream is connected (else polling). */
+  live: false,
 });
 
 const prev: Record<string, { t: number; r: number; s: number }> = {};
@@ -50,6 +54,17 @@ async function pollOnce() {
       get<{ jobs: Job[] }>("/v1/jobs").then((v) => v.jobs),
       get<{ groups: { name: string; members: string[] }[] }>("/v1/groups").then((v) => v.groups),
     ]);
+    apply(status, stores, jobs, groups);
+    // Without the stream, refetch views on every poll.
+    if (!app.live) app.changed++;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) app.authed = false;
+    app.error = (e as Error).message;
+  }
+}
+
+function apply(status: Status, stores: Store[], jobs: Job[], groups: { name: string; members: string[] }[]) {
+  {
     const now = performance.now();
     const rates: Record<string, Rates> = {};
     for (const n of status.nodes) {
@@ -72,20 +87,52 @@ async function pollOnce() {
     app.rates = rates;
     app.error = "";
     app.tick++;
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 401) app.authed = false;
-    app.error = (e as Error).message;
   }
+}
+
+// ---------------------------------------------------------------- live
+
+let source: EventSource | null = null;
+let lastEvent = 0;
+
+/** Subscribe to the node's event stream; polling covers any gap. */
+function connect() {
+  source?.close();
+  source = new EventSource(eventsUrl());
+  source.addEventListener("state", (e) => {
+    lastEvent = performance.now();
+    app.live = true;
+    try {
+      const v = JSON.parse((e as MessageEvent).data);
+      apply(v.status, v.stores, v.jobs, v.groups);
+    } catch {
+      /* a malformed frame: the next one replaces it */
+    }
+  });
+  source.addEventListener("changed", () => {
+    lastEvent = performance.now();
+    app.changed++;
+  });
+  source.onerror = () => {
+    // EventSource reconnects by itself; until it does, polling fills in.
+    app.live = false;
+  };
 }
 
 let timer: ReturnType<typeof setInterval> | undefined;
 export function startPolling() {
   clearInterval(timer);
   poll();
+  connect();
   timer = setInterval(() => {
     const oldest = Math.min(Infinity, ...net.inflight.values());
     app.slow = isFinite(oldest) && performance.now() - oldest > 4000 ? Math.round((performance.now() - oldest) / 1000) : 0;
-    if (document.visibilityState === "visible") poll();
+    // State arrives when it changes; a silent stream for long is a dead one.
+    if (app.live && performance.now() - lastEvent > 45_000) {
+      app.live = false;
+      connect();
+    }
+    if (!app.live && document.visibilityState === "visible") poll();
   }, 2000);
 }
 

@@ -34,6 +34,10 @@ pub struct LogQuery {
     pub contains: Option<String>,
     /// Only lines with a larger `seq`.
     pub after: Option<u64>,
+    /// Only lines at or after this time (Unix ms). Followers use it with
+    /// `seq` to skip what they have: `seq` restarts when a node does.
+    #[serde(default)]
+    pub since_ms: Option<u64>,
     /// The newest this many (default 500).
     pub limit: Option<usize>,
 }
@@ -74,6 +78,7 @@ pub fn recent(q: &LogQuery) -> Vec<LogLine> {
         .iter()
         .rev()
         .take_while(|l| q.after.is_none_or(|a| l.seq > a))
+        .take_while(|l| q.since_ms.is_none_or(|t| l.ts_ms >= t))
         .filter(|l| rank(&l.level) <= max)
         .filter(|l| {
             needle.as_ref().is_none_or(|n| {
@@ -165,6 +170,7 @@ mod tests {
                 level: Some(level.into()),
                 contains: Some(extra.map_or(tag.clone(), |e| format!("{tag} {e}"))),
                 after: None,
+                since_ms: None,
                 limit,
             })
             .into_iter()
