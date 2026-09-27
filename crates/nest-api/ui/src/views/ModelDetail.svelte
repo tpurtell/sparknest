@@ -2,7 +2,7 @@
   import { get, type Readiness, type TreeNode, type HostUsage } from "../lib/api";
   import { app, runningJobs, startJob, go, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
-  import { copyTo, offload, keepOn, removeFrom, nodeMenu, consolidate, consolidateTo } from "../lib/actions";
+  import { copyTo, offload, keepOn, removeFrom, nodeMenu, consolidate, consolidateTo, deleteModel } from "../lib/actions";
   import Treemap from "../components/Treemap.svelte";
   import Icon from "../components/Icon.svelte";
 
@@ -73,6 +73,7 @@
       <button class="btn" onclick={() => consolidateTo(selector)}><Icon name="target" size={15} /> Move to…</button>
       <button class="btn" onclick={() => offload(selector)} disabled={!app.stores.length}><Icon name="archive" size={15} /> Offload…</button>
       <button class="btn danger" onclick={() => removeFrom(selector)}><Icon name="trash" size={15} /> Remove from…</button>
+      <button class="btn danger" onclick={() => deleteModel(selector)} title="Delete the repo from the hub with hf: every copy, every host"><Icon name="trash" size={15} /> Delete model</button>
     </div>
 
     {#if d.revisions.length || d.rules.length}

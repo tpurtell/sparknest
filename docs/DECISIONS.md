@@ -953,3 +953,18 @@ not needed). The source is only read, once.
 The import runs at the source drive's read rate. Snapshots, refs and
 verification are unchanged; placement afterwards is the placer's (rules,
 plans).
+
+## ADR-037 — Models are deleted by hf, on sparknest's hub (2026-09-27)
+
+**Context.** Deleting a model's directory from the Files page removes paths,
+but in huggingface_hub's current layout a repo's blobs are links into the
+hub's shared `blobs/` directory, which other repos may use; only hf knows
+which shared blobs are still referenced.
+
+**Decision.** Models are deleted with `hf cache rm` run by the daemon on its
+own mount's hub (`--cache-dir <mount>/hf-home/hub`, `HF_HOME` set to the
+mount's hf-home), so every host's and archive's copy goes with the files.
+The UI's model detail and `nest hf rm REPO... [--dry-run]` preview with hf's
+dry run, then delete as a job. The daemon looks for `hf` on PATH, then in
+Homebrew's and `~/.local/bin` (its system unit has a minimal PATH). Deleting
+paths from the Files page stays as it is.

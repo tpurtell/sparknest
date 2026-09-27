@@ -3,7 +3,7 @@
 
 import { post, api, type TreeNode, type Plan } from "./api";
 import { app, startJob, targets, toast, go } from "./state.svelte";
-import { pick, inform, openMenu, type MenuItem } from "./ui.svelte";
+import { pick, inform, confirm, openMenu, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
 import { download, remove as deletePath } from "./files.svelte";
 
@@ -16,6 +16,32 @@ export async function copyTo(selector: string, hosts?: string[]) {
     ));
   if (!to?.length) return;
   await startJob("/v1/replicate", { selector, hosts: to }, `Copying ${selLabel(selector)} to ${to.join(", ")}`);
+}
+
+/** Delete a Hugging Face repo from the hub, every copy: `hf cache rm` on
+ *  the daemon's host (it knows which shared blobs other repos use). */
+export async function deleteModel(selector: string) {
+  const label = selLabel(selector);
+  let d: { repos?: number; revisions?: number; size?: string };
+  try {
+    d = (await post<{ dry_run: typeof d }>("/v1/hf/remove", { targets: [selector], dry_run: true })).dry_run;
+  } catch (e) {
+    toast((e as Error).message, true);
+    return;
+  }
+  if (!d?.repos) {
+    await inform(`Nothing to delete`, `hf finds no ${label} in the hub.`);
+    return;
+  }
+  const ok = await confirm(
+    `Delete ${label}?`,
+    `hf removes ${d.revisions ?? 1} revision${d.revisions === 1 ? "" : "s"} (${d.size ?? "?"}) from every host and archive store. This cannot be undone.`,
+    "Delete",
+    true,
+  );
+  if (!ok) return;
+  await startJob("/v1/hf/remove", { targets: [selector] }, `Deleting ${label}`);
+  go("models");
 }
 
 export async function removeFrom(selector: string, hosts?: string[]) {

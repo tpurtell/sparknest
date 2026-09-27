@@ -164,6 +164,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf", get(hf_repos))
         .route("/v1/hf/detail", get(hf_detail))
         .route("/v1/hf/import", post(hf_import))
+        .route("/v1/hf/remove", post(hf_remove))
         .route("/v1/logs", get(logs))
         .route("/v1/space/tree", get(space_tree))
         .route("/v1/download", get(transfer::download))
@@ -708,6 +709,46 @@ async fn hf_import(State(api): State<Api>, Json(r): Json<HfImportReq>) -> R<serd
         spread: r.spread,
     };
     Ok(Json(json!({ "job": api.placer.hf_import(opts) })))
+}
+
+#[derive(Deserialize)]
+struct HfRemoveReq {
+    /// Repos: `org/name`, `hf:org/name`, `model/org/name`, `dataset/org/name`.
+    targets: Vec<String>,
+    /// Only report what would go (hf's dry run), synchronously.
+    #[serde(default)]
+    dry_run: bool,
+    /// The `hf` program; absent: found on this node.
+    hf: Option<String>,
+}
+
+/// Delete Hugging Face repos properly: `hf cache rm` on sparknest's hub
+/// (through this node's mount), which knows the hub's shared blobs.
+async fn hf_remove(State(api): State<Api>, Json(r): Json<HfRemoveReq>) -> R<serde_json::Value> {
+    let mount_hub = api
+        .mountpoint
+        .as_ref()
+        .map(|m| std::path::Path::new(m).join(api.hub.trim_start_matches('/')))
+        .ok_or_else(|| ApiError(StatusCode::CONFLICT, "this node has no mount".into()))?;
+    let hf =
+        r.hf.map(std::path::PathBuf::from)
+            .or_else(nest_place::hfimport::find_hf)
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "hf is not installed on this node".into(),
+                )
+            })?;
+    if r.targets.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "no repos given".into()));
+    }
+    if r.dry_run {
+        let v = nest_place::hfimport::remove(&hf, &mount_hub, &r.targets, true).await?;
+        return Ok(Json(json!({ "dry_run": v })));
+    }
+    Ok(Json(
+        json!({ "job": api.placer.hf_remove(hf, mount_hub, r.targets) }),
+    ))
 }
 
 async fn cluster(State(api): State<Api>) -> R<serde_json::Value> {

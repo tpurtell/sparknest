@@ -351,6 +351,21 @@ enum HfCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Delete Hugging Face repos from sparknest's hub (every copy, every host)
+    ///
+    /// Runs `hf cache rm` on the hub through this host's mount, so hf decides
+    /// which of the hub's shared blobs other repos still use. REPO is
+    /// org/name (a model), dataset/org/name, or hf:org/name.
+    Rm {
+        #[arg(required = true)]
+        repos: Vec<String>,
+        /// Only show what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Follow the job until it finishes.
+        #[arg(long)]
+        wait: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1635,6 +1650,37 @@ async fn main() -> Result<()> {
             }
             None => c.get("/v1/jobs").await?,
         },
+        Cmd::Hf {
+            cmd:
+                HfCmd::Rm {
+                    repos,
+                    dry_run,
+                    wait,
+                },
+        } => {
+            let v = c
+                .post(
+                    "/v1/hf/remove",
+                    json!({ "targets": repos, "dry_run": dry_run, "hf": which("hf") }),
+                )
+                .await?;
+            if *dry_run {
+                if !cli.json {
+                    let d = &v["dry_run"];
+                    println!(
+                        "would remove {} repo(s), {} revision(s), {}",
+                        d["repos"],
+                        d["revisions"],
+                        d["size"].as_str().unwrap_or("?")
+                    );
+                    return Ok(());
+                }
+                v
+            } else {
+                let jid = v["job"].as_u64().unwrap_or(0);
+                if *wait { wait_job(&c, jid).await? } else { v }
+            }
+        }
         Cmd::Hf {
             cmd:
                 HfCmd::Import {

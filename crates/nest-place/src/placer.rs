@@ -1080,6 +1080,26 @@ impl Placer {
         })
     }
 
+    /// Delete Hugging Face repos from the hub through `hf cache rm` (see
+    /// `hfimport::remove`), as a job whose note is hf's summary.
+    pub fn hf_remove(
+        self: &Arc<Self>,
+        hf: std::path::PathBuf,
+        mount_hub: std::path::PathBuf,
+        targets: Vec<String>,
+    ) -> u64 {
+        let what = format!("hf rm {}", targets.join(" "));
+        tracing::info!(?targets, "hf rm started");
+        self.local_job(what, move |_vfs, progress, notes| async move {
+            let r = crate::hfimport::remove(&hf, &mount_hub, &targets, false).await;
+            progress.lock().finished = true;
+            if let Ok(v) = &r {
+                notes.lock().push(format!("hf: {v}"));
+            }
+            r.map(|_| ())
+        })
+    }
+
     /// A job that runs on this node over an `ImportProgress`: its progress
     /// is mirrored into the job under this host's name (files, bytes and
     /// rate like any other job), it can be cancelled, and `notes` lines end

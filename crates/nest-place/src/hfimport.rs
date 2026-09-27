@@ -729,3 +729,120 @@ async fn place_spread(
     }
     Ok(())
 }
+
+/// The `hf` program: on PATH, else where Homebrew or pip put it (the
+/// daemon's system unit has a minimal PATH).
+pub fn find_hf() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    dirs.push("/home/linuxbrew/.linuxbrew/bin".into());
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/bin"));
+    }
+    dirs.into_iter().map(|d| d.join("hf")).find(|p| p.is_file())
+}
+
+/// A repo target for `hf cache rm`: `model/org/name`, `dataset/org/name`
+/// (also accepts `hf:org/name`, `org/name`, `datasets/org/name`).
+pub fn rm_target(t: &str) -> String {
+    let t = t.trim().trim_start_matches("hf:");
+    for (plural, single) in [
+        ("models/", "model/"),
+        ("datasets/", "dataset/"),
+        ("spaces/", "space/"),
+    ] {
+        if let Some(rest) = t.strip_prefix(plural) {
+            return format!("{single}{rest}");
+        }
+    }
+    if ["model/", "dataset/", "space/"]
+        .iter()
+        .any(|p| t.starts_with(p))
+    {
+        t.to_string()
+    } else {
+        format!("model/{t}")
+    }
+}
+
+/// Run `hf cache rm` on sparknest's hub (through this node's mount, so the
+/// files go on every host and archive), with HF_HOME pointing at it: hf
+/// knows which of the hub's shared blobs other repos still use. Returns
+/// hf's JSON summary.
+pub async fn remove(
+    hf: &Path,
+    mount_hub: &Path,
+    targets: &[String],
+    dry_run: bool,
+) -> NestResult<serde_json::Value> {
+    let mut cmd = tokio::process::Command::new(hf);
+    cmd.arg("cache")
+        .arg("rm")
+        .args(targets.iter().map(|t| rm_target(t)))
+        .arg("--cache-dir")
+        .arg(mount_hub)
+        .arg("--json")
+        .arg(if dry_run { "--dry-run" } else { "--yes" })
+        .env("HF_HUB_DISABLE_TELEMETRY", "1");
+    if let Some(home) = mount_hub.parent() {
+        cmd.env("HF_HOME", home);
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| NestError::Io(format!("running {}: {e}", hf.display())))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let summary = stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok());
+    match (out.status.success(), summary) {
+        (true, Some(v)) => Ok(v),
+        (true, None) => Ok(serde_json::json!({ "output": stdout.trim() })),
+        (false, _) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg = err
+                .lines()
+                .chain(stdout.lines())
+                .rfind(|l| !l.trim().is_empty())
+                .unwrap_or("failed");
+            Err(NestError::Invalid(format!("hf cache rm: {}", msg.trim())))
+        }
+    }
+}
+
+#[cfg(test)]
+mod rm_tests {
+    /// With hf installed: a dry run reports, a delete removes the repo.
+    #[tokio::test]
+    async fn hf_removes_a_repo_from_a_hub() {
+        let Some(hf) = super::find_hf() else { return };
+        let hub = std::env::temp_dir().join(format!("nest-hf-rm-{}/hub", std::process::id()));
+        let r = hub.join("models--org--tiny");
+        std::fs::create_dir_all(r.join("blobs")).unwrap();
+        std::fs::create_dir_all(r.join("snapshots/abc")).unwrap();
+        std::fs::create_dir_all(r.join("refs")).unwrap();
+        std::fs::write(r.join("blobs/e1"), b"weights").unwrap();
+        std::os::unix::fs::symlink("../../blobs/e1", r.join("snapshots/abc/model.bin")).unwrap();
+        std::fs::write(r.join("refs/main"), b"abc").unwrap();
+        let t = vec!["hf:org/tiny".to_string()];
+        let d = super::remove(&hf, &hub, &t, true).await.unwrap();
+        assert_eq!(d["repos"], 1, "{d}");
+        assert!(r.exists());
+        let v = super::remove(&hf, &hub, &t, false).await.unwrap();
+        assert_eq!(v["repos_deleted"], 1, "{v}");
+        assert!(!r.exists());
+        let _ = std::fs::remove_dir_all(hub.parent().unwrap());
+    }
+
+    #[test]
+    fn targets_are_what_hf_expects() {
+        use super::rm_target;
+        assert_eq!(rm_target("hf:Qwen/Qwen3-8B"), "model/Qwen/Qwen3-8B");
+        assert_eq!(rm_target("Qwen/Qwen3-8B"), "model/Qwen/Qwen3-8B");
+        assert_eq!(rm_target("gpt2"), "model/gpt2");
+        assert_eq!(rm_target("datasets/cais/mmlu"), "dataset/cais/mmlu");
+        assert_eq!(rm_target("dataset/cais/mmlu"), "dataset/cais/mmlu");
+    }
+}
