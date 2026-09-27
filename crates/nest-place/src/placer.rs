@@ -55,6 +55,9 @@ pub struct ClusterJob {
     /// What happened, for people (e.g. per-repo outcomes of an hf import).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// The host that runs it (where it was started).
+    #[serde(default)]
+    pub node: String,
     /// Node-side jobs to tell when cancelled.
     #[serde(skip)]
     host_jobs: Vec<(NodeId, u64)>,
@@ -112,6 +115,8 @@ pub struct Placer {
     stores_cache: Mutex<Option<(std::time::Instant, Vec<StoreStatus>)>>,
     /// Each host's last answer to Info, for live views.
     info_cache: Mutex<HashMap<NodeId, admin::NodeInfo>>,
+    /// Other nodes' jobs as last heard, for when one answers slowly.
+    jobs_cache: Mutex<HashMap<NodeId, Vec<ClusterJob>>>,
     plans: Mutex<HashMap<u64, crate::plan::Plan>>,
     next_job: AtomicU64,
     dirty: Arc<tokio::sync::Notify>,
@@ -214,6 +219,7 @@ impl Placer {
             usage_cache: Mutex::new(None),
             stores_cache: Mutex::new(None),
             info_cache: Mutex::new(HashMap::new()),
+            jobs_cache: Mutex::new(HashMap::new()),
             plans: Mutex::new(HashMap::new()),
             next_job: AtomicU64::new(rand::random::<u32>() as u64),
             dirty: Arc::new(tokio::sync::Notify::new()),
@@ -230,6 +236,7 @@ impl Placer {
             }
         }));
         tokio::spawn(auto_reconcile(Arc::downgrade(&p)));
+        let _ = p.admin.placer.set(Arc::downgrade(&p));
         tokio::spawn(share_capacity(Arc::downgrade(&p)));
         tokio::spawn(auto_meta_snapshots(Arc::downgrade(&p)));
         // Record our name so rules and tools can say "raptor" (needs quorum;
@@ -996,9 +1003,54 @@ impl Placer {
         self.jobs.lock().get(&id).map(|j| j.lock().clone())
     }
 
-    /// Cancel a running replicate, offload or plan job: no new files start
-    /// (those copying finish), and nothing is evicted afterwards.
+    /// A job by id, wherever in the cluster it runs.
+    pub async fn find_job(&self, id: u64) -> Option<ClusterJob> {
+        match self.job(id) {
+            Some(j) => Some(j),
+            None => self.all_jobs().await.into_iter().find(|j| j.id == id),
+        }
+    }
+
+    /// Cancel a running replicate, offload, import or plan job, on whichever
+    /// node runs it: no new files start (those copying finish), and nothing
+    /// is evicted afterwards.
     pub async fn cancel_job(&self, id: u64) -> NestResult<()> {
+        if self.jobs.lock().contains_key(&id) {
+            return self.cancel_own_job(id).await;
+        }
+        let owner = self
+            .jobs_cache
+            .lock()
+            .iter()
+            .find(|(_, js)| js.iter().any(|j| j.id == id))
+            .map(|(n, _)| *n);
+        let owner = match owner {
+            Some(n) => n,
+            None => {
+                self.all_jobs().await;
+                self.jobs_cache
+                    .lock()
+                    .iter()
+                    .find(|(_, js)| js.iter().any(|j| j.id == id))
+                    .map(|(n, _)| *n)
+                    .ok_or(NestError::NotFound)?
+            }
+        };
+        match admin::call(
+            self.rpc(),
+            owner,
+            &AdminReq::CancelOwnJob { job: id },
+            Duration::from_secs(5),
+        )
+        .await?
+        {
+            AdminResp::Err(e) => Err(NestError::Invalid(e)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Cancel one of this node's own jobs.
+    pub(crate) async fn cancel_own_job(&self, id: u64) -> NestResult<()> {
         let job = self
             .jobs
             .lock()
@@ -1047,6 +1099,7 @@ impl Placer {
         Ok(())
     }
 
+    /// The jobs started on this node.
     pub fn jobs(&self) -> Vec<ClusterJob> {
         let mut v: Vec<ClusterJob> = self
             .jobs
@@ -1054,7 +1107,36 @@ impl Placer {
             .values()
             .map(|j| j.lock().clone())
             .collect();
+        for j in &mut v {
+            j.node = self.admin.name.clone();
+        }
         v.sort_by_key(|j| j.id);
+        v
+    }
+
+    /// Every node's jobs, oldest first: a node that does not answer in
+    /// time contributes what it said last.
+    pub async fn all_jobs(&self) -> Vec<ClusterJob> {
+        let me = self.vfs.data().id();
+        let peers: Vec<NodeId> = self
+            .nodes()
+            .map(|n| n.into_iter().map(|h| h.node).filter(|n| *n != me).collect())
+            .unwrap_or_default();
+        let answers = futures::future::join_all(peers.iter().map(|&n| async move {
+            let r = admin::call(self.rpc(), n, &AdminReq::Jobs, Duration::from_millis(900)).await;
+            (n, r)
+        }))
+        .await;
+        let mut v = self.jobs();
+        let mut cache = self.jobs_cache.lock();
+        cache.retain(|n, _| peers.contains(n));
+        for (n, r) in answers {
+            if let Ok(AdminResp::Jobs(js)) = r {
+                cache.insert(n, js);
+            }
+        }
+        v.extend(cache.values().flatten().cloned());
+        v.sort_by_key(|j| (j.started_ms, j.id));
         v
     }
 

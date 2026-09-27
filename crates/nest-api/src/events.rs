@@ -65,7 +65,7 @@ async fn snapshot(api: &Api) -> Option<String> {
     Some(
         json!({
             "status": status,
-            "jobs": api.placer.jobs(),
+            "jobs": api.placer.all_jobs().await,
             "stores": stores,
             "groups": groups,
         })

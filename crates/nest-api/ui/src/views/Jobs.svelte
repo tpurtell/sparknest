@@ -7,7 +7,7 @@
 </script>
 
 <div class="stack">
-  <div class="row"><h2>Jobs</h2><span class="small muted">on this node since it started</span></div>
+  <div class="row"><h2>Jobs</h2><span class="small muted">on every host since its daemon started</span></div>
   {#each jobs as j (j.id)}
     {@const done = tot(j, "done_bytes")}
     {@const total = tot(j, "total_bytes")}
@@ -18,6 +18,7 @@
           {!j.finished ? (j.cancelled ? "cancelling" : "running") : j.cancelled ? "cancelled" : j.error ? "failed" : "done"}
         </span>
         <b class="what">{selLabel(j.what)}</b>
+        {#if j.node}<span class="tiny muted">on {j.node}</span>{/if}
         <span class="spacer"></span>
         {#if j.started_ms}<span class="tiny muted mono">{new Date(j.started_ms).toLocaleTimeString()} · {duration(secs * 1000)}{done && secs > 0.5 ? ` · ${human(done / secs)}/s` : ""}</span>{/if}
         {#if !j.finished && !j.cancelled}<button class="btn sm danger" onclick={() => cancelJob(j.id)}><Icon name="stop" size={13} /> Cancel</button>{/if}

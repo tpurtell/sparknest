@@ -141,6 +141,13 @@ pub(crate) enum AdminReq {
     /// Drop this host's clean page cache (benchmarks), through the fixed
     /// setuid helper; nothing about it comes from the request.
     DropCaches,
+    /// The jobs people started on this node (imports, replicates, plans),
+    /// so any node's pages can list them.
+    Jobs,
+    /// Cancel one of this node's own jobs (see `Jobs`).
+    CancelOwnJob {
+        job: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +178,7 @@ pub(crate) enum AdminResp {
     Logs(Vec<crate::logs::LogLine>),
     Usage(Vec<nest_data::usage::FileUsage>),
     Dropped(Result<String, String>),
+    Jobs(Vec<crate::placer::ClusterJob>),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -209,9 +217,11 @@ pub async fn drop_caches_here() -> Result<String, String> {
 
 pub struct Admin {
     pub(crate) vfs: Arc<Vfs>,
-    name: String,
+    pub(crate) name: String,
     mountpoint: Option<String>,
     jobs: Mutex<HashMap<u64, Arc<Mutex<JobProgress>>>>,
+    /// The node's placer, for the requests about its own jobs.
+    pub(crate) placer: std::sync::OnceLock<std::sync::Weak<crate::placer::Placer>>,
 }
 
 impl Admin {
@@ -226,6 +236,7 @@ impl Admin {
             name,
             mountpoint,
             jobs: Mutex::new(HashMap::new()),
+            placer: std::sync::OnceLock::new(),
         });
         rpc.register(service::ADMIN, Arc::new(AdminService(Arc::downgrade(&a))));
         a
@@ -467,6 +478,17 @@ impl Handler for AdminService {
                 AdminReq::Evict { files, store } => a.evict(files, store).await,
                 AdminReq::Logs(q) => AdminResp::Logs(crate::logs::recent(&q)),
                 AdminReq::DropCaches => AdminResp::Dropped(drop_caches_here().await),
+                AdminReq::Jobs => match a.placer.get().and_then(|p| p.upgrade()) {
+                    Some(p) => AdminResp::Jobs(p.jobs()),
+                    None => AdminResp::Jobs(Vec::new()),
+                },
+                AdminReq::CancelOwnJob { job } => match a.placer.get().and_then(|p| p.upgrade()) {
+                    Some(p) => match p.cancel_own_job(job).await {
+                        Ok(()) => AdminResp::Started,
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    },
+                    None => AdminResp::Err("no placer on this node".into()),
+                },
                 AdminReq::Usage { since_ms } => {
                     let u = a.vfs.usage().clone();
                     match tokio::task::spawn_blocking(move || u.summary(since_ms)).await {

@@ -140,6 +140,8 @@ export interface Job {
   finished_ms?: number;
   cancelled?: boolean;
   notes?: string[];
+  /** The host that runs it. */
+  node?: string;
 }
 export interface Readiness {
   host: string;

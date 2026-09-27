@@ -1657,6 +1657,9 @@ fn job_line(j: &Value) -> String {
         state,
         j["what"].as_str().unwrap_or("")
     );
+    if let Some(n) = j["node"].as_str().filter(|n| !n.is_empty()) {
+        line += &format!("  (on {n})");
+    }
     for (h, p) in j["hosts"].as_object().into_iter().flatten() {
         line += &format!(
             "\n          {h}: {}/{} files, {}/{}",

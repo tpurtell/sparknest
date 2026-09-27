@@ -574,13 +574,14 @@ async fn reconcile(State(api): State<Api>, Json(r): Json<ReconcileReq>) -> R<ser
 }
 
 async fn jobs(State(api): State<Api>) -> R<serde_json::Value> {
-    Ok(Json(json!({ "jobs": api.placer.jobs() })))
+    Ok(Json(json!({ "jobs": api.placer.all_jobs().await })))
 }
 
 async fn job(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json::Value> {
     let j = api
         .placer
-        .job(id)
+        .find_job(id)
+        .await
         .ok_or(ApiError(StatusCode::NOT_FOUND, format!("no job {id}")))?;
     Ok(Json(
         json!({ "job": j, "import": api.placer.import_progress(id) }),
