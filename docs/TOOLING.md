@@ -12,6 +12,7 @@ Add a row the moment a new tool is introduced.
 | node ≥ 24, npm | raptor | already installed | web UI: `crates/nest-api/ui` (Svelte 5 + Vite) builds to the committed `crates/nest-api/web/index.html`; `scripts/build.sh` runs `npm ci` and rebuilds when sources change |
 | bindgen (cargo) + libclang | raptor only | `cargo install bindgen-cli`; libclang-21 present | regenerate vendored verbs bindings |
 | rdmasync, rdmapipe | all nodes | `brew install tpurtell/local-ai/rdmasync rdmapipe` or existing `~/.local/bin` | moving test data, throughput baselines |
+| cc, python3 | all nodes | already installed | build the page-cache helper on `sparknest-drop-page-cache --install`; its tests run in `scripts/build.sh --check` |
 | perftest (`ib_write_bw`) | all nodes | already installed on raptor; `apt`/brew on Sparks if missing | raw fabric ceilings |
 
 Homebrew (`/home/linuxbrew/.linuxbrew`) is the preferred way to add tools.

@@ -124,6 +124,9 @@ pub(crate) enum AdminReq {
     Usage {
         since_ms: u64,
     },
+    /// Drop this host's clean page cache (benchmarks), through the fixed
+    /// setuid helper; nothing about it comes from the request.
+    DropCaches,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,6 +156,41 @@ pub(crate) enum AdminResp {
     Err(String),
     Logs(Vec<crate::logs::LogLine>),
     Usage(Vec<nest_data::usage::FileUsage>),
+    Dropped(Result<String, String>),
+}
+
+/// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
+/// 4750, the installing user's group). A fixed path: the daemon never runs
+/// anything a request names.
+pub const DROP_CACHES_HELPER: &str = "/usr/local/libexec/sparknest/drop-page-cache";
+
+/// Sync and drop this host's clean page cache via the helper.
+pub async fn drop_caches_here() -> Result<String, String> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(DROP_CACHES_HELPER)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "timed out after 120 s".to_string())?
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            "helper not installed here: run `sparknest-drop-page-cache --install` on this host"
+                .to_string()
+        }
+        _ => format!("{DROP_CACHES_HELPER}: {e}"),
+    })?;
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    if out.status.success() {
+        Ok(text(&out.stdout))
+    } else {
+        Err(match out.status.code() {
+            Some(77) => "helper not installed setuid here: run `sparknest-drop-page-cache --install` on this host".into(),
+            _ => text(&out.stderr),
+        })
+    }
 }
 
 pub struct Admin {
@@ -393,6 +431,7 @@ impl Handler for AdminService {
                 },
                 AdminReq::Evict { files, store } => a.evict(files, store).await,
                 AdminReq::Logs(q) => AdminResp::Logs(crate::logs::recent(&q)),
+                AdminReq::DropCaches => AdminResp::Dropped(drop_caches_here().await),
                 AdminReq::Usage { since_ms } => {
                     let u = a.vfs.usage().clone();
                     match tokio::task::spawn_blocking(move || u.summary(since_ms)).await {

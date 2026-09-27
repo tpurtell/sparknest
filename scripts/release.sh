@@ -50,11 +50,13 @@ glibc_max() { readelf --version-info "$1" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLI
 package() {
   local arch=$1 bindir=$2 pkg="$name-linux-$1"
   local stage="$out/stage/$pkg"
-  mkdir -p "$stage/bin" "$stage/share/sparknest" "$stage/share/doc/sparknest"
+  mkdir -p "$stage/bin" "$stage/libexec/sparknest" "$stage/share/sparknest" "$stage/share/doc/sparknest"
   install -m 0755 "$bindir/sparknestd" "$bindir/nest" "$stage/bin/"
+  install -m 0755 tools/drop-page-cache/sparknest-drop-page-cache "$stage/bin/"
+  install -m 0644 tools/drop-page-cache/drop-page-cache.c "$stage/libexec/sparknest/"
   cp -r packaging/config packaging/systemd "$stage/share/sparknest/"
   cp README.md docs/INSTALL.md LICENSE-MIT LICENSE-APACHE "$stage/share/doc/sparknest/"
-  for f in "$stage"/bin/*; do
+  for f in "$stage"/bin/sparknestd "$stage"/bin/nest; do
     local m; m=$(glibc_max "$f")
     [ "$(printf '%s\n%s\n' "$m" "$GLIBC_CEILING" | sort -V | tail -1)" = "$GLIBC_CEILING" ] \
       || die "$f requires GLIBC_$m (ceiling $GLIBC_CEILING)"

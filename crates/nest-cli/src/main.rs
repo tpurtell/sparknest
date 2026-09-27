@@ -187,6 +187,18 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Drop the clean page cache on every host (or --host), for cold-cache
+    /// benchmarks
+    ///
+    /// Each host syncs and writes 1 to /proc/sys/vm/drop_caches through its
+    /// setuid helper, installed once per host with `sudo` by
+    /// `sparknest-drop-page-cache --install`. Other workloads on those hosts
+    /// lose their cached pages too.
+    DropCaches {
+        /// Only these hosts or @groups (repeatable).
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+    },
     /// Recent log lines from every node (or one), merged by time.
     Logs {
         /// Only this host.
@@ -1419,6 +1431,31 @@ async fn main() -> Result<()> {
                 {
                     wait_job(&c, id).await?;
                 }
+            }
+            v
+        }
+        Cmd::DropCaches { hosts } => {
+            let v = c.post("/v1/drop-caches", json!({ "hosts": hosts })).await?;
+            if !cli.json {
+                let mut failed = 0;
+                for h in v["hosts"].as_array().into_iter().flatten() {
+                    let ok = h["ok"].as_bool() == Some(true);
+                    failed += (!ok) as u32;
+                    println!(
+                        "  {:<9} {} {}",
+                        h["host"].as_str().unwrap_or(""),
+                        if ok { "dropped" } else { "FAILED " },
+                        if ok {
+                            ""
+                        } else {
+                            h["message"].as_str().unwrap_or("")
+                        }
+                    );
+                }
+                if failed > 0 {
+                    bail!("{failed} host(s) could not drop their page cache");
+                }
+                return Ok(());
             }
             v
         }

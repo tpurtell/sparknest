@@ -33,6 +33,9 @@ case "${1:-}" in
       web_ui
       npm --prefix "$ui" run check
     fi
+    if command -v python3 >/dev/null && command -v cc >/dev/null; then
+      python3 -m unittest discover -s tools/drop-page-cache -p 'test_*.py'
+    fi
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace

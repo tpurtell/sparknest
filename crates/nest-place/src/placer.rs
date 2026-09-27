@@ -1154,6 +1154,44 @@ impl Placer {
         Ok(out)
     }
 
+    // ------------------------------------------------------------ caches
+
+    /// Drop the clean page cache on `hosts` (every node when empty), at
+    /// once, for benchmarks: (host, outcome).
+    pub async fn drop_caches(
+        &self,
+        hosts: &[String],
+    ) -> NestResult<Vec<(String, Result<String, String>)>> {
+        let nodes: Vec<_> = if hosts.is_empty() {
+            self.nodes()?
+        } else {
+            self.resolve_hosts(hosts)?
+        };
+        let me = self.vfs.data().id();
+        Ok(
+            futures::future::join_all(nodes.into_iter().map(|h| async move {
+                let r = if h.node == me {
+                    admin::drop_caches_here().await
+                } else {
+                    match admin::call(
+                        self.rpc(),
+                        h.node,
+                        &AdminReq::DropCaches,
+                        Duration::from_secs(130),
+                    )
+                    .await
+                    {
+                        Ok(AdminResp::Dropped(r)) => r,
+                        Ok(other) => Err(format!("unexpected {other:?}")),
+                        Err(e) => Err(e.to_string()),
+                    }
+                };
+                (h.name, r)
+            }))
+            .await,
+        )
+    }
+
     // ------------------------------------------------------------ logs
 
     /// Recent log lines from `host` (or every node), merged oldest first,

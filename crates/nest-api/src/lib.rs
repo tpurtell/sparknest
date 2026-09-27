@@ -172,6 +172,7 @@ pub fn router(api: Api) -> Router {
             put(transfer::upload).layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route("/v1/mkdir", post(transfer::mkdir))
+        .route("/v1/drop-caches", post(drop_caches))
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/remove", post(cluster_remove))
@@ -597,6 +598,28 @@ async fn import(State(api): State<Api>, Json(r): Json<ImportReq>) -> R<serde_jso
         copy: r.copy,
     };
     Ok(Json(json!({ "job": api.placer.import(opts) })))
+}
+
+#[derive(Deserialize)]
+struct DropCachesReq {
+    /// Hosts or @groups; every node when empty.
+    #[serde(default)]
+    hosts: Vec<String>,
+}
+
+/// Drop the clean page cache on hosts (benchmarks).
+async fn drop_caches(State(api): State<Api>, Json(r): Json<DropCachesReq>) -> R<serde_json::Value> {
+    let out: Vec<_> = api
+        .placer
+        .drop_caches(&r.hosts)
+        .await?
+        .into_iter()
+        .map(|(h, r)| match r {
+            Ok(m) => json!({ "host": h, "ok": true, "message": m }),
+            Err(e) => json!({ "host": h, "ok": false, "message": e }),
+        })
+        .collect();
+    Ok(Json(json!({ "hosts": out })))
 }
 
 #[derive(Deserialize)]

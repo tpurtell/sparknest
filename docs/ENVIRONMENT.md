@@ -110,6 +110,18 @@ works, and sealed files are served through the page cache instead. The
 system unit also raises the mount's kernel readahead from 128 KiB to 16 MiB,
 which cold reads of sealed files need.
 
+For cold-cache benchmarks (`nest drop-caches` drops the page cache on every
+host), install the fixed-function helper once per node; it asks for sudo:
+
+```bash
+~/.local/lib/sparknest/sparknest-drop-page-cache --install   # or from a checkout:
+tools/drop-page-cache/sparknest-drop-page-cache --install
+```
+
+It lands at `/usr/local/libexec/sparknest/drop-page-cache` (root, setuid,
+mode 4750, your group only) and does exactly one thing: `sync` and
+`drop_caches=1`. See `tools/drop-page-cache/README.md`.
+
 Other root-level performance levers, measured or suspected on the Sparks
 (record results in `benchmarks/` before adopting any):
 

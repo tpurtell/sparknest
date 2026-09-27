@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# One-time sudo installation; subsequent cache drops use a fixed-function helper.
+set -euo pipefail
+readonly helper=/usr/local/libexec/sparknest/drop-page-cache
+# Resolved through symlinks (Homebrew links bin/ into the Cellar).
+readonly self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+readonly script_dir="$(dirname -- "$self")"
+# The helper's source: beside this script in the repository, or under
+# libexec/sparknest/ in an installed package.
+source_c() {
+    local c
+    for c in "$script_dir/drop-page-cache.c" "$script_dir/../libexec/sparknest/drop-page-cache.c"; do
+        [[ -f "$c" ]] && { echo "$c"; return 0; }
+    done
+    echo "Cannot find drop-page-cache.c next to $self or in ../libexec/sparknest/." >&2
+    return 1
+}
+
+usage() {
+    cat <<'HELP'
+Usage: sparknest-drop-page-cache [--install | --check | --help]
+
+No arguments: sync and drop clean filesystem page-cache pages system-wide.
+Install the fixed-function helper with sudo first if it is missing.
+--install: install/update the helper; do not drop caches.
+--check: verify the installed helper and current user's execute access.
+
+Installation: root-owned /usr/local/libexec/sparknest/drop-page-cache,
+mode 4750, executable by the installing user's primary group. The writable
+checkout is never made setuid. A C compiler and sudo are needed only to install.
+Active or dirty pages may remain; verify residency for cold-cache benchmarks.
+HELP
+}
+
+check_parents() {
+    local path owner mode
+    for path in /usr /usr/local /usr/local/libexec /usr/local/libexec/sparknest; do
+        [[ -d "$path" && ! -L "$path" ]] || return 1
+        owner=$(stat -c '%u' -- "$path")
+        mode=$(stat -c '%a' -- "$path")
+        [[ "$owner" == 0 ]] && (( (8#$mode & 8#022) == 0 )) || return 1
+    done
+}
+
+check_helper() {
+    check_parents && [[ -f "$helper" && ! -L "$helper" && -x "$helper" ]] &&
+        [[ $(stat -c '%u:%a' -- "$helper") == 0:4750 ]]
+}
+
+# This installation entry is invoked through sudo, never through the helper.
+# It requires ordinary sudo authorization every time it is used.
+if [[ ${1:-} == --install-helper ]]; then
+    [[ $# == 3 && $EUID == 0 && $3 =~ ^[0-9]+$ && -f $2 && ! -L $2 ]] || {
+        echo 'Invalid privileged installation invocation.' >&2; exit 1;
+    }
+    for path in /usr /usr/local /usr/local/libexec /usr/local/libexec/sparknest; do
+        if [[ ! -e "$path" && ! -L "$path" ]]; then
+            /usr/bin/install -d -o root -g root -m 0755 -- "$path"
+        fi
+        [[ -d "$path" && ! -L "$path" && $(stat -c '%u' -- "$path") == 0 ]] || {
+            echo "Refusing unsafe installation directory: $path" >&2; exit 1;
+        }
+        mode=$(stat -c '%a' -- "$path")
+        (( (8#$mode & 8#022) == 0 )) || {
+            echo "Refusing writable installation directory: $path" >&2; exit 1;
+        }
+    done
+    # Install a new inode, then rename: never alter an executing setuid binary.
+    pending=$(mktemp /usr/local/libexec/sparknest/.drop-page-cache.XXXXXXXX)
+    trap 'rm -f -- "$pending"' EXIT
+    /usr/bin/install -o root -g "$3" -m 0750 -- "$2" "$pending"
+    # Set privilege only after copying and ownership changes, which can clear it.
+    /usr/bin/chmod 4750 -- "$pending"
+    [[ $(stat -c '%u:%g:%a' -- "$pending") == "0:$3:4750" ]] || {
+        echo 'Staged helper failed ownership/mode checks.' >&2; exit 1;
+    }
+    /usr/bin/mv -fT -- "$pending" "$helper"
+    check_helper && [[ $(stat -c '%g' -- "$helper") == "$3" ]] || {
+        echo 'Installed helper failed ownership/access checks.' >&2; exit 1;
+    }
+    echo "Installed $helper (root, group $3, mode 4750)."
+    exit 0
+fi
+
+[[ $# -le 1 ]] || { usage >&2; exit 64; }
+case ${1:-} in
+    --help|-h) usage; exit 0 ;;
+    --check)
+        if check_helper; then echo "Ready: $helper"; exit 0; fi
+        echo 'Cache-drop helper is missing, unsafe, or not executable by this user.' >&2
+        exit 1 ;;
+    ''|--install) ;;
+    *) usage >&2; exit 64 ;;
+esac
+
+if [[ ${1:-} == --install ]] || ! check_helper; then
+    build_dir=$(mktemp -d)
+    trap 'rm -rf -- "$build_dir"' EXIT
+    cc -std=c11 -O2 -Wall -Wextra -Werror -D_FORTIFY_SOURCE=3 \
+        -fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now \
+        "$(source_c)" -o "$build_dir/drop-page-cache"
+    install_group=${SUDO_GID:-$(id -g)}
+    echo 'Installing the cache-drop helper; sudo may ask for your password.' >&2
+    if (( EUID == 0 )); then
+        "$self" --install-helper "$build_dir/drop-page-cache" "$install_group"
+    else
+        sudo -- "$self" --install-helper "$build_dir/drop-page-cache" "$install_group"
+    fi
+    check_helper || { echo 'Installed helper failed ownership/access checks.' >&2; exit 1; }
+    rm -rf -- "$build_dir"
+    trap - EXIT
+fi
+[[ ${1:-} == --install ]] && exit 0
+exec "$helper"
