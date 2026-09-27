@@ -2162,7 +2162,30 @@ impl Vfs {
                     )
                 };
                 if n < 0 {
-                    return Err(std::io::Error::last_os_error());
+                    let e = std::io::Error::last_os_error();
+                    // Different filesystem types (ext4 to CIFS, ...) or no
+                    // support: finish with an ordinary buffered copy.
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+                    ) {
+                        use std::os::unix::fs::FileExt;
+                        let mut buf = vec![0u8; 4 << 20];
+                        while (off_in as u64) < size {
+                            let want = ((size - off_in as u64) as usize).min(buf.len());
+                            let got = from.read_at(&mut buf[..want], off_in as u64)?;
+                            if got == 0 {
+                                return Err(std::io::Error::other(format!(
+                                    "short copy: {off_in} of {size} bytes"
+                                )));
+                            }
+                            st.file().write_all_at(&buf[..got], off_out as u64)?;
+                            off_in += got as libc::loff_t;
+                            off_out += got as libc::loff_t;
+                        }
+                        break;
+                    }
+                    return Err(e);
                 }
                 if n == 0 {
                     return Err(std::io::Error::other(format!(
