@@ -579,3 +579,54 @@ and stays on /dev/fuse when the parameter is off.
 Measured on ostrich (benchmarks/M8-FUSE-IO-URING.md): 4 KiB reads 58–179 µs
 → ~20 µs, 128 KiB reads 0.4 → 2.3–3.4 GB/s, 1 MiB reads 1.5–2.2 → 3.1–3.3
 GB/s, writes +55%, parallel reads level.
+
+## ADR-026 — Relaxed metadata durability with automatic recovery (2026-09-27)
+
+**Context.** A metadata commit waits for about three fsyncs in a row
+(benchmarks/M8-METADATA-LATENCY.md); the software path is 0.1–0.4 ms. The
+user prefers optimistic durability with automatic recovery: full power
+outages are rare, and file data is what matters.
+
+**Decisions.**
+
+1. **openraft 0.10** (pinned alpha): the leader replicates entries once they
+   are submitted, not flushed, and consecutive appends merge into one write.
+   The commit index is stored without fsync (openraft allows it to lag).
+2. **Raft log and metadata run SQLite WAL with synchronous=NORMAL**, with
+   automatic checkpoints off; our own thread checkpoints about once a second
+   when changes are pending, with a size cap as a backstop. That interval is
+   the metadata loss window for a full outage. **Votes are always fsynced**:
+   a host that forgot its vote could vote twice in a term.
+3. **File data stays durable.** Replica, recall, offload and import copies
+   are fsynced before they are recorded (as before). Finalize `fdatasync`s
+   the owner's object before recording it stable, so a stable file is
+   durable on every holder's disk. An application's `fsync` becomes an object
+   `fsync` (its `fdatasync` an `fdatasync`) followed by a metadata barrier:
+   the Raft log flushed on a majority up to the latest entry. `fsync` on a
+   directory takes the barrier too.
+4. **Dirty detection.** Each host records the kernel boot id and a
+   clean-shutdown marker. A host whose OS crashed while the daemon ran is
+   dirty. A dirty minority simply rejoins (the log repairs it). A dirty
+   majority re-founds automatically from the most advanced metadata among a
+   majority, after a short grace period for more hosts, then runs fsck.
+5. **fsck** (a library used by the daemon's pre-mount recovery phase and by
+   `nest fsck`, online through the daemon or offline) compares each host's
+   objects with the metadata. With a healthy quorum everything resolves
+   automatically: a damaged or missing copy is retired and re-copied from
+   another holder; a file with no surviving copy is reported lost. An
+   object the metadata does not know (metadata rolled back) is never
+   deleted: it moves to `/.lost+found/<host>/`. Files mid-write on a crashed
+   owner keep the size found on disk. Resolutions that would destroy data
+   with no quorum to decide fail the mount until `nest fsck` (`-y` applies
+   the standard non-destructive choices). Hugging Face blobs can be checked
+   deeply against the SHA-256 in their names.
+6. **Automatic upgrade and re-found on restart.** The Raft log is disposable
+   across format changes; only our metadata schema migrates. Hosts exchange
+   binary and format versions before mounting. A new format is adopted only
+   when a majority of configured members run it; a host on the minority
+   version waits unmounted and says why. So an accidental upgrade of a
+   minority never takes the cluster. Lossless after a clean shutdown (a
+   small decoder reads the old log's committed tail); after a crash it is
+   the dirty path. `nest upgrade prepare` remains the recommended manual
+   route. Tested with simulated in-process clusters, not real installs.
+7. **Batch delete** in `nest`: many unlinks per Raft entry, in chunks.
