@@ -361,8 +361,10 @@ fn place(
         Err(e) if e.raw_os_error() == Some(18) && copy => {
             let run = || -> std::io::Result<()> {
                 let mut from = std::fs::File::open(src)?;
-                store.reserve_room(from.metadata()?.len())?;
+                let len = from.metadata()?.len();
+                store.reserve_room(len)?;
                 let st = store.begin_staging(key)?;
+                st.presize(len)?;
                 // Whole 4 MiB chunks (aligned offsets), written directly
                 // through io_uring with the store's window in flight; the
                 // source is read once and its pages dropped.

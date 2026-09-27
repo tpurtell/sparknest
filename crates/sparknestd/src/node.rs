@@ -133,12 +133,13 @@ impl Node {
                 quarantine = true;
             }
         }
-        // Transfers into the live store write directly with 16 in flight
-        // (NVMe keeps up; nothing floods the page cache loaders rely on).
+        // Transfers into the live store write directly, 4 × 4 MiB in flight:
+        // enough to saturate raptor's NVMe (6.7 GB/s measured; 3.5 at 1),
+        // and nothing floods the page cache loaders rely on.
         let store = Arc::new(
             ObjectStore::open(&cfg.node.state_dir)
                 .context("opening object store")?
-                .window(16),
+                .window(4),
         );
         store.set_reserve(cfg.node.data_reserve_gib << 30);
         let (data, handler) = DataNode::new(id, store, tuning.lease);

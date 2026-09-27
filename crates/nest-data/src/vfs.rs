@@ -2604,6 +2604,7 @@ impl Vfs {
         // direct I/O through io_uring (nest_store::uring): no thread waits
         // on the disk, and the store's window of writes in flight paces the
         // transfer at the device's speed.
+        staging.presize(a.size).map_err(io)?;
         let staging = Arc::new(staging);
         let mut next = 0u64;
         let mut inflight = futures::stream::FuturesUnordered::new();
@@ -2685,6 +2686,7 @@ impl Vfs {
             const CHUNK: usize = 4 << 20;
             let from = src.open_read(key)?;
             let st = dest.begin_staging(key)?;
+            st.presize(size)?;
             let mut off = 0u64;
             let mut since_drop = 0usize;
             while off < size {

@@ -442,6 +442,12 @@ impl Staging {
         }
     }
 
+    /// Size the file before writing it: direct writes that do not extend
+    /// the file can run in parallel (ext4 serializes extending ones).
+    pub fn presize(&self, size: u64) -> io::Result<()> {
+        self.file().set_len(size)
+    }
+
     /// Wait for every write in flight.
     pub async fn flushed(&self) -> io::Result<()> {
         loop {
@@ -694,33 +700,40 @@ mod pace_bench {
         let Some(dir) = std::env::var_os("NEST_PACE_BENCH") else {
             return;
         };
-        let window: usize = std::env::var("NEST_PACE_WINDOW")
-            .ok()
-            .and_then(|w| w.parse().ok())
-            .unwrap_or(8);
-        let gib: u64 = std::env::var("NEST_PACE_GIB")
-            .ok()
-            .and_then(|w| w.parse().ok())
-            .unwrap_or(4);
+        let env = |k: &str, d: u64| -> u64 {
+            std::env::var(k)
+                .ok()
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(d)
+        };
+        let window = env("NEST_PACE_WINDOW", 8) as usize;
+        let gib = env("NEST_PACE_GIB", 4);
+        let block = (env("NEST_PACE_BLOCK_KIB", 4096) as usize) << 10;
+        let presize = env("NEST_PACE_PRESIZE", 1) == 1;
         let dir = std::path::Path::new(&dir).join(format!("pace-bench-{}", std::process::id()));
         let s = ObjectStore::open_with_staging(&dir, "staging-b")
             .unwrap()
             .window(window);
         let total: u64 = gib << 30;
+        let data = vec![0x5au8; block];
         let t = std::time::Instant::now();
         let st = s
             .begin_staging(ObjectKey::new(FileId(1), Generation(1)))
             .unwrap();
+        if presize {
+            st.presize(total).unwrap();
+        }
         let mut off = 0;
         while off < total {
-            st.write_blocking(uring::AlignedBuf::copy_of(&[0x5a; 4 << 20]), off)
+            st.write_blocking(uring::AlignedBuf::copy_of(&data), off)
                 .unwrap();
-            off += 4 << 20;
+            off += block as u64;
         }
         s.commit_staging(st).unwrap();
         let secs = t.elapsed().as_secs_f64();
         eprintln!(
-            "direct write, window {window}: {:.0} MB/s ({:.1} s for {gib} GiB)",
+            "block {:>5} KiB  window {window:>2}  presized {presize:<5}  {:>6.0} MB/s ({:.1} s for {gib} GiB)",
+            block >> 10,
             total as f64 / secs / 1e6,
             secs
         );
