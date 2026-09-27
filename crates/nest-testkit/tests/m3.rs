@@ -272,3 +272,32 @@ async fn fence_waits_out_an_unreachable_holders_lease() {
     v1.release(rfh, None).await;
     v2.release(fh, None).await;
 }
+
+/// Objects kept open for serving are closed when evicted here and swept
+/// when idle: an open file keeps its disk space after deletion, which once
+/// filled raptor's disk during a spread import.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn served_objects_are_not_held_open() {
+    use nest_fabric::ReadSource;
+    let c = ready(2).await;
+    let f = file(&c, 1, "blob", &vec![7u8; 1 << 20]).await;
+    let a = c.attr(1, f).unwrap();
+    replicate(&c, f, 1, 2).await;
+    let v1 = &c.node(1).vfs;
+    // Served to another host: kept open for the next request.
+    let sf = ReadSource::open(&**v1, f, a.generation).await.unwrap();
+    drop(sf);
+    assert_eq!(v1.serving_open(), 1);
+    // Evicted here: closed at once.
+    assert!(v1.evict_from(f, NodeId(1).live_store()).await.unwrap());
+    assert_eq!(v1.serving_open(), 0);
+    // Anything else idle is closed within a few seconds.
+    let g = file(&c, 1, "other", b"x").await;
+    let b = c.attr(1, g).unwrap();
+    drop(ReadSource::open(&**v1, g, b.generation).await.unwrap());
+    assert_eq!(v1.serving_open(), 1);
+    c.eventually("idle served objects closed", Duration::from_secs(6), |c| {
+        c.node(1).vfs.serving_open() == 0
+    })
+    .await;
+}

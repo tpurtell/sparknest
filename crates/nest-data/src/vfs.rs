@@ -324,6 +324,7 @@ impl Vfs {
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(fold_usage(Arc::downgrade(&vfs)));
             tokio::spawn(roll_io_stats(Arc::downgrade(&vfs.io)));
+            tokio::spawn(sweep_serve_files(Arc::downgrade(&vfs)));
             tokio::spawn(probe_disk(Arc::downgrade(&vfs)));
         }
         vfs
@@ -1497,15 +1498,28 @@ impl Vfs {
         let f = Arc::new(self.servable_object(file, generation)?);
         if a.gen_state == GenState::Stable && self.d.servable(key) {
             let mut m = self.serve_files.lock();
+            m.retain(|_, (_, at)| at.elapsed() < SERVE_TTL);
             if m.len() >= SERVE_FILES_MAX {
-                m.retain(|_, (_, at)| at.elapsed() < SERVE_TTL);
-                if m.len() >= SERVE_FILES_MAX {
-                    m.clear();
-                }
+                m.clear();
             }
             m.insert(key, (f.clone(), std::time::Instant::now()));
         }
         Ok(f)
+    }
+
+    /// Close served objects not used within `SERVE_TTL`. An open file keeps
+    /// its disk space after it is deleted: a spread import's staging copies
+    /// (served to their new hosts, then removed here) once filled raptor's
+    /// disk because entries were only swept past `SERVE_FILES_MAX`.
+    fn sweep_serve_files(&self) {
+        self.serve_files
+            .lock()
+            .retain(|_, (_, at)| at.elapsed() < SERVE_TTL);
+    }
+
+    /// Objects kept open for serving (for tests and diagnostics).
+    pub fn serving_open(&self) -> usize {
+        self.serve_files.lock().len()
     }
 
     fn cached_serve_file(&self, key: ObjectKey) -> Option<Arc<std::fs::File>> {
@@ -2755,6 +2769,10 @@ impl Vfs {
     /// Remove `store`'s copy of `file` (refused for the last live copy).
     pub async fn evict_from(&self, file: FileId, store: nest_types::StoreId) -> NestResult<bool> {
         let a = self.raw_attr(file)?;
+        // Never hold open an object about to be removed here.
+        self.serve_files
+            .lock()
+            .remove(&ObjectKey::new(file, a.generation));
         let me_store = store;
         if !self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
             return Ok(false);
@@ -2915,6 +2933,16 @@ async fn probe_disk(vfs: Weak<Vfs>) {
 }
 
 /// Snapshot read latencies once a second (windows are differences).
+/// Close served objects nobody read lately (see `Vfs::sweep_serve_files`).
+async fn sweep_serve_files(vfs: std::sync::Weak<Vfs>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let Some(v) = vfs.upgrade() else { return };
+        v.sweep_serve_files();
+    }
+}
+
 async fn roll_io_stats(io: std::sync::Weak<nest_fabric::iostats::IoStats>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
