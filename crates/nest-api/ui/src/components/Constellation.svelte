@@ -66,7 +66,7 @@
       seen.add(key);
       arcs.push({ a, b, intensity: k, color });
     };
-    const rates = hosts.map((h) => app.rates[h.name] ?? { read: 0, served: 0, local: 0 });
+    const rates = hosts.map((h) => app.rates[h.name] ?? { read: 0, served: 0, local: 0, waste: null });
     const served = rates.reduce((a, r) => a + r.served, 0);
     rates.forEach((r, dst) => {
       if (r.read < 1e5 || served < 1) return;

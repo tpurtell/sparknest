@@ -235,3 +235,120 @@ async fn cancelled_reads_never_answer_later_ones() {
         }
     }
 }
+
+/// Answers small reads at once (as a host does for objects it already has
+/// open) and anything else on the async path.
+struct Quick;
+
+impl ReadSource for Quick {
+    fn try_read_now(
+        &self,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Option<Result<usize, NestError>> {
+        if file != FileId(7) || generation != Generation(3) {
+            return None; // errors come from the async path
+        }
+        let n = (SIZE.saturating_sub(offset) as usize).min(dst.len());
+        for (k, b) in dst[..n].iter_mut().enumerate() {
+            *b = byte(offset + k as u64);
+        }
+        Some(Ok(n))
+    }
+
+    fn read_into(
+        &self,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        len: usize,
+        buf: Slot,
+    ) -> BoxFuture<'static, (Slot, Result<usize, NestError>)> {
+        Synthetic.read_into(file, generation, offset, len, buf)
+    }
+}
+
+/// Small reads are served on the completion thread with the same bytes,
+/// lengths and errors as the async path; large ones still take it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn small_reads_take_the_fast_path() {
+    let cfg = FabricConfig {
+        chunk: 4 << 20,
+        client_slots: 16,
+        server_slots: 8,
+        window: 8,
+        devices: vec![],
+        max_inflight: 16,
+    };
+    let Some((rpc1, f1)) = node(1, cfg.clone()).await else {
+        return;
+    };
+    let (rpc2, f2) = node(2, cfg).await.unwrap();
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+    let src: Arc<dyn ReadSource> = Arc::new(Quick);
+    f1.set_source(Arc::downgrade(&src));
+    let fast = || {
+        f1.stats
+            .served_fast
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = fast();
+    let mut tasks = Vec::new();
+    for i in 0..512u64 {
+        let f2 = f2.clone();
+        tasks.push(tokio::spawn(async move {
+            let off = (i * 7_777_777) % (SIZE - 4096);
+            let b = f2
+                .read(NodeId(1), FileId(7), Generation(3), off, 4096)
+                .await
+                .unwrap();
+            assert_eq!(b.len(), 4096);
+            assert!(
+                b.as_slice()
+                    .iter()
+                    .enumerate()
+                    .all(|(k, v)| *v == byte(off + k as u64))
+            );
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    // Concurrent reads beyond the free staging slots (8 here) wait on the
+    // async path.
+    let concurrent = fast() - before;
+    assert!(concurrent > 0, "none of 512 served fast");
+    // One at a time, every small read is.
+    let n = fast();
+    for i in 0..64u64 {
+        let off = i * 1_000_003;
+        let b = f2
+            .read(NodeId(1), FileId(7), Generation(3), off, 4096)
+            .await
+            .unwrap();
+        assert_eq!(b.as_slice()[4095], byte(off + 4095));
+    }
+    assert_eq!(fast() - n, 64);
+    // The tail, errors and a large read behave as before.
+    let b = f2
+        .read(NodeId(1), FileId(7), Generation(3), SIZE - 100, 4096)
+        .await
+        .unwrap();
+    assert_eq!(b.len(), 100);
+    assert_eq!(
+        f2.read(NodeId(1), FileId(7), Generation(2), 0, 16)
+            .await
+            .err(),
+        Some(NestError::Stale)
+    );
+    let n = fast();
+    let b = f2
+        .read(NodeId(1), FileId(7), Generation(3), 0, 4 << 20)
+        .await
+        .unwrap();
+    assert_eq!(b.len(), 4 << 20);
+    assert_eq!(fast(), n, "a large read took the fast path");
+}

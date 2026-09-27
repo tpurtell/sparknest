@@ -184,6 +184,11 @@ pub struct Vfs {
     fences: Mutex<HashMap<(FileId, Epoch), watch::Receiver<bool>>>,
     /// Local reads in progress per file (fencing waits for them).
     inflight: Mutex<HashMap<FileId, u32>>,
+    /// Objects this host serves to others, kept open: fully re-checked
+    /// (metadata, live replica) at most every `SERVE_TTL`, and in between
+    /// only against the lease and fences. STABLE generations only: their
+    /// bytes never change.
+    serve_files: Mutex<HashMap<ObjectKey, (Arc<std::fs::File>, std::time::Instant)>>,
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
     fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
@@ -274,6 +279,7 @@ impl Vfs {
             )),
             fences: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
+            serve_files: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
             fence_hooks: Mutex::new(Vec::new()),
             fabric: Mutex::new(None),
@@ -403,6 +409,11 @@ impl Vfs {
     fn note_direct(&self, h: &Handle, offset: u64, n: u64) {
         let seq = h.last_end.swap(offset + n, Ordering::Relaxed) == offset;
         self.patterns.direct(h.file, n, seq);
+    }
+
+    /// Readahead chunks dropped on this host, and bytes of them consumed.
+    pub fn readahead_totals(&self) -> (u64, u64) {
+        self.patterns.readahead_totals()
     }
 
     /// Files this host currently reads directly (scattered reads).
@@ -1398,6 +1409,37 @@ impl Vfs {
                 })
             })
             .unwrap_or(false)
+    }
+
+    /// The open object to serve `generation` of `file` from, cached for
+    /// STABLE generations (a remote read used to cost two queries, a stat
+    /// and an open per request).
+    fn serve_file(&self, file: FileId, generation: Generation) -> NestResult<Arc<std::fs::File>> {
+        let key = ObjectKey::new(file, generation);
+        if let Some(f) = self.cached_serve_file(key) {
+            return Ok(f);
+        }
+        let a = self.raw_attr(file)?;
+        let f = Arc::new(self.servable_object(file, generation)?);
+        if a.gen_state == GenState::Stable && self.d.servable(key) {
+            let mut m = self.serve_files.lock();
+            if m.len() >= SERVE_FILES_MAX {
+                m.retain(|_, (_, at)| at.elapsed() < SERVE_TTL);
+                if m.len() >= SERVE_FILES_MAX {
+                    m.clear();
+                }
+            }
+            m.insert(key, (f.clone(), std::time::Instant::now()));
+        }
+        Ok(f)
+    }
+
+    fn cached_serve_file(&self, key: ObjectKey) -> Option<Arc<std::fs::File>> {
+        let f = match self.serve_files.lock().get(&key) {
+            Some((f, at)) if at.elapsed() < SERVE_TTL => f.clone(),
+            _ => return None,
+        };
+        self.d.may_serve_now(key).then_some(f)
     }
 
     fn servable_object(&self, file: FileId, generation: Generation) -> NestResult<std::fs::File> {
@@ -2640,7 +2682,37 @@ impl Vfs {
     }
 }
 
+/// How long an open served object is trusted before a full re-check.
+const SERVE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+const SERVE_FILES_MAX: usize = 4096;
+
 impl nest_fabric::ReadSource for Vfs {
+    /// Small reads of objects already open for serving: one pread, on the
+    /// fabric's completion thread, no queries (the first read of an object
+    /// takes the async path and opens it).
+    fn try_read_now(
+        &self,
+        file: FileId,
+        generation: Generation,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Option<Result<usize, NestError>> {
+        let f = self.cached_serve_file(ObjectKey::new(file, generation))?;
+        let _t = self.track(file);
+        let mut done = 0;
+        Some(loop {
+            if done == dst.len() {
+                break Ok(done);
+            }
+            match f.read_at(&mut dst[done..], offset + done as u64) {
+                Ok(0) => break Ok(done),
+                Ok(n) => done += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(io(e)),
+            }
+        })
+    }
+
     fn read_into(
         &self,
         file: FileId,
@@ -2652,7 +2724,7 @@ impl nest_fabric::ReadSource for Vfs {
         let me = self.arc();
         Box::pin(async move {
             let _t = me.track(file);
-            let f = match me.servable_object(file, generation) {
+            let f = match me.serve_file(file, generation) {
                 Ok(f) => f,
                 Err(e) => return (slot, Err(e)),
             };

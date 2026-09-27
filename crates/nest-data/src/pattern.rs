@@ -35,6 +35,9 @@ const SEQ_SHARE: f64 = 0.9;
 /// Forget files not read for this long (and keep the table bounded).
 const IDLE: Duration = Duration::from_secs(30 * 60);
 const MAX_FILES: usize = 1 << 16;
+/// A verdict this host just changed is not overridden by what the metadata
+/// said before its record landed.
+const SETTLE: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct Profile {
@@ -46,6 +49,8 @@ struct Profile {
     direct: u64,
     sequential: u64,
     last: Instant,
+    /// When this host last changed its verdict (its record may be in flight).
+    changed: Option<Instant>,
 }
 
 impl Profile {
@@ -57,6 +62,7 @@ impl Profile {
             direct: 0,
             sequential: 0,
             last: Instant::now(),
+            changed: None,
         }
     }
 }
@@ -68,6 +74,10 @@ pub type OnChange = Box<dyn Fn(FileId, bool) + Send + Sync>;
 pub struct Patterns {
     files: Mutex<HashMap<FileId, Profile>>,
     on_change: std::sync::OnceLock<OnChange>,
+    /// Host-wide: bytes of readahead chunks dropped, and of them consumed
+    /// (their difference is readahead's waste).
+    dropped: std::sync::atomic::AtomicU64,
+    used: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Patterns {
@@ -92,16 +102,21 @@ impl Patterns {
         self.files.lock().get(&file).is_some_and(|p| p.random)
     }
 
-    /// What the file's metadata records, seen at open: a recorded verdict
-    /// wins over one this host has not formed yet.
+    /// What the file's metadata records, seen at open. The record wins
+    /// (another host's verdict, or `nest read-pattern`), except just after
+    /// this host changed its own verdict, whose record may still be in
+    /// flight.
     pub fn seed(&self, file: FileId, scattered: bool) {
         let mut m = self.files.lock();
         match m.get_mut(&file) {
             Some(p) => {
-                if scattered && !p.random {
-                    p.random = true;
+                let settling = p.changed.is_some_and(|t| t.elapsed() < SETTLE);
+                if p.random != scattered && !settling {
+                    p.random = scattered;
                     p.direct = 0;
                     p.sequential = 0;
+                    p.discarded = 0;
+                    p.consumed = 0;
                 }
             }
             None if scattered => {
@@ -120,6 +135,9 @@ impl Patterns {
         if bytes == 0 {
             return false;
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        self.dropped.fetch_add(bytes, Relaxed);
+        self.used.fetch_add(consumed.min(bytes), Relaxed);
         let mut m = self.files.lock();
         prune(&mut m);
         let p = m.entry(file).or_insert_with(Profile::new);
@@ -138,6 +156,7 @@ impl Patterns {
         }
         if random {
             p.random = true;
+            p.changed = Some(Instant::now());
             p.direct = 0;
             p.sequential = 0;
             tracing::info!(
@@ -168,6 +187,7 @@ impl Patterns {
         if p.direct >= SEQ_JUDGE_BYTES {
             if p.sequential as f64 >= p.direct as f64 * SEQ_SHARE {
                 p.random = false;
+                p.changed = Some(Instant::now());
                 p.discarded = 0;
                 p.consumed = 0;
                 streams = true;
@@ -183,6 +203,13 @@ impl Patterns {
         if streams {
             self.changed(file, false);
         }
+    }
+
+    /// Readahead chunks dropped so far on this host, and bytes of them
+    /// readers consumed.
+    pub fn readahead_totals(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.dropped.load(Relaxed), self.used.load(Relaxed))
     }
 
     /// Files currently read directly.
@@ -274,9 +301,16 @@ mod tests {
         assert!(seen.lock().is_empty(), "a seed is not a change");
         p.seed(FileId(10), false);
         assert!(!p.is_random(FileId(10)));
+        // An override reaches a host that formed no verdict of its own.
+        p.seed(F, false);
+        assert!(!p.is_random(F));
+        p.seed(F, true);
         for _ in 0..16 {
             p.discarded(FileId(10), CHUNK, 0);
         }
+        // Its own fresh verdict is not undone by the old record.
+        p.seed(FileId(10), false);
+        assert!(p.is_random(FileId(10)));
         for _ in 0..256 {
             p.direct(F, 1 << 20, true);
         }

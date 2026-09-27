@@ -65,6 +65,20 @@ impl Default for FabricConfig {
 /// Supplies file bytes for requests this node serves. Implemented by the
 /// data service so generation fencing and serving rules stay in one place.
 pub trait ReadSource: Send + Sync + 'static {
+    /// Serve a small read at once, on the fabric's completion thread, when
+    /// that costs no more than one small file read: `None` sends it down the
+    /// async path (`read_into`). Must not wait on locks held across I/O,
+    /// the network, or metadata writes.
+    fn try_read_now(
+        &self,
+        _file: FileId,
+        _generation: Generation,
+        _offset: u64,
+        _dst: &mut [u8],
+    ) -> Option<Result<usize, NestError>> {
+        None
+    }
+
     fn read_into(
         &self,
         file: FileId,
@@ -101,6 +115,9 @@ const KIND_READ: u8 = 1;
 const KIND_ERR: u8 = 2;
 
 const IMM_LEN_BITS: u32 = 23;
+/// Reads up to this size may be served on the completion thread
+/// (`ReadSource::try_read_now`); larger ones go to the async path.
+const FAST_SERVE_MAX: usize = 64 << 10;
 
 fn err_code(e: &NestError) -> u8 {
     match e {
@@ -281,6 +298,8 @@ pub struct Stats {
     /// Serving: waiting for a staging slot, and reading the bytes.
     pub serve_slot_wait_ns: AtomicU64,
     pub serve_read_ns: AtomicU64,
+    /// Reads answered on the completion thread (`try_read_now`).
+    pub served_fast: AtomicU64,
 }
 
 impl Fabric {
@@ -761,15 +780,45 @@ impl Fabric {
     // ------------------------------------------------------------ server
 
     fn serve(self: &Arc<Self>, lane: Arc<Lane>, req: ReadReq) {
+        let len = (req.len as usize).min(self.cfg.chunk);
+        // Small reads (a lookup table's rows, a page fault) are answered
+        // right here: every hop to a task or the blocking pool costs a
+        // thread wake, which on the Sparks' deep idle states took several
+        // times the disk read itself.
+        let mut spare = None;
+        if len <= FAST_SERVE_MAX
+            && let Some(src) = self.source.lock().as_ref().and_then(|w| w.upgrade())
+            && let Some(mut slot) = lane.dev.staging.try_acquire()
+        {
+            let t = std::time::Instant::now();
+            match src.try_read_now(
+                FileId(req.file),
+                Generation(req.generation),
+                req.offset,
+                slot.as_mut_slice(len),
+            ) {
+                Some(r) => {
+                    self.stats
+                        .serve_read_ns
+                        .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.stats.served_fast.fetch_add(1, Ordering::Relaxed);
+                    self.answer(&lane, &req, r.map(|n| (slot, n)));
+                    return;
+                }
+                None => spare = Some(slot),
+            }
+        }
         let me = self.clone();
         self.rt.spawn(async move {
             let source = me.source.lock().as_ref().and_then(|w| w.upgrade());
-            let len = (req.len as usize).min(me.cfg.chunk);
             let result = match source {
                 None => Err(NestError::Unavailable("not serving yet".into())),
                 Some(src) => {
                     let t0 = std::time::Instant::now();
-                    let slot = lane.dev.staging.acquire().await;
+                    let slot = match spare {
+                        Some(s) => s,
+                        None => lane.dev.staging.acquire().await,
+                    };
                     let t1 = std::time::Instant::now();
                     let (slot, r) = src
                         .read_into(
@@ -789,44 +838,52 @@ impl Fabric {
                     r.map(|n| (slot, n))
                 }
             };
-            match result {
-                Ok((slot, n)) => {
-                    let id = wr(WR_WRITE, lane.id, slot.index());
-                    let (ptr, lkey) = (slot.ptr(), slot.lkey());
-                    me.in_flight.lock().insert(id, slot);
-                    let imm = (req.slot << IMM_LEN_BITS) | n as u32;
-                    // SAFETY: the staging slot stays alive in `in_flight`
-                    // until this write completes; the remote range is the
-                    // landing slot the client named for this request.
-                    let r = unsafe {
-                        lane.qp
-                            .post_write_imm(id, ptr, n as u32, lkey, req.addr, req.rkey, imm)
-                    };
-                    if r.is_err() {
-                        me.in_flight.lock().remove(&id);
-                        me.fail_lane(&lane);
-                    } else {
-                        me.stats.served.fetch_add(1, Ordering::Relaxed);
-                        me.stats.served_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    let mut msg = [0u8; MSG_SIZE];
-                    msg[0] = KIND_ERR;
-                    msg[1] = err_code(&e);
-                    msg[4..8].copy_from_slice(&req.slot.to_le_bytes());
-                    // SAFETY: inline send copies the message at post time.
-                    if unsafe {
-                        lane.qp
-                            .post_send(wr(WR_SEND, lane.id, 0), msg.as_mut_ptr(), 8, 0, true)
-                    }
-                    .is_err()
-                    {
-                        me.fail_lane(&lane);
-                    }
+            me.answer(&lane, &req, result);
+        });
+    }
+
+    /// Send a read's answer: the bytes (an RDMA write into the client's
+    /// landing slot, with the length in the immediate) or an error message.
+    fn answer(&self, lane: &Arc<Lane>, req: &ReadReq, result: Result<(Slot, usize), NestError>) {
+        match result {
+            Ok((slot, n)) => {
+                let id = wr(WR_WRITE, lane.id, slot.index());
+                let (ptr, lkey) = (slot.ptr(), slot.lkey());
+                self.in_flight.lock().insert(id, slot);
+                let imm = (req.slot << IMM_LEN_BITS) | n as u32;
+                // SAFETY: the staging slot stays alive in `in_flight`
+                // until this write completes; the remote range is the
+                // landing slot the client named for this request.
+                let r = unsafe {
+                    lane.qp
+                        .post_write_imm(id, ptr, n as u32, lkey, req.addr, req.rkey, imm)
+                };
+                if r.is_err() {
+                    self.in_flight.lock().remove(&id);
+                    self.fail_lane(lane);
+                } else {
+                    self.stats.served.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .served_bytes
+                        .fetch_add(n as u64, Ordering::Relaxed);
                 }
             }
-        });
+            Err(e) => {
+                let mut msg = [0u8; MSG_SIZE];
+                msg[0] = KIND_ERR;
+                msg[1] = err_code(&e);
+                msg[4..8].copy_from_slice(&req.slot.to_le_bytes());
+                // SAFETY: inline send copies the message at post time.
+                if unsafe {
+                    lane.qp
+                        .post_send(wr(WR_SEND, lane.id, 0), msg.as_mut_ptr(), 8, 0, true)
+                }
+                .is_err()
+                {
+                    self.fail_lane(lane);
+                }
+            }
+        }
     }
 }
 

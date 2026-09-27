@@ -1493,6 +1493,15 @@ async fn main() -> Result<()> {
                         rate("disk_read_bps"),
                         rate("link_bps")
                     );
+                    let dropped = n["info"]["readahead_dropped_bytes"].as_u64().unwrap_or(0);
+                    if dropped > 0 {
+                        let used = n["info"]["readahead_used_bytes"].as_u64().unwrap_or(0);
+                        caps += &format!(
+                            " · readahead waste {:.0}% of {}",
+                            100.0 * (1.0 - used as f64 / dropped as f64),
+                            human(dropped)
+                        );
+                    }
                     match n["info"]["scattered_files"].as_u64().unwrap_or(0) {
                         0 => {}
                         k => caps += &format!(" · {k} file{} read directly (scattered)", if k == 1 { "" } else { "s" }),

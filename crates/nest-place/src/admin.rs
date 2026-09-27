@@ -32,6 +32,9 @@ pub struct NodeInfo {
     pub fabric_read_bytes: u64,
     #[serde(default)]
     pub fabric_served_bytes: u64,
+    /// Of the reads served, those answered on the completion thread.
+    #[serde(default)]
+    pub fabric_served_fast: u64,
     /// Bytes this host read from its own disk through sparknest (tracked
     /// reads; rates come from differences between polls).
     #[serde(default)]
@@ -39,6 +42,12 @@ pub struct NodeInfo {
     /// Files this host reads directly because reads are scattered (ADR-031).
     #[serde(default)]
     pub scattered_files: u64,
+    /// Readahead chunks this host fetched and dropped, and bytes of them
+    /// readers used: the rest was wasted reading (ADR-031).
+    #[serde(default)]
+    pub readahead_dropped_bytes: u64,
+    #[serde(default)]
+    pub readahead_used_bytes: u64,
     /// What this host has learned about the sources it reads from
     /// (ADR-030): latency, in flight, recent rate.
     #[serde(default)]
@@ -301,8 +310,15 @@ impl Admin {
             version: env!("CARGO_PKG_VERSION").to_string(),
             fabric_read_bytes,
             fabric_served_bytes,
+            fabric_served_fast: fab.as_ref().map_or(0, |f| {
+                f.stats
+                    .served_fast
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            }),
             local_read_bytes: self.vfs.local_read_bytes(),
             scattered_files: self.vfs.scattered_files() as u64,
+            readahead_dropped_bytes: self.vfs.readahead_totals().0,
+            readahead_used_bytes: self.vfs.readahead_totals().1,
             io: self.vfs.io_report(),
             disk_read_bps: self.vfs.disk_read_bps(),
             fabric_timing: fab

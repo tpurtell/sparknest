@@ -283,6 +283,12 @@ impl DataNode {
     /// True if `key` may be served from this node's store right now: the
     /// node holds a read lease, committed metadata lists it as a live
     /// replica here, it is not fenced for deletion, and it exists.
+    /// The in-memory part of `servable`: lease held, not fenced. For
+    /// re-checking a copy already found servable (no queries, no I/O).
+    pub fn may_serve_now(&self, key: ObjectKey) -> bool {
+        self.lease_valid() && !self.st.lock().fenced.contains(&key) && self.meta.get().is_some()
+    }
+
     pub fn servable(&self, key: ObjectKey) -> bool {
         if !self.lease_valid() || self.st.lock().fenced.contains(&key) || self.meta.get().is_none()
         {
