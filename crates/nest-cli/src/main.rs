@@ -1458,11 +1458,20 @@ async fn main() -> Result<()> {
                 for n in v["nodes"].as_array().into_iter().flatten() {
                     let host = n["name"].as_str().unwrap_or("");
                     let io = n["info"]["io"].as_array().cloned().unwrap_or_default();
+                    let rate = |k: &str| match n["info"][k].as_u64().unwrap_or(0) {
+                        0 => "?".to_string(),
+                        b => format!("{}/s", human(b)),
+                    };
+                    let caps = format!(
+                        "disk {} · links {}",
+                        rate("disk_read_bps"),
+                        rate("link_bps")
+                    );
                     if io.is_empty() {
-                        println!("{host}: no spread reads yet");
+                        println!("{host}: {caps}; no spread reads yet");
                         continue;
                     }
-                    println!("{host}:");
+                    println!("{host}: {caps}");
                     println!(
                         "    {:<10} {:>10} {:>8} {:>12} {:>12} {:>7}",
                         "source", "latency", "flight", "last 10 s", "total", "errors"

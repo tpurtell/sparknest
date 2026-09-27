@@ -136,6 +136,24 @@ async fn auto_meta_snapshots(p: std::sync::Weak<Placer>) {
     }
 }
 
+/// Tell this host's read balancer every holder's disk rate and our link
+/// rate, every 30 s (ADR-030).
+async fn share_capacity(p: std::sync::Weak<Placer>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let Some(p) = p.upgrade() else { return };
+        let Ok(st) = p.status_live().await else {
+            continue;
+        };
+        let disks = st
+            .iter()
+            .filter_map(|n| n.info.as_ref().map(|i| (n.node, i.disk_read_bps)))
+            .collect();
+        let link = p.vfs.link_bps();
+        p.vfs.balancer().set_capacity(disks, link);
+    }
+}
+
 /// Quiet period after the last change before automatic rules are applied.
 const AUTO_DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -212,6 +230,7 @@ impl Placer {
             }
         }));
         tokio::spawn(auto_reconcile(Arc::downgrade(&p)));
+        tokio::spawn(share_capacity(Arc::downgrade(&p)));
         tokio::spawn(auto_meta_snapshots(Arc::downgrade(&p)));
         // Record our name so rules and tools can say "raptor" (needs quorum;
         // retried until it lands).

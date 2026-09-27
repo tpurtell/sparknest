@@ -17,6 +17,11 @@
 //!   the rest from its page cache; a busy holder sheds stripes to the next.
 //! - Faster sources (raptor's disk, a page-cache hit) keep more work
 //!   without being told.
+//! - A stripe only ever goes to as many of its ranked holders as can
+//!   together fill this host's links: the first holders whose measured disk
+//!   bandwidth sums to `HEADROOM` × the link rate. Asking more disks gains
+//!   nothing the links could carry, and a small set per stripe keeps the
+//!   page caches of concurrent readers useful.
 //!
 //! The same table records bytes per source over a sliding window for
 //! `nest io`, which prints what each host has learned.
@@ -36,6 +41,8 @@ pub enum Source {
 
 /// How much busier than the best choice a preferred source may be.
 const SLACK: f64 = 2.0;
+/// The holders a stripe may use supply this much of the links' rate.
+const HEADROOM: f64 = 1.25;
 
 /// Rendezvous weight of holder `node` for `key` (a stripe of a file): the
 /// same on every host.
@@ -118,6 +125,9 @@ impl Stat {
 #[derive(Default)]
 pub struct Balancer {
     stats: Mutex<HashMap<Source, Stat>>,
+    /// Holders' measured disk read rate (bytes/s) and this host's link
+    /// rate, for capping how many holders a stripe uses.
+    capacity: Mutex<(HashMap<NodeId, u64>, u64)>,
 }
 
 /// A read in progress from one source; recorded when finished.
@@ -172,6 +182,43 @@ impl Drop for Ticket {
 }
 
 impl Balancer {
+    /// Nothing is being read through the balancer right now.
+    pub fn idle(&self) -> bool {
+        self.stats.lock().values().all(|s| s.in_flight == 0)
+    }
+
+    /// Holders' disk read rates and this host's link rate (bytes/s; 0 for
+    /// unknown).
+    pub fn set_capacity(&self, disks: HashMap<NodeId, u64>, link: u64) {
+        *self.capacity.lock() = (disks, link);
+    }
+
+    /// The prefix of `ranked` whose disks can fill the links with headroom
+    /// (all of them when rates are unknown).
+    fn cap(&self, ranked: &mut Vec<NodeId>) {
+        let (disks, link) = &*self.capacity.lock();
+        if *link == 0 || disks.is_empty() {
+            return;
+        }
+        let mut known: Vec<u64> = disks.values().copied().filter(|b| *b > 0).collect();
+        if known.is_empty() {
+            return;
+        }
+        known.sort_unstable();
+        let median = known[known.len() / 2];
+        let want = (*link as f64 * HEADROOM) as u64;
+        let mut sum = 0u64;
+        let mut keep = 0;
+        for n in ranked.iter() {
+            keep += 1;
+            sum += disks.get(n).copied().filter(|b| *b > 0).unwrap_or(median);
+            if sum >= want {
+                break;
+            }
+        }
+        ranked.truncate(keep.max(1));
+    }
+
     /// Pick the source for the next chunk of stripe `key` among
     /// `candidates` (non-empty) and count it in flight.
     pub fn pick(self: &Arc<Self>, candidates: &[Source], key: u64) -> Ticket {
@@ -192,14 +239,24 @@ impl Balancer {
                 })
                 .collect();
             peers.sort_by_key(|n| std::cmp::Reverse(weight(key, *n)));
-            peers
-                .into_iter()
-                .map(Source::Peer)
+            self.cap(&mut peers);
+            let best = peers
+                .iter()
+                .map(|n| score(&Source::Peer(*n)))
+                .fold(f64::INFINITY, f64::min)
+                .min(best);
+            let capped: Vec<Source> = peers.into_iter().map(Source::Peer).collect();
+            capped
+                .iter()
+                .copied()
                 .find(|s| score(s) <= best * SLACK)
                 .unwrap_or_else(|| {
-                    // Only the local disk qualified after all.
-                    *candidates
+                    // Every allowed holder is busy: the least busy of them
+                    // (or the local disk).
+                    capped
                         .iter()
+                        .chain(candidates.iter().filter(|c| **c == Source::Local))
+                        .copied()
                         .min_by(|a, b| score(a).total_cmp(&score(b)))
                         .expect("candidates")
                 })
@@ -346,6 +403,36 @@ mod tests {
                 .all(|x| x.in_flight == 0 && (x.source == A || x.errors == 0)),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn a_stripe_uses_only_the_holders_the_links_can_use() {
+        let b = Arc::new(Balancer::default());
+        // Links: 10 GB/s; holders' disks 5 GB/s each: 10 × 1.25 needs 3.
+        let peers: Vec<NodeId> = (2..=8).map(NodeId).collect();
+        b.set_capacity(
+            peers.iter().map(|n| (*n, 5_000_000_000)).collect(),
+            10_000_000_000,
+        );
+        let c: Vec<Source> = peers.iter().map(|n| Source::Peer(*n)).collect();
+        for n in &peers {
+            teach(&b, Source::Peer(*n), 0.002);
+        }
+        let key = 42;
+        let mut ranked = peers.clone();
+        ranked.sort_by_key(|n| std::cmp::Reverse(weight(key, *n)));
+        // Load the stripe heavily: it may spread, but never past the top 3.
+        let held: Vec<Ticket> = (0..40).map(|_| b.pick(&c, key)).collect();
+        let used: std::collections::HashSet<Source> = held.iter().map(|t| t.source()).collect();
+        assert!(used.len() > 1, "a loaded stripe spreads: {used:?}");
+        for s in &used {
+            let Source::Peer(n) = s else { panic!() };
+            assert!(
+                ranked[..3].contains(n),
+                "{n:?} is outside the top 3 {:?}",
+                &ranked[..3]
+            );
+        }
     }
 
     #[test]

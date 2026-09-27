@@ -171,6 +171,8 @@ pub struct Vfs {
     owned: Mutex<HashMap<FileId, Arc<Owned>>>,
     usage: Arc<crate::usage::Usage>,
     balancer: Arc<crate::balance::Balancer>,
+    /// This host's measured disk read rate (bytes/s; 0 until measured).
+    disk_bps: Arc<AtomicU64>,
     /// Revocation state per (file, epoch) this node was granted.
     fences: Mutex<HashMap<(FileId, Epoch), watch::Receiver<bool>>>,
     /// Local reads in progress per file (fencing waits for them).
@@ -258,6 +260,9 @@ impl Vfs {
             owned: Mutex::new(HashMap::new()),
             usage: Arc::new(crate::usage::Usage::open(d.store().root())),
             balancer: Arc::new(crate::balance::Balancer::default()),
+            disk_bps: Arc::new(AtomicU64::new(
+                crate::diskprobe::load(d.store().root()).map_or(0, |b| b.bytes_per_s),
+            )),
             fences: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
@@ -280,6 +285,7 @@ impl Vfs {
         // by the data node; nothing to adopt here.
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(fold_usage(Arc::downgrade(&vfs)));
+            tokio::spawn(probe_disk(Arc::downgrade(&vfs)));
         }
         vfs
     }
@@ -292,6 +298,25 @@ impl Vfs {
     /// What this host has learned about its read sources (ADR-030).
     pub fn io_report(&self) -> Vec<crate::balance::SourceReport> {
         self.balancer.report()
+    }
+
+    pub fn balancer(&self) -> &Arc<crate::balance::Balancer> {
+        &self.balancer
+    }
+
+    /// This host's measured disk read rate, bytes/s (0 until measured).
+    pub fn disk_read_bps(&self) -> u64 {
+        self.disk_bps.load(Ordering::Relaxed)
+    }
+
+    /// This host's RDMA link rate, bytes/s (0 without a fabric).
+    pub fn link_bps(&self) -> u64 {
+        self.fabric()
+            .map(|f| {
+                let devs: Vec<String> = f.rails().iter().map(|r| r.ibdev.clone()).collect();
+                crate::diskprobe::link_bytes_per_s(&devs)
+            })
+            .unwrap_or(0)
     }
 
     /// The copies a STABLE generation can be read from, when there are
@@ -2574,6 +2599,43 @@ async fn fold_usage(vfs: Weak<Vfs>) {
         drop(v);
         if let Ok(Err(e)) = tokio::task::spawn_blocking(move || usage.flush()).await {
             tracing::warn!(error = %e, "writing usage statistics failed");
+        }
+    }
+}
+
+/// Measure the disk's read rate once the host is idle after boot, then
+/// daily (ADR-030). The measurement reads a few GiB with direct I/O, so it
+/// waits for a quiet minute rather than competing with real reads.
+async fn probe_disk(vfs: Weak<Vfs>) {
+    const DAY: u64 = 86_400;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    loop {
+        let Some(v) = vfs.upgrade() else { return };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = crate::diskprobe::load(v.d.store().root()).map_or(0, |b| b.measured_at);
+        let due = now.saturating_sub(last) >= DAY;
+        if due && v.balancer.idle() && v.handles.lock().is_empty() {
+            let store = v.d.store().clone();
+            drop(v);
+            if let Ok(Some(bps)) =
+                tokio::task::spawn_blocking(move || crate::diskprobe::measure(&store)).await
+            {
+                let Some(v) = vfs.upgrade() else { return };
+                let b = crate::diskprobe::DiskBandwidth {
+                    bytes_per_s: bps,
+                    measured_at: now,
+                };
+                crate::diskprobe::save(v.d.store().root(), &b);
+                v.disk_bps.store(bps, Ordering::Relaxed);
+                tracing::info!(bytes_per_s = bps, "disk read rate measured");
+            }
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        } else {
+            drop(v);
+            tokio::time::sleep(Duration::from_secs(if due { 30 } else { 3600 })).await;
         }
     }
 }

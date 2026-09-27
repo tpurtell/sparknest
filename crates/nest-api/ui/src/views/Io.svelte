@@ -59,6 +59,9 @@
       {@const io = n.info?.io ?? []}
       <div class="host panel">
         <div class="row"><b>{n.name}</b><span class="spacer"></span><span class="tiny muted">{io.length ? `${io.length} source${io.length > 1 ? "s" : ""}` : "no spread reads yet"}</span></div>
+        <div class="tiny muted mono" title="measured disk read rate (idle, direct I/O) and RDMA link rate: a stripe uses only as many holders as fill the links, with 25% headroom">
+          disk {n.info?.disk_read_bps ? rate(n.info.disk_read_bps) : "not measured yet"} · links {n.info?.link_bps ? rate(n.info.link_bps) : "?"}
+        </div>
         {#each io as s}
           <div class="src">
             <span class="sn">{s.source === "Local" ? "disk" : srcName(s.source, n.name)}</span>

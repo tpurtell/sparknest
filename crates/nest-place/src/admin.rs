@@ -36,6 +36,11 @@ pub struct NodeInfo {
     /// (ADR-030): latency, in flight, recent rate.
     #[serde(default)]
     pub io: Vec<nest_data::balance::SourceReport>,
+    /// Measured disk read rate and RDMA link rate, bytes/s (0: unknown).
+    #[serde(default)]
+    pub disk_read_bps: u64,
+    #[serde(default)]
+    pub link_bps: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +279,8 @@ impl Admin {
             fabric_read_bytes,
             fabric_served_bytes,
             io: self.vfs.io_report(),
+            disk_read_bps: self.vfs.disk_read_bps(),
+            link_bps: self.vfs.link_bps(),
         }
     }
 

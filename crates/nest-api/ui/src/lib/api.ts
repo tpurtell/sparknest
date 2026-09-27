@@ -82,6 +82,8 @@ export interface NodeInfo {
   fabric_read_bytes: number;
   fabric_served_bytes: number;
   io?: SourceReport[];
+  disk_read_bps?: number;
+  link_bps?: number;
 }
 export interface SourceReport {
   source: "Local" | { Peer: number };

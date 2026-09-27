@@ -14,6 +14,7 @@
 //!   owner-routed writes and whole-file transfers.
 
 pub mod balance;
+pub mod diskprobe;
 pub mod fsck;
 mod local;
 mod readahead;
