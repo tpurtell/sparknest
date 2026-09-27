@@ -323,7 +323,9 @@ async fn write_small(vfs: &Vfs, path: &str, body: &[u8]) -> NestResult<bool> {
             parent,
             name.as_bytes(),
             0o644,
-            nest_data::vfs::oflags::WRONLY,
+            // Exclusive: another host may have just written this ref (hosts
+            // import the same repos at once); never take over its file.
+            nest_data::vfs::oflags::WRONLY | nest_data::vfs::oflags::EXCL,
         )
         .await
     {
@@ -447,7 +449,14 @@ pub async fn run(
             }
         }
         let errs_before = progress.lock().errors.len();
-        import_entries(&vfs, entries, false, opts.copy, &progress).await?;
+        // A repo that fails is reported and the import moves on.
+        if let Err(e) = import_entries(&vfs, entries, false, opts.copy, &progress).await {
+            out.status = "failed".into();
+            out.note = format!("placing blobs: {e}");
+            all_verified = false;
+            outcomes.lock().push(out);
+            continue;
+        }
         if progress.lock().errors.len() > errs_before {
             out.status = "failed".into();
             out.note = "some blobs could not be placed (see errors)".into();
@@ -467,11 +476,19 @@ pub async fn run(
                     out.note = format!("hf: {why}; snapshot links mirrored");
                 }
                 out.status = "mirrored".into();
-                mirror_snapshot(&vfs, &base, commit, files).await?;
+                if let Err(e) = mirror_snapshot(&vfs, &base, commit, files).await {
+                    out.status = "failed".into();
+                    out.note = format!("mirroring snapshot {commit}: {e}");
+                }
             }
         }
         for (name, commit) in &r.refs {
-            write_small(&vfs, &format!("{base}/refs/{name}"), commit.as_bytes()).await?;
+            if let Err(e) =
+                write_small(&vfs, &format!("{base}/refs/{name}"), commit.as_bytes()).await
+            {
+                out.status = "failed".into();
+                out.note = format!("writing refs/{name}: {e}");
+            }
         }
         // 3. Verify every source snapshot file.
         let mut bad = Vec::new();
@@ -481,12 +498,20 @@ pub async fn run(
                     SnapFile::Blob(e) => r.blobs[e].1,
                     SnapFile::Plain(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
                 };
-                if settled_size(&vfs, &format!("{base}/snapshots/{commit}/{rel}"))? != Some(want) {
+                if settled_size(&vfs, &format!("{base}/snapshots/{commit}/{rel}"))
+                    .ok()
+                    .flatten()
+                    != Some(want)
+                {
                     bad.push(rel.clone());
                 }
             }
         }
-        if bad.is_empty() {
+        if bad.is_empty() && out.status != "failed" {
+            // This host has the weights; give it its own copy of the repo's
+            // small files other hosts wrote (refs, trees/*.json, configs), so
+            // it counts as holding the whole model.
+            fill_small_files(&vfs, &base).await;
             verified_dirs.push(r.dir.clone());
         } else {
             all_verified = false;
@@ -597,4 +622,27 @@ fn swap_in_links(
         done.push(d.clone());
     }
     Ok(done)
+}
+
+/// Copy onto this host the files under `base` it lacks that are small
+/// (repo metadata another host wrote); large ones stay where they are.
+async fn fill_small_files(vfs: &Arc<Vfs>, base: &str) {
+    const SMALL: u64 = 16 << 20;
+    let m = match vfs
+        .data()
+        .with_reader(|c| Ok(crate::selector::resolve_tree(c, base)))
+    {
+        Ok(Ok(m)) => m,
+        _ => return,
+    };
+    let me = vfs.data().id().live_store();
+    for e in m.entries.iter().filter(|e| e.stable && e.size <= SMALL) {
+        let have = vfs
+            .data()
+            .with_reader(|c| nest_meta::query::has_live_replica(c, e.file, e.generation, me))
+            .unwrap_or(true);
+        if !have && let Err(err) = vfs.replicate_here(e.file).await {
+            tracing::debug!(path = %e.path, error = %err, "could not copy a small file here");
+        }
+    }
 }

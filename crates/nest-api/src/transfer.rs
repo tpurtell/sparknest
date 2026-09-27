@@ -322,7 +322,15 @@ pub(crate) async fn upload(
             return Err(ApiError(StatusCode::CONFLICT, format!("{path} exists")));
         }
         Some(id) => vfs.open(id, flags | nest_data::vfs::oflags::TRUNC).await?.0,
-        None => match vfs.create(parent, name.as_bytes(), 0o644, flags).await {
+        None => match vfs
+            .create(
+                parent,
+                name.as_bytes(),
+                0o644,
+                flags | nest_data::vfs::oflags::EXCL,
+            )
+            .await
+        {
             Ok((_, fh, _)) => fh,
             Err(NestError::Exists) => {
                 return Err(ApiError(StatusCode::CONFLICT, format!("{path} exists")));
