@@ -13,6 +13,7 @@ Add a row the moment a new tool is introduced.
 | bindgen (cargo) + libclang | raptor only | `cargo install bindgen-cli`; libclang-21 present | regenerate vendored verbs bindings |
 | rdmasync, rdmapipe | all nodes | `brew install tpurtell/local-ai/rdmasync rdmapipe` or existing `~/.local/bin` | moving test data, throughput baselines |
 | cc, python3 | all nodes | already installed | build the page-cache helper on `sparknest-drop-page-cache --install`; its tests run in `scripts/build.sh --check` |
+| sparknest-allow-restart | all nodes | once per host, asks for sudo: `tools/allow-restart/sparknest-allow-restart --hosts` from a checkout (every host in `scripts/cluster.env`), or `sparknest-allow-restart` from the Homebrew package | a sudoers rule for exactly `systemctl restart sparknestd@CLUSTER`, so an agent iterating on the daemon can restart it after a deploy without a password prompt; `--check` tells whether it is in place |
 | perftest (`ib_write_bw`) | all nodes | already installed on raptor; `apt`/brew on Sparks if missing | raw fabric ceilings |
 
 Homebrew (`/home/linuxbrew/.linuxbrew`) is the preferred way to add tools.

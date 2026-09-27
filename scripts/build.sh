@@ -36,6 +36,13 @@ case "${1:-}" in
     if command -v python3 >/dev/null && command -v cc >/dev/null; then
       python3 -m unittest discover -s tools/drop-page-cache -p 'test_*.py'
     fi
+    # The restart rule: exactly one command line, and valid sudoers syntax.
+    allow=tools/allow-restart/sparknest-allow-restart
+    bash -n "$allow"
+    "$allow" --print ci | grep -qx "$(id -un) ALL=(root) NOPASSWD: $(command -v systemctl) restart sparknestd@ci"
+    if command -v visudo >/dev/null; then
+      rule=$(mktemp -p target) && "$allow" --print ci >"$rule" && visudo -cqf "$rule" >/dev/null && rm -f "$rule"
+    fi
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace

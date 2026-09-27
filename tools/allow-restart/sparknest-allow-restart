@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Let the current user restart the sparknest daemon without a password: one
+# sudoers rule for exactly `systemctl restart sparknestd@CLUSTER` and nothing
+# else. The first run asks for the sudo password and installs it; later runs
+# see it is there and do nothing. Then, from a shell or an agent:
+#
+#   sudo systemctl restart sparknestd@CLUSTER
+set -euo pipefail
+
+readonly self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+
+usage() {
+    cat <<'HELP'
+Usage: sparknest-allow-restart [--check | --print | --hosts | --help] [CLUSTER]
+
+No option: install the rule on this host if it is missing (asks for sudo once).
+--check: exit 0 if this user may already run the command without a password.
+--print: show the rule that would be installed.
+--hosts: install on every host in scripts/cluster.env over `ssh -t`, one
+         password prompt per host that lacks it (run from a checkout).
+
+CLUSTER defaults to "sparknest". The rule, in /etc/sudoers.d/sparknest-restart-CLUSTER
+(root, 0440, checked with visudo first):
+
+  USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart sparknestd@CLUSTER
+
+Only that exact command line is allowed: not start, stop, other units, or
+extra arguments. Remove the file to take it back.
+HELP
+}
+
+mode=install
+case "${1:-}" in
+    --help | -h) usage; exit 0 ;;
+    --check | --print | --hosts) mode=${1#--}; shift ;;
+    --install-rule) mode=install-rule; shift ;;
+    -*) usage >&2; exit 2 ;;
+esac
+cluster=${1:-sparknest}
+# sudo skips sudoers.d files whose names contain a dot.
+[[ $cluster =~ ^[A-Za-z0-9_-]+$ ]] || { echo "cluster name must be letters, digits, - or _" >&2; exit 2; }
+
+unit="sparknestd@$cluster"
+ctl=$(command -v systemctl) || { echo "systemctl not found" >&2; exit 1; }
+file="/etc/sudoers.d/sparknest-restart-$cluster"
+
+rule_for() {
+    printf '# Installed by sparknest-allow-restart: restart the daemon, nothing else.\n'
+    printf '%s ALL=(root) NOPASSWD: %s restart %s\n' "$1" "$ctl" "$unit"
+}
+
+# Allowed without a password? (-k ignores cached credentials, so a recent
+# sudo does not count.)
+allowed() {
+    sudo -k -n -l "$ctl" restart "$unit" >/dev/null 2>&1
+}
+
+case $mode in
+    print)
+        rule_for "$(id -un)"
+        ;;
+    check)
+        if allowed; then echo "$(hostname -s): may run: sudo $ctl restart $unit"; else
+            echo "$(hostname -s): not allowed yet (run sparknest-allow-restart $cluster)" >&2; exit 1
+        fi
+        ;;
+    install)
+        if allowed; then
+            echo "$(hostname -s): already allowed: sudo $ctl restart $unit"
+            exit 0
+        fi
+        [[ $EUID != 0 ]] || { echo "run as the user who restarts the daemon, not as root" >&2; exit 1; }
+        echo "$(hostname -s): installing $file for $(id -un) (sudo asks for your password once)"
+        sudo -- "$self" --install-rule "$cluster" "$(id -un)"
+        allowed && echo "$(hostname -s): done: sudo $ctl restart $unit" || {
+            echo "$(hostname -s): installed, but sudo still asks for a password; check $file" >&2; exit 1
+        }
+        ;;
+    install-rule)
+        # The privileged half, reached only through sudo above.
+        user=${2:-}
+        [[ $EUID == 0 && $user =~ ^[a-z_][a-z0-9_-]*$ ]] && id -u "$user" >/dev/null 2>&1 || {
+            echo "invalid privileged invocation" >&2; exit 1
+        }
+        tmp=$(mktemp)
+        trap 'rm -f "$tmp"' EXIT
+        rule_for "$user" >"$tmp"
+        visudo -cqf "$tmp" || { echo "visudo rejected the rule" >&2; exit 1; }
+        install -o root -g root -m 0440 "$tmp" "$file"
+        ;;
+    hosts)
+        dir=$(dirname -- "$self")
+        env="$dir/../../scripts/cluster.env"
+        [[ -f $env ]] || { echo "--hosts runs from a checkout (needs scripts/cluster.env)" >&2; exit 1; }
+        # shellcheck source=/dev/null
+        source "$env"
+        me=$(hostname -s)
+        failed=()
+        for h in "${SPARKNEST_HOSTS[@]}"; do
+            host=${h%%:*}
+            if [[ $host == "$me" ]]; then
+                "$self" "$cluster" || failed+=("$host")
+                continue
+            fi
+            ssh "$host" 'mkdir -p ~/.cache/sparknest' &&
+                scp -q "$self" "$host:.cache/sparknest/sparknest-allow-restart" &&
+                ssh -t "$host" "bash ~/.cache/sparknest/sparknest-allow-restart $cluster" ||
+                failed+=("$host")
+        done
+        [[ ${#failed[@]} == 0 ]] || { echo "failed on: ${failed[*]}" >&2; exit 1; }
+        ;;
+esac

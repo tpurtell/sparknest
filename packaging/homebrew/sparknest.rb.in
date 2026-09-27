@@ -24,6 +24,8 @@ class Sparknest < Formula
     # sudo, once per host; Homebrew cannot install setuid root files).
     bin.install "tools/drop-page-cache/sparknest-drop-page-cache"
     (libexec/"sparknest").install "tools/drop-page-cache/drop-page-cache.c"
+    # Installs a sudoers rule for exactly `systemctl restart sparknestd@CLUSTER`.
+    bin.install "tools/allow-restart/sparknest-allow-restart"
     inreplace pkgshare.glob("systemd/*.service"), "@BIN_DIR@", opt_bin
     doc.install "README.md", "docs/INSTALL.md"
   end
@@ -34,6 +36,8 @@ class Sparknest < Formula
         sudo apt install fuse3
       For cold-cache benchmarks (`nest drop-caches`), once on each host:
         sparknest-drop-page-cache --install
+      To restart the daemon without a password (e.g. from an agent), once on each host:
+        sparknest-allow-restart
       Cluster setup, configuration and service units:
         #{doc}/INSTALL.md
         #{pkgshare}
@@ -44,6 +48,7 @@ class Sparknest < Formula
     assert_match version.to_s, shell_output("#{bin}/nest --version")
     assert_match version.to_s, shell_output("#{bin}/sparknestd --version")
     assert_match "drop_caches", shell_output("#{bin}/sparknest-drop-page-cache --help")
+    assert_match "restart sparknestd@", shell_output("#{bin}/sparknest-allow-restart --help")
 
     # A one-node cluster over TCP without a mount: import, offload to an
     # archive store, snapshot the metadata, then rebuild the tree offline.

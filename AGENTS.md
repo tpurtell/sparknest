@@ -22,7 +22,10 @@ Read in this order: `PROPOSAL.md` (architecture and invariants),
   or copied data.
 - Root actions need the user (sudo prompts for a password). Batch them into a
   short checklist in `docs/ENVIRONMENT.md` and ask once, rather than blocking
-  repeatedly.
+  repeatedly. The one exception: once `sparknest-allow-restart` has run on a
+  host (`tools/allow-restart/`), `sudo systemctl restart sparknestd@CLUSTER`
+  works there without a password. Still ask before restarting a daemon whose
+  mount is in use.
 
 ## Git workflow
 

@@ -122,6 +122,19 @@ It lands at `/usr/local/libexec/sparknest/drop-page-cache` (root, setuid,
 mode 4750, your group only) and does exactly one thing: `sync` and
 `drop_caches=1`. See `tools/drop-page-cache/README.md`.
 
+To restart the daemon after a deploy without a password (for agents
+iterating on sparknest), install the restart rule once per node; it asks for
+sudo on each host that lacks it:
+
+```bash
+tools/allow-restart/sparknest-allow-restart --hosts        # from a checkout on raptor
+sudo systemctl restart sparknestd@sparknest                  # then, passwordless
+```
+
+It adds `/etc/sudoers.d/sparknest-restart-sparknest` allowing exactly that
+command line for your user, nothing else (`--print` shows it, `--check`
+verifies it; delete the file to revoke).
+
 Other root-level performance levers, measured or suspected on the Sparks
 (record results in `benchmarks/` before adopting any):
 
