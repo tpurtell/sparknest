@@ -42,5 +42,5 @@
   .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ok { color: var(--ok); }
   .bad { color: var(--bad); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  @media (max-width: 899px) { .tray { left: 12px; bottom: 84px; } }
+  @media (max-width: 899px) { .tray { left: 12px; bottom: 12px; } }
 </style>

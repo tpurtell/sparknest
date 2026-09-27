@@ -31,6 +31,12 @@
     { v: "logs", label: "Logs", icon: "logs" },
   ];
   let moreOpen = $state(false);
+  // Any navigation closes the menu.
+  $effect(() => {
+    void route.view;
+    void route.arg;
+    moreOpen = false;
+  });
 
   onMount(() => {
     if (app.authed) startPolling();
@@ -66,15 +72,33 @@
 
     <div class="content">
       <header class="top">
+        <button class="burger btn ghost" onclick={() => (moreOpen = !moreOpen)} aria-label="Menu" aria-expanded={moreOpen}>
+          <Icon name={moreOpen ? "x" : "menu"} size={20} />
+        </button>
+        <button class="brand mbrand" onclick={() => { moreOpen = false; go("overview"); }}>
+          <span class="bolt"><Icon name="bolt" size={16} /></span><span>sparknest</span>
+        </button>
         <div class="pills">
           <span class="pill"><span class="dot {serving === total && total ? 'ok' : 'bad'}"></span>{serving}/{total} serving</span>
           {#if leaderName()}<span class="pill hide-s">leader <b>{leaderName()}</b></span>{/if}
-          {#if flow > 1e5}<span class="pill live"><Icon name="bolt" size={13} />{human(flow)}/s</span>{/if}
+          {#if flow > 1e5}<span class="pill live hide-s"><Icon name="bolt" size={13} />{human(flow)}/s</span>{/if}
           {#if running.length}
             <a class="pill live" href="#/jobs"><span class="dot spark"></span>{running.length} job{running.length > 1 ? "s" : ""}</a>
           {/if}
-          {#if app.error}<span class="pill err">{app.error}</span>{/if}
+          {#if app.error}<span class="pill err hide-s">{app.error}</span>{/if}
         </div>
+        {#if moreOpen}
+          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+          <div class="mscrim" onclick={() => (moreOpen = false)}></div>
+          <nav class="mnav">
+            {#each [...main, ...extra] as n}
+              <a href="#/{n.v}" class:on={route.view === n.v} onclick={() => (moreOpen = false)}>
+                <Icon name={n.icon} /> <span>{n.label}</span>
+                {#if n.v === "jobs" && running.length}<span class="count">{running.length}</span>{/if}
+              </a>
+            {/each}
+          </nav>
+        {/if}
       </header>
       <main>
         {#key route.view}
@@ -93,25 +117,6 @@
       </main>
     </div>
 
-    <nav class="tabs panel">
-      {#each main as n}
-        <a href="#/{n.v}" class:on={route.view === n.v}>
-          <Icon name={n.icon} size={20} />
-          <span>{n.label}</span>
-          {#if n.v === "jobs" && running.length}<span class="count">{running.length}</span>{/if}
-        </a>
-      {/each}
-      <button class:on={extra.some((e) => e.v === route.view)} onclick={() => (moreOpen = !moreOpen)}>
-        <Icon name="menu" size={20} /><span>More</span>
-      </button>
-      {#if moreOpen}
-        <div class="more panel">
-          {#each extra as n}
-            <a href="#/{n.v}" onclick={() => (moreOpen = false)}><Icon name={n.icon} /> {n.label}</a>
-          {/each}
-        </div>
-      {/if}
-    </nav>
   </div>
 {/if}
 <Toasts />
@@ -142,17 +147,20 @@
   .pill.err { color: var(--bad); border-color: rgba(255, 79, 123, 0.5); }
   main { padding: 4px 22px 40px; flex: 1; min-width: 0; }
   .view { max-width: 1600px; margin: 0 auto; }
-  .tabs { display: none; }
+  .burger, .mbrand, .mnav, .mscrim { display: none; }
   @media (max-width: 899px) {
     .side { display: none; }
-    .top { padding: 10px 12px; justify-content: flex-start; }
+    .top { padding: 8px 10px; justify-content: flex-start; align-items: center; gap: 6px; background: rgba(3, 8, 20, 0.82); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); }
+    .burger { display: inline-flex; padding: 6px 8px; }
+    .mbrand { display: flex; font-size: 16px; padding: 2px 4px; gap: 8px; }
+    .mbrand .bolt { width: 26px; height: 26px; }
+    .pills { margin-left: auto; flex-wrap: nowrap; }
+    .pill { padding: 4px 9px; }
     .hide-s { display: none; }
-    main { padding: 2px 12px 96px; }
-    .tabs { display: flex; flex-direction: row; position: fixed; left: 8px; right: 8px; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 50; justify-content: space-around; padding: 6px; border-radius: 18px; background: rgba(6, 13, 30, 0.9); }
-    .tabs a, .tabs button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 10px; color: var(--muted); padding: 6px 2px; border-radius: 12px; background: none; border: 0; position: relative; }
-    .tabs .on { color: var(--spark); background: rgba(56, 232, 255, 0.1); }
-    .tabs .count { position: absolute; top: 2px; right: 18%; }
-    .more { position: absolute; right: 6px; bottom: 70px; display: flex; flex-direction: column; padding: 6px; min-width: 160px; background: rgba(6, 13, 30, 0.96); }
-    .more a { display: flex; flex-direction: row; gap: 10px; font-size: 14px; padding: 10px 12px; color: var(--text); }
+    main { padding: 10px 12px 28px; }
+    .mscrim { display: block; position: fixed; inset: 0; top: 52px; z-index: 29; background: rgba(1, 4, 12, 0.5); }
+    .mnav { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; position: absolute; top: calc(100% + 6px); left: 8px; right: 8px; z-index: 30; padding: 8px; background: #071022; border: 1px solid var(--line-hi); border-radius: var(--radius); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6), 0 0 30px rgba(56, 232, 255, 0.12); animation: rise 0.18s ease-out; }
+    .mnav a { display: flex; align-items: center; gap: 10px; padding: 11px 12px; border-radius: 10px; color: var(--muted); position: relative; }
+    .mnav a.on { color: var(--spark); background: rgba(56, 232, 255, 0.1); }
   }
 </style>

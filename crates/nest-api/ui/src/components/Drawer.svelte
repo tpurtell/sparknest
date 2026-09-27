@@ -21,5 +21,5 @@
   .close { position: absolute; top: 12px; right: 12px; }
   @keyframes slide { from { transform: translateX(40px); opacity: 0; } to { transform: none; opacity: 1; } }
   @keyframes fade { from { opacity: 0; } }
-  @media (max-width: 899px) { .drawer { top: 0; right: 0; bottom: 0; width: 100vw; border-radius: 0; padding: 16px 14px 90px; } }
+  @media (max-width: 899px) { .drawer { top: 0; right: 0; bottom: 0; width: 100vw; border-radius: 0; padding: 16px 14px 40px; } }
 </style>

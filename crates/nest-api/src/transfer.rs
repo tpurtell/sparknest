@@ -313,20 +313,22 @@ pub(crate) async fn upload(
     };
     let vfs = api.vfs.clone();
     let flags = nest_data::vfs::oflags::WRONLY;
-    let fh = match vfs.create(parent, name.as_bytes(), 0o644, flags).await {
-        Ok((_, fh, _)) => fh,
-        Err(NestError::Exists) if q.overwrite => {
-            let c = api.conn()?;
-            let id = query::lookup(&c, parent, name.as_bytes())
-                .map_err(|e| bad(e.to_string()))?
-                .ok_or(NestError::NotFound)?;
-            drop(c);
-            vfs.open(id, flags | nest_data::vfs::oflags::TRUNC).await?.0
-        }
-        Err(NestError::Exists) => {
+    let existing = {
+        let c = api.conn()?;
+        query::lookup(&c, parent, name.as_bytes()).map_err(|e| bad(e.to_string()))?
+    };
+    let fh = match existing {
+        Some(_) if !q.overwrite => {
             return Err(ApiError(StatusCode::CONFLICT, format!("{path} exists")));
         }
-        Err(e) => return Err(e.into()),
+        Some(id) => vfs.open(id, flags | nest_data::vfs::oflags::TRUNC).await?.0,
+        None => match vfs.create(parent, name.as_bytes(), 0o644, flags).await {
+            Ok((_, fh, _)) => fh,
+            Err(NestError::Exists) => {
+                return Err(ApiError(StatusCode::CONFLICT, format!("{path} exists")));
+            }
+            Err(e) => return Err(e.into()),
+        },
     };
     let mut off = 0u64;
     let mut stream = body.into_data_stream();
