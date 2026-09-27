@@ -17,12 +17,14 @@
   import Rules from "./views/Rules.svelte";
   import Files from "./views/Files.svelte";
   import Logs from "./views/Logs.svelte";
+  import Io from "./views/Io.svelte";
 
   const main: { v: View; label: string; icon: string }[] = [
     { v: "overview", label: "Overview", icon: "overview" },
     { v: "models", label: "Models", icon: "models" },
     { v: "space", label: "Space", icon: "space" },
     { v: "plans", label: "Plans", icon: "plans" },
+    { v: "io", label: "I/O", icon: "io" },
     { v: "jobs", label: "Jobs", icon: "jobs" },
   ];
   const extra: { v: View; label: string; icon: string }[] = [
@@ -112,6 +114,7 @@
             {:else if route.view === "rules"}<Rules />
             {:else if route.view === "files"}<Files />
             {:else if route.view === "logs"}<Logs />
+            {:else if route.view === "io"}<Io />
             {/if}
           </div>
         {/key}

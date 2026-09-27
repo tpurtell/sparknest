@@ -50,6 +50,25 @@ pub struct VfsConfig {
     pub rpc_timeout: Duration,
     /// Largest readahead window, in fabric chunks.
     pub readahead_chunks: usize,
+    /// When a sealed file with a local copy is handed to the kernel.
+    pub passthrough: Passthrough,
+    /// Read files with several copies from several of them (ADR-030).
+    pub balance_reads: bool,
+}
+
+/// When a sealed file with a local copy is served by the kernel directly
+/// (fastest for one reader, but only ever from this host's disk).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Passthrough {
+    /// Whenever this host has a copy.
+    #[default]
+    Always,
+    /// Only when this host holds the only live copy; otherwise the daemon
+    /// serves reads and can spread them over every copy.
+    Sole,
+    /// Never: the daemon serves every read.
+    Never,
 }
 
 impl Default for VfsConfig {
@@ -59,6 +78,8 @@ impl Default for VfsConfig {
             catch_up_wait: Duration::from_secs(10),
             rpc_timeout: Duration::from_secs(10),
             readahead_chunks: 16,
+            passthrough: Passthrough::Always,
+            balance_reads: true,
         }
     }
 }
@@ -103,6 +124,16 @@ struct Handle {
     /// Bytes read through this handle not yet folded into usage: local,
     /// remote, archive.
     read_bytes: [AtomicU64; 3],
+    /// How reads of a generation are served, decided on its first read:
+    /// `Some(sources)` when spread over several copies.
+    route: Mutex<Option<(Generation, Option<Route>)>>,
+}
+
+/// A generation readable from several copies.
+#[derive(Clone)]
+struct Route {
+    sources: Vec<crate::balance::Source>,
+    local: Option<Arc<nest_store::ObjectStore>>,
 }
 
 impl Handle {
@@ -139,6 +170,7 @@ pub struct Vfs {
     next_fh: AtomicU64,
     owned: Mutex<HashMap<FileId, Arc<Owned>>>,
     usage: Arc<crate::usage::Usage>,
+    balancer: Arc<crate::balance::Balancer>,
     /// Revocation state per (file, epoch) this node was granted.
     fences: Mutex<HashMap<(FileId, Epoch), watch::Receiver<bool>>>,
     /// Local reads in progress per file (fencing waits for them).
@@ -225,6 +257,7 @@ impl Vfs {
             next_fh: AtomicU64::new(1),
             owned: Mutex::new(HashMap::new()),
             usage: Arc::new(crate::usage::Usage::open(d.store().root())),
+            balancer: Arc::new(crate::balance::Balancer::default()),
             fences: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
@@ -254,6 +287,52 @@ impl Vfs {
     /// This host's file usage (ADR-028).
     pub fn usage(&self) -> &Arc<crate::usage::Usage> {
         &self.usage
+    }
+
+    /// What this host has learned about its read sources (ADR-030).
+    pub fn io_report(&self) -> Vec<crate::balance::SourceReport> {
+        self.balancer.report()
+    }
+
+    /// The copies a STABLE generation can be read from, when there are
+    /// several: this host's live copy and every other host's.
+    fn route_for(&self, a: &FileAttr) -> Option<Route> {
+        use crate::balance::Source;
+        if !self.cfg.balance_reads || a.gen_state != GenState::Stable || self.fabric().is_none() {
+            return None;
+        }
+        let key = ObjectKey::new(a.id, a.generation);
+        let local = self.d.servable(key).then(|| self.d.store().clone());
+        let me = self.me();
+        let mut sources: Vec<Source> = self
+            .q(|c| query::replicas(c, a.id))
+            .ok()?
+            .into_iter()
+            .filter(|r| {
+                r.generation == a.generation
+                    && r.state == nest_types::ReplicaState::Live
+                    && !crate::is_archive(r.store)
+                    && NodeId(r.store.0) != me
+            })
+            .map(|r| Source::Peer(NodeId(r.store.0)))
+            .collect();
+        if local.is_some() {
+            sources.insert(0, Source::Local);
+        }
+        (sources.len() >= 2).then_some(Route { sources, local })
+    }
+
+    /// The handle's route for `a`'s generation, deciding it on first use.
+    fn route(&self, h: &Handle, a: &FileAttr) -> Option<Route> {
+        let mut r = h.route.lock();
+        match r.as_ref() {
+            Some((g, route)) if *g == a.generation => route.clone(),
+            _ => {
+                let route = self.route_for(a);
+                *r = Some((a.generation, route.clone()));
+                route
+            }
+        }
     }
 
     /// Move a handle's byte counters into the usage table's pending batch.
@@ -1302,6 +1381,7 @@ impl Vfs {
             remote: Mutex::new(None),
             readahead: tokio::sync::Mutex::new(None),
             read_bytes: Default::default(),
+            route: Mutex::new(None),
         });
         self.handles.lock().insert(fh, h);
         self.d.handle_opened(file);
@@ -1319,7 +1399,14 @@ impl Vfs {
     fn choose_mode(&self, a: &FileAttr, writable: bool) -> OpenMode {
         if a.sealed && !writable && a.gen_state == GenState::Stable {
             let key = ObjectKey::new(a.id, a.generation);
-            if self.d.servable(key)
+            let allowed = match self.cfg.passthrough {
+                Passthrough::Always => true,
+                // Other copies exist: let the daemon spread the reads.
+                Passthrough::Sole => !self.live_elsewhere(a),
+                Passthrough::Never => false,
+            };
+            if allowed
+                && self.d.servable(key)
                 && let Ok(f) = self.d.store().open_read(key)
             {
                 return OpenMode::Passthrough(f);
@@ -1489,6 +1576,41 @@ impl Vfs {
             }
             let a = self.raw_attr(h.file)?;
             let key = ObjectKey::new(h.file, a.generation);
+            // Several copies: spread chunks over them (ADR-030).
+            if let Some(route) = self.route(&h, &a)
+                && let Some(fab) = self.fabric()
+            {
+                let _t = self.track(h.file);
+                let mut ra = h.readahead.lock().await;
+                if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
+                    *ra = Some(crate::readahead::Readahead::new(
+                        &fab,
+                        self.balancer.clone(),
+                        h.file,
+                        a.generation,
+                        route.sources.clone(),
+                        route.local.clone(),
+                        self.cfg.readahead_chunks,
+                        Some(a.size),
+                    ));
+                }
+                let r = ra.as_mut().expect("just set");
+                match r.read(&fab, offset, size).await {
+                    Ok(b) => {
+                        let (l, rem) = r.take_served();
+                        h.count(crate::usage::Source::Local, l);
+                        h.count(crate::usage::Source::Remote, rem);
+                        return Ok(b);
+                    }
+                    Err(e) => {
+                        // No copy could serve it: decide afresh.
+                        *ra = None;
+                        *h.route.lock() = None;
+                        last = e;
+                        continue;
+                    }
+                }
+            }
             if let Some(src) = self.own_read_source(&a) {
                 let _t = self.track(h.file);
                 let f = {
@@ -1538,9 +1660,11 @@ impl Vfs {
                         if !ra.as_ref().is_some_and(|r| r.matches(h.file, a.generation)) {
                             *ra = Some(crate::readahead::Readahead::new(
                                 &fab,
+                                self.balancer.clone(),
                                 h.file,
                                 a.generation,
-                                s,
+                                vec![crate::balance::Source::Peer(s)],
+                                None,
                                 self.cfg.readahead_chunks,
                                 Some(a.size),
                             ));
@@ -1682,7 +1806,17 @@ impl Vfs {
         let h = self.handle(fh).ok()?;
         let a = self.raw_attr(h.file).ok()?;
         let key = ObjectKey::new(h.file, a.generation);
-        if let Some(src) = self.own_read_source(&a) {
+        // Until the first read has decided how this generation is served,
+        // the slow path decides; a spread read only serves ready chunks here.
+        let spread = if self.cfg.balance_reads && a.gen_state == GenState::Stable {
+            match h.route.lock().as_ref() {
+                Some((g, r)) if *g == a.generation => r.is_some(),
+                _ => return None,
+            }
+        } else {
+            false
+        };
+        if !spread && let Some(src) = self.own_read_source(&a) {
             let _t = self.track(h.file);
             let f = {
                 let mut r = h.reader.lock();
@@ -1722,7 +1856,9 @@ impl Vfs {
         }
         let out = r.try_ready(offset, size)?;
         r.advance(&fab, offset, size);
-        h.count(crate::usage::Source::Remote, out.len() as u64);
+        let (l, rem) = r.take_served();
+        h.count(crate::usage::Source::Local, l);
+        h.count(crate::usage::Source::Remote, rem);
         Some(from_readahead(out))
     }
 

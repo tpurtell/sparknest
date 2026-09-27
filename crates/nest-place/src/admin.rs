@@ -32,6 +32,10 @@ pub struct NodeInfo {
     pub fabric_read_bytes: u64,
     #[serde(default)]
     pub fabric_served_bytes: u64,
+    /// What this host has learned about the sources it reads from
+    /// (ADR-030): latency, in flight, recent rate.
+    #[serde(default)]
+    pub io: Vec<nest_data::balance::SourceReport>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +273,7 @@ impl Admin {
             version: env!("CARGO_PKG_VERSION").to_string(),
             fabric_read_bytes,
             fabric_served_bytes,
+            io: self.vfs.io_report(),
         }
     }
 

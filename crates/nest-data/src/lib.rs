@@ -13,6 +13,7 @@
 //! - Sessions, orphan release, and (later milestones) ranged reads,
 //!   owner-routed writes and whole-file transfers.
 
+pub mod balance;
 pub mod fsck;
 mod local;
 mod readahead;
@@ -24,4 +25,4 @@ pub mod vfs;
 pub use local::{
     ARCHIVE_STORE_BASE, Archive, ArchiveConfig, DataNode, ReconcileReport, is_archive,
 };
-pub use vfs::{FenceHook, OpenMode, Vfs, VfsConfig};
+pub use vfs::{FenceHook, OpenMode, Passthrough, Vfs, VfsConfig};

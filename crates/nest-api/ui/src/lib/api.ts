@@ -81,6 +81,17 @@ export interface NodeInfo {
   version: string;
   fabric_read_bytes: number;
   fabric_served_bytes: number;
+  io?: SourceReport[];
+}
+export interface SourceReport {
+  source: "Local" | { Peer: number };
+  latency_us: number;
+  measured: boolean;
+  in_flight: number;
+  bytes_per_s: number;
+  bytes_total: number;
+  reads_total: number;
+  errors: number;
 }
 export interface NodeStatus {
   node: number;

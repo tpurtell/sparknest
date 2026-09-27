@@ -132,6 +132,14 @@ pub struct FuseSection {
     /// (up to 16 GiB / 200k entries).
     #[serde(default = "default_true")]
     pub rescue_unmounted: bool,
+    /// When a sealed file with a local copy is handed to the kernel:
+    /// "always", "sole" (only when no other host holds a copy, so reads of
+    /// replicated files can be spread over every copy) or "never".
+    #[serde(default)]
+    pub passthrough: nest_data::Passthrough,
+    /// Spread reads of files with several copies over them (ADR-030).
+    #[serde(default = "default_true")]
+    pub balance_reads: bool,
 }
 
 impl Default for FuseSection {
@@ -142,6 +150,8 @@ impl Default for FuseSection {
             io_uring: true,
             allow_nonempty: false,
             rescue_unmounted: true,
+            passthrough: Default::default(),
+            balance_reads: true,
         }
     }
 }

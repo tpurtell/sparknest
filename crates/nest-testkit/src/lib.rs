@@ -36,6 +36,8 @@ pub fn fast_tuning() -> Tuning {
             catch_up_wait: Duration::from_secs(5),
             rpc_timeout: Duration::from_secs(3),
             readahead_chunks: 8,
+            passthrough: nest_data::Passthrough::Always,
+            balance_reads: true,
         },
         lease: Duration::from_millis(800),
         mount: false,
@@ -130,6 +132,8 @@ impl TestCluster {
                 io_uring: true,
                 allow_nonempty: false,
                 rescue_unmounted: true,
+                passthrough: self.tuning.vfs.passthrough,
+                balance_reads: self.tuning.vfs.balance_reads,
             },
             hf: Default::default(),
         }

@@ -255,8 +255,8 @@ export async function cancelJob(id: number) {
 
 // ---------------------------------------------------------------- routing
 
-export type View = "overview" | "models" | "space" | "plans" | "jobs" | "rules" | "files" | "logs";
-export const VIEWS: View[] = ["overview", "models", "space", "plans", "jobs", "rules", "files", "logs"];
+export type View = "overview" | "models" | "space" | "plans" | "io" | "jobs" | "rules" | "files" | "logs";
+export const VIEWS: View[] = ["overview", "models", "space", "plans", "io", "jobs", "rules", "files", "logs"];
 
 function parse() {
   const h = location.hash.replace(/^#\/?/, "");

@@ -11,6 +11,11 @@
   const cap = $derived(hosts.reduce((a, h) => a + (h.info?.total_bytes ?? 0), 0));
   const archived = $derived(app.stores.reduce((a, s) => a + (s.gateways.find(([, h]) => h.healthy)?.[1].object_bytes ?? 0), 0));
   const flow = $derived(Object.values(app.rates).reduce((a, r) => a + r.read, 0));
+  // Spread-read rates a host measured: from its disk and from other hosts.
+  const spread = (i: NonNullable<(typeof hosts)[number]["info"]>) => ({
+    disk: (i.io ?? []).filter((s) => s.source === "Local").reduce((a, s) => a + s.bytes_per_s, 0),
+    net: (i.io ?? []).filter((s) => s.source !== "Local").reduce((a, s) => a + s.bytes_per_s, 0),
+  });
 </script>
 
 <div class="stack">
@@ -41,7 +46,8 @@
             <i class="ours" style="width:{pct(i.object_bytes, i.total_bytes)}%"></i>
           </div>
           <div class="row tiny muted mono"><span>{human(i.object_bytes)} held · {i.objects} files</span><span class="spacer"></span>
-            {#if app.rates[h.name]?.read > 1e5}<span class="live">↓{rate(app.rates[h.name].read)}</span>{/if}
+            {#if spread(i).disk + spread(i).net > 1e6}<span class="live" title="spread reads, last 10 s">disk {rate(spread(i).disk)} · net {rate(spread(i).net)}</span>
+            {:else if app.rates[h.name]?.read > 1e5}<span class="live">↓{rate(app.rates[h.name].read)}</span>{/if}
             {#if app.rates[h.name]?.served > 1e5}<span class="live">↑{rate(app.rates[h.name].served)}</span>{/if}</div>
         {/if}
       </button>

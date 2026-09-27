@@ -187,6 +187,13 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+    /// How each host reads: per source (its disk, each other host), the
+    /// recent latency per chunk, reads in flight, and bytes per second
+    ///
+    /// Reads of files with several copies are spread over them by these
+    /// numbers (ADR-030): an idle local disk first, then whichever source
+    /// has the lowest latency × (in flight + 1).
+    Io,
     /// Drop the clean page cache on every host (or --host), for cold-cache
     /// benchmarks
     ///
@@ -1431,6 +1438,61 @@ async fn main() -> Result<()> {
                 {
                     wait_job(&c, id).await?;
                 }
+            }
+            v
+        }
+        Cmd::Io => {
+            let v = c.get("/v1/status").await?;
+            if !cli.json {
+                let names: std::collections::HashMap<u64, String> = v["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|n| {
+                        (
+                            n["node"].as_u64().unwrap_or(0),
+                            n["name"].as_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect();
+                for n in v["nodes"].as_array().into_iter().flatten() {
+                    let host = n["name"].as_str().unwrap_or("");
+                    let io = n["info"]["io"].as_array().cloned().unwrap_or_default();
+                    if io.is_empty() {
+                        println!("{host}: no spread reads yet");
+                        continue;
+                    }
+                    println!("{host}:");
+                    println!(
+                        "    {:<10} {:>10} {:>8} {:>12} {:>12} {:>7}",
+                        "source", "latency", "flight", "last 10 s", "total", "errors"
+                    );
+                    for s in io {
+                        let src = match &s["source"] {
+                            serde_json::Value::String(l) if l == "Local" => "disk".to_string(),
+                            other => other["Peer"]
+                                .as_u64()
+                                .and_then(|id| names.get(&id).cloned())
+                                .unwrap_or_else(|| other.to_string()),
+                        };
+                        let lat = s["latency_us"].as_u64().unwrap_or(0);
+                        println!(
+                            "    {:<10} {:>8.2}ms{} {:>8} {:>10}/s {:>12} {:>7}",
+                            src,
+                            lat as f64 / 1000.0,
+                            if s["measured"].as_bool() == Some(true) {
+                                " "
+                            } else {
+                                "?"
+                            },
+                            s["in_flight"],
+                            human(s["bytes_per_s"].as_u64().unwrap_or(0)),
+                            human(s["bytes_total"].as_u64().unwrap_or(0)),
+                            s["errors"]
+                        );
+                    }
+                }
+                return Ok(());
             }
             v
         }

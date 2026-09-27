@@ -192,7 +192,14 @@ impl Node {
         }
         let report = data.attach(meta.clone(), trust_local).await?;
         tracing::info!(?report, "local store reconciled");
-        let vfs = Vfs::new(data.clone(), tuning.vfs.clone());
+        let vfs = Vfs::new(
+            data.clone(),
+            VfsConfig {
+                passthrough: cfg.fuse.passthrough,
+                balance_reads: cfg.fuse.balance_reads,
+                ..tuning.vfs.clone()
+            },
+        );
         let recovery = if !trust_local {
             // Unknown objects may be data the metadata forgot unless this
             // host is catching up with the very incarnation it reconciled.
