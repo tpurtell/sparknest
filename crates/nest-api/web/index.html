@@ -145,12 +145,13 @@ function modal(title, bodyHtml, actions) {
 }
 
 // ---------------------------------------------------------------- state
-const views = ["Overview", "Models", "Files", "Rules", "Space", "Jobs"];
+const views = ["Overview", "Models", "Files", "Rules", "Space", "Jobs", "Logs"];
 let view = (() => { const v = new URLSearchParams(location.search).get("view"); return views.includes(v) ? v : "Overview"; })();
 let status = null, stores = [];
 let filesPath = new URLSearchParams(location.search).get("path") || "/";
 let timer = null;
 let groups = [], lastPlan = null, planInputs = {}, planArchives = [];
+let logState = { host: "", level: "info", q: "", follow: true };
 
 function targets() {
   const t = (status?.nodes || []).map(n => ({ name: n.name, kind: "node" }));
@@ -193,6 +194,7 @@ async function render() {
     else if (view === "Rules") main.innerHTML = await rules();
     else if (view === "Space") main.innerHTML = await space();
     else if (view === "Jobs") main.innerHTML = await jobs();
+    else if (view === "Logs") { main.innerHTML = logsView(); await loadLogs(); }
     bind();
   } catch (e) { main.innerHTML = `<div class="card"><b>Error:</b> ${esc(e.message)}</div>`; }
 }
@@ -287,12 +289,50 @@ async function jobs() {
   return `<h2>Jobs on this node</h2><div class="tablewrap"><table><tr><th>Job</th><th>State</th><th>Progress</th></tr>` + list.map(j => {
     const hosts = Object.entries(j.hosts || {}).map(([h, p]) => {
       const pct = p.total_bytes ? 100 * p.done_bytes / p.total_bytes : (p.finished ? 100 : 0);
+      const fails = p.failed.map(([, why]) => `<div class="small" style="color:var(--bad)">${esc(why)}
+        <button class="btn" data-act="logsfor" data-host="${esc(h)}" data-q="${esc(why.split(": ")[0])}">logs</button></div>`).join("");
       return `<div class="small">${esc(h)} <span class="jobbar"><div style="width:${pct.toFixed(0)}%"></div></span>
-        ${p.done_files}/${p.total_files} files · ${human(p.done_bytes)} / ${human(p.total_bytes)}${p.failed.length ? ` · <span style="color:var(--bad)">${p.failed.length} failed</span>` : ""}</div>`;
+        ${p.done_files}/${p.total_files} files · ${human(p.done_bytes)} / ${human(p.total_bytes)}${p.failed.length ? ` · <span style="color:var(--bad)">${p.failed.length} failed</span>` : ""}</div>
+        ${fails ? `<details><summary class="small">why</summary>${fails}</details>` : ""}`;
     }).join("");
     const state = !j.finished ? "running" : j.error ? `<span style="color:var(--bad)">${esc(j.error)}</span>` : "done";
-    return `<tr><td>${esc(j.what)}</td><td>${state}</td><td>${hosts}</td></tr>`;
+    // Duration and aggregate rate (every host's bytes over wall time).
+    let timing = "";
+    if (j.started_ms) {
+      const secs = Math.max(((j.finished_ms || Date.now()) - j.started_ms) / 1000, 0.001);
+      const bytes = Object.values(j.hosts || {}).reduce((a, p) => a + p.done_bytes, 0);
+      timing = `<div class="small muted">${new Date(j.started_ms).toLocaleTimeString()} · ${secs < 90 ? secs.toFixed(1) + " s" : (secs / 60).toFixed(1) + " min"}${bytes ? ` · ${human(bytes / secs)}/s total` : ""}</div>`;
+    }
+    return `<tr><td>${esc(j.what)}${timing}</td><td>${state}</td><td>${hosts}</td></tr>`;
   }).join("") + `</table></div>`;
+}
+
+function logsView() {
+  const hosts = (status?.nodes || []).map(n => `<option value="${esc(n.name)}"${logState.host === n.name ? " selected" : ""}>${esc(n.name)}</option>`).join("");
+  const lv = ["error", "warn", "info", "debug"].map(l => `<option${logState.level === l ? " selected" : ""}>${l}</option>`).join("");
+  return `<h2>Logs</h2><p class="muted small">Recent lines each node keeps in memory (the newest 20,000 per node), merged by time.</p>
+    <div class="row"><select id="lhost"><option value="">all hosts</option>${hosts}</select><select id="llevel">${lv}</select>
+    <input id="lq" placeholder="filter text, e.g. a path or job" value="${esc(logState.q)}" style="flex:1;min-width:180px">
+    <label class="row small"><input type="checkbox" id="lfollow"${logState.follow ? " checked" : ""}> follow</label></div>
+    <div id="lunreach"></div><div class="tablewrap"><table class="logs"><tbody id="lbody"><tr><td class="empty">Loading…</td></tr></tbody></table></div>`;
+}
+
+async function loadLogs() {
+  const qs = new URLSearchParams({ level: logState.level, limit: "1000" });
+  if (logState.host) qs.set("host", logState.host);
+  if (logState.q) qs.set("q", logState.q);
+  const v = await get("/v1/logs?" + qs);
+  const body = $("#lbody");
+  if (!body) return;
+  const color = { ERROR: "var(--bad)", WARN: "var(--warn)" };
+  body.innerHTML = v.lines.slice().reverse().map(l => `<tr><td class="small muted" style="white-space:nowrap">${new Date(l.ts_ms).toLocaleTimeString([], { hour12: false })}.${String(l.ts_ms % 1000).padStart(3, "0")}</td>
+    <td class="small">${esc(l.host)}</td><td class="small" style="color:${color[l.level] || "inherit"}">${esc(l.level)}</td>
+    <td class="small" style="word-break:break-word"><span class="muted">${esc(l.target.replace(/^nest_|^sparknestd::?/, ""))}</span> ${esc(l.message)}</td></tr>`).join("")
+    || `<tr><td class="empty">No matching lines</td></tr>`;
+  $("#lunreach").innerHTML = v.unreachable.map(u => `<div class="small" style="color:var(--bad)">${esc(u)}</div>`).join("");
+  const set = () => { logState.host = $("#lhost").value; logState.level = $("#llevel").value; logState.q = $("#lq").value.trim(); logState.follow = $("#lfollow").checked; loadLogs().catch(e => toast(e.message, true)); };
+  $("#lhost").onchange = set; $("#llevel").onchange = set; $("#lfollow").onchange = set;
+  $("#lq").onkeydown = e => { if (e.key === "Enter") set(); };
 }
 
 // "600" means 600 GiB here: nobody sets a free-space floor in bytes.
@@ -427,6 +467,7 @@ function bind() {
       } catch (err) { toast(err.message, true); }
     }
     else if (d.act === "clearplan") { lastPlan = null; render(); }
+    else if (d.act === "logsfor") { logState = { ...logState, host: (status?.nodes || []).some(n => n.name === d.host) ? d.host : "", level: "info", q: d.q }; view = "Logs"; renderNav(); render(); }
     else if (d.act === "applyplan") {
       if (await modal(`Apply plan ${d.id}?`, `<p class="muted">Offloads copy into the archive before anything is removed. Each step is rechecked against current rules and generations first.</p>`, [["Apply", "primary", true]])) {
         lastPlan = null; startJob(`/v1/plans/${d.id}/apply`, {}, "Plan");
@@ -459,6 +500,7 @@ async function start() {
   timer = setInterval(async () => {
     await refreshStatus();
     if (view === "Overview" || view === "Jobs") render();
+    else if (view === "Logs" && logState.follow && document.activeElement?.id !== "lq") loadLogs().catch(() => {});
   }, 3000);
 }
 start();

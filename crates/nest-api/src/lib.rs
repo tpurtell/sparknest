@@ -146,6 +146,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/backups/{id}", axum::routing::delete(backup_delete))
         .route("/v1/backups/meta", post(meta_snapshot))
         .route("/v1/hf", get(hf_repos))
+        .route("/v1/logs", get(logs))
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/remove", post(cluster_remove))
@@ -779,6 +780,42 @@ struct PlanReq {
     /// none means the plan only removes redundant copies.
     #[serde(default)]
     archives: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct LogsReq {
+    /// One host; every node when absent.
+    host: Option<String>,
+    /// Least severe level shown: error, warn, info (default), debug.
+    level: Option<String>,
+    /// Case-insensitive text the message or target must contain.
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn logs(
+    State(api): State<Api>,
+    axum::extract::Query(r): axum::extract::Query<LogsReq>,
+) -> R<serde_json::Value> {
+    let (lines, missing) = api
+        .placer
+        .logs(
+            r.host.as_deref().filter(|h| !h.is_empty()),
+            nest_place::logs::LogQuery {
+                level: r.level,
+                contains: r.q.filter(|q| !q.is_empty()),
+                after: None,
+                limit: r.limit,
+            },
+        )
+        .await?;
+    let lines: Vec<_> = lines
+        .into_iter()
+        .map(|(host, l)| {
+            json!({ "host": host, "ts_ms": l.ts_ms, "level": l.level, "target": l.target, "message": l.message })
+        })
+        .collect();
+    Ok(Json(json!({ "lines": lines, "unreachable": missing })))
 }
 
 async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_json::Value> {

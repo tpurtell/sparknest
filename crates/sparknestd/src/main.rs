@@ -55,12 +55,18 @@ enum Sub {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,openraft=warn".into()),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        // The console and the in-memory ring the web UI reads share a filter.
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info,openraft=warn".into()),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(nest_place::logs::RingLayer)
+            .init();
+    }
     let args = Args::parse();
     if let Some(Sub::Export {
         meta,

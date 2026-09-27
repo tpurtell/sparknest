@@ -14,6 +14,7 @@
 pub mod admin;
 pub mod backup;
 pub mod import;
+pub mod logs;
 pub mod placer;
 pub mod plan;
 pub mod selector;

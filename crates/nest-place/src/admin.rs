@@ -104,6 +104,8 @@ pub(crate) enum AdminReq {
         files: Vec<(FileId, nest_types::Generation)>,
         store: StoreId,
     },
+    /// Recent log lines kept in memory on this node.
+    Logs(crate::logs::LogQuery),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,6 +133,7 @@ pub(crate) enum AdminResp {
     Removed(u64),
     Path(String),
     Err(String),
+    Logs(Vec<crate::logs::LogLine>),
 }
 
 pub struct Admin {
@@ -222,7 +225,16 @@ impl Admin {
                     p.done_files += 1;
                     p.done_bytes += size;
                     if let Err(e) = r {
-                        p.failed.push((f, e.to_string()));
+                        let path = vfs
+                            .data()
+                            .meta()
+                            .open_reader()
+                            .ok()
+                            .and_then(|c| nest_meta::query::path_of(&c, f).ok().flatten())
+                            .map(|p| String::from_utf8_lossy(&p).into_owned())
+                            .unwrap_or_default();
+                        tracing::warn!(job, file = f.0, %path, error = %e, "replicate: file not copied");
+                        p.failed.push((f, format!("{path}: {e}")));
                     }
                     futures::future::ready(())
                 })
@@ -330,6 +342,7 @@ impl Handler for AdminService {
                     None => AdminResp::Err(format!("no job {job}")),
                 },
                 AdminReq::Evict { files, store } => a.evict(files, store).await,
+                AdminReq::Logs(q) => AdminResp::Logs(crate::logs::recent(&q)),
                 AdminReq::EvictExact { files, store } => {
                     let mut removed = 0;
                     let mut refused = Vec::new();

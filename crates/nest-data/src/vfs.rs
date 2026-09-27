@@ -1223,6 +1223,11 @@ impl Vfs {
         };
         src.open_read(key).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    file = file.0,
+                    generation = generation.0,
+                    "asked for a copy that vanished since the check"
+                );
                 NestError::Stale // invalidated since the check
             } else {
                 io(e)
@@ -2040,18 +2045,40 @@ impl Vfs {
         if sources.is_empty() {
             return Err(NestError::Unavailable("no live copy to copy from".into()));
         }
+        let mut tried = Vec::new();
         let mut last = NestError::Unavailable("no holder reachable".into());
         for src in sources {
             let copied = match src {
                 None => self.copy_local(a, dest).await,
                 Some(n) => self.copy_from(n, a, dest).await,
             };
+            let from = src.map_or_else(|| "local copy".to_string(), |n| format!("node {n}"));
             match copied {
                 Ok(()) => return Ok(()),
-                Err(NestError::Stale) => return Err(NestError::Stale),
-                Err(e) => last = e,
+                // Stale from one source is final only if the file really
+                // moved on; otherwise that source lost its copy (evicted,
+                // or behind on metadata) and the next one may still serve.
+                Err(NestError::Stale) => {
+                    let now = self.raw_attr(a.id)?;
+                    if now.generation != a.generation || now.gen_state != GenState::Stable {
+                        return Err(NestError::Stale);
+                    }
+                    tracing::warn!(file = a.id.0, generation = a.generation.0, %from,
+                        "source no longer has this generation; trying the next");
+                    tried.push(format!("{from}: stale"));
+                    last = NestError::Unavailable(format!(
+                        "no source could serve it ({})",
+                        tried.join(", ")
+                    ));
+                }
+                Err(e) => {
+                    tried.push(format!("{from}: {e}"));
+                    last = e;
+                }
             }
         }
+        tracing::warn!(file = a.id.0, generation = a.generation.0, tried = %tried.join("; "),
+            "copy failed from every source");
         Err(last)
     }
 
@@ -2139,7 +2166,9 @@ impl Vfs {
         dest: &Arc<nest_store::ObjectStore>,
     ) -> NestResult<()> {
         let key = ObjectKey::new(a.id, a.generation);
-        let src = self.local_source(a).ok_or(NestError::Stale)?;
+        let src = self
+            .local_source(a)
+            .ok_or_else(|| NestError::Unavailable("the local copy is no longer servable".into()))?;
         let dest = dest.clone();
         let size = a.size;
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {

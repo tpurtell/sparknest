@@ -45,6 +45,18 @@ pub struct ClusterJob {
     pub pending: u64,
     pub finished: bool,
     pub error: Option<String>,
+    /// Unix milliseconds.
+    #[serde(default)]
+    pub started_ms: u64,
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
+}
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -632,6 +644,7 @@ impl Placer {
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
             what: format!("replicate {}", sel.describe()),
+            started_ms: now_ms(),
             ..Default::default()
         }));
         self.jobs.lock().insert(id, job.clone());
@@ -649,6 +662,7 @@ impl Placer {
             let r = me.run_replicate(&job, m, hosts, parallel).await;
             let mut j = job.lock();
             j.finished = true;
+            j.finished_ms = Some(now_ms());
             j.error = r.err().map(|e| e.to_string());
         });
         Ok(id)
@@ -736,6 +750,7 @@ impl Placer {
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
             what: format!("import {} -> {}", opts.src.display(), opts.dst),
+            started_ms: now_ms(),
             ..Default::default()
         }));
         self.jobs.lock().insert(id, job.clone());
@@ -747,6 +762,7 @@ impl Placer {
             progress.lock().finished = true;
             let mut j = job.lock();
             j.finished = true;
+            j.finished_ms = Some(now_ms());
             j.error = r.err().map(|e| e.to_string());
         });
         id
@@ -820,6 +836,7 @@ impl Placer {
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
             what: format!("offload {} -> {store}", sel.describe()),
+            started_ms: now_ms(),
             ..Default::default()
         }));
         self.jobs.lock().insert(id, job.clone());
@@ -847,6 +864,7 @@ impl Placer {
             .await;
             let mut j = job.lock();
             j.finished = true;
+            j.finished_ms = Some(now_ms());
             j.error = r.err().map(|e: NestError| e.to_string());
         });
         Ok(id)
@@ -866,6 +884,62 @@ impl Placer {
             .await?;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------ logs
+
+    /// Recent log lines from `host` (or every node), merged oldest first,
+    /// the newest `q.limit` overall. Hosts that do not answer are listed.
+    pub async fn logs(
+        &self,
+        host: Option<&str>,
+        q: crate::logs::LogQuery,
+    ) -> NestResult<(Vec<(String, crate::logs::LogLine)>, Vec<String>)> {
+        let nodes: Vec<_> = self
+            .nodes()?
+            .into_iter()
+            .filter(|h| host.is_none_or(|x| x == h.name))
+            .collect();
+        if nodes.is_empty() {
+            return Err(NestError::NotFound);
+        }
+        let me = self.vfs.data().id();
+        let q = &q;
+        let got = futures::future::join_all(nodes.iter().map(|h| async move {
+            if h.node == me {
+                return (h.name.clone(), Ok(crate::logs::recent(q)));
+            }
+            let r = admin::call(
+                self.rpc(),
+                h.node,
+                &AdminReq::Logs(q.clone()),
+                Duration::from_secs(3),
+            )
+            .await;
+            (
+                h.name.clone(),
+                match r {
+                    Ok(AdminResp::Logs(l)) => Ok(l),
+                    Ok(other) => Err(format!("unexpected {other:?}")),
+                    Err(e) => Err(e.to_string()),
+                },
+            )
+        }))
+        .await;
+        let mut lines = Vec::new();
+        let mut missing = Vec::new();
+        for (name, r) in got {
+            match r {
+                Ok(l) => lines.extend(l.into_iter().map(|l| (name.clone(), l))),
+                Err(e) => missing.push(format!("{name}: {e}")),
+            }
+        }
+        lines.sort_by_key(|(_, l)| l.ts_ms);
+        let limit = q.limit.unwrap_or(500);
+        if lines.len() > limit {
+            lines.drain(..lines.len() - limit);
+        }
+        Ok((lines, missing))
     }
 
     // ------------------------------------------------------------ plans
@@ -896,6 +970,7 @@ impl Placer {
         let job = Arc::new(Mutex::new(ClusterJob {
             id: jid,
             what: format!("apply plan {id}"),
+            started_ms: now_ms(),
             ..Default::default()
         }));
         self.jobs.lock().insert(jid, job.clone());
@@ -988,6 +1063,7 @@ impl Placer {
             .await;
             let mut j = job.lock();
             j.finished = true;
+            j.finished_ms = Some(now_ms());
             j.error = r.err().map(|e| e.to_string());
         });
         Ok(jid)
@@ -1009,6 +1085,7 @@ impl Placer {
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
             what,
+            started_ms: now_ms(),
             ..Default::default()
         }));
         self.jobs.lock().insert(id, job.clone());
@@ -1030,6 +1107,7 @@ impl Placer {
                         j.hosts.insert(host.clone(), p);
                         if done {
                             j.finished = true;
+                            j.finished_ms = Some(now_ms());
                             if failed > 0 {
                                 j.error = Some(format!("{failed} entries failed"));
                             }

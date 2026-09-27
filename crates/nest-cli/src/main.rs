@@ -153,6 +153,21 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Recent log lines from every node (or one), merged by time.
+    Logs {
+        /// Only this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Least severe level: error, warn, info, debug.
+        #[arg(long, default_value = "info")]
+        level: String,
+        /// Only lines containing this text.
+        #[arg(long)]
+        grep: Option<String>,
+        /// How many lines.
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+    },
     /// List jobs, or show one.
     Jobs {
         id: Option<u64>,
@@ -327,6 +342,18 @@ fn find_socket(cli: &Cli) -> Result<PathBuf> {
         }
     }
     bail!("cannot find the daemon: pass --socket or --config (or set SPARKNEST_SOCKET)")
+}
+
+/// `HH:MM:SS.mmm` UTC from Unix milliseconds (no date library needed).
+fn chrono_like(ms: u64) -> String {
+    let s = ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}Z",
+        (s / 3600) % 24,
+        (s / 60) % 60,
+        s % 60,
+        ms % 1000
+    )
 }
 
 fn enc(s: &str) -> String {
@@ -1157,6 +1184,39 @@ async fn main() -> Result<()> {
                 {
                     wait_job(&c, id).await?;
                 }
+            }
+            v
+        }
+        Cmd::Logs {
+            host,
+            level,
+            grep,
+            lines,
+        } => {
+            let mut path = format!("/v1/logs?level={}&limit={lines}", enc(level));
+            if let Some(h) = host {
+                path += &format!("&host={}", enc(h));
+            }
+            if let Some(g) = grep {
+                path += &format!("&q={}", enc(g));
+            }
+            let v = c.get(&path).await?;
+            if !cli.json {
+                for l in v["lines"].as_array().into_iter().flatten() {
+                    let ms = l["ts_ms"].as_u64().unwrap_or(0);
+                    let t = chrono_like(ms);
+                    println!(
+                        "{t} {:<8} {:<5} {}: {}",
+                        l["host"].as_str().unwrap_or(""),
+                        l["level"].as_str().unwrap_or(""),
+                        l["target"].as_str().unwrap_or(""),
+                        l["message"].as_str().unwrap_or("")
+                    );
+                }
+                for u in v["unreachable"].as_array().into_iter().flatten() {
+                    eprintln!("unreachable: {}", u.as_str().unwrap_or(""));
+                }
+                return Ok(());
             }
             v
         }
