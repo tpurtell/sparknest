@@ -22,7 +22,11 @@
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); }
+html, body { margin: 0; height: 100%; color: var(--text); font: 14px/1.45 var(--sans); }
+/* Only the root paints the dark base; a body background would be painted
+   above the animated backdrop (z-index -1) over the first screen. */
+html { background: var(--bg); }
+body { background: transparent; }
 body { overflow-x: hidden; -webkit-font-smoothing: antialiased; }
 button, input, select { font: inherit; color: inherit; }
 a { color: var(--spark); text-decoration: none; }

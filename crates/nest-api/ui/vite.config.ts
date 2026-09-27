@@ -16,6 +16,7 @@ export default defineConfig({
   },
   server: {
     // `npm run dev` against a running node: SPARKNEST_API=http://host:7411
-    proxy: { "/v1": process.env.SPARKNEST_API ?? "http://127.0.0.1:7411" },
+    // (the page's API calls travel over a WebSocket, so it is proxied too).
+    proxy: { "/v1": { target: process.env.SPARKNEST_API ?? "http://127.0.0.1:7411", ws: true } },
   },
 });

@@ -197,7 +197,7 @@
   {#if plan}
     <div class="panel pad" class:dim={busy}>
       <div class="row" style="margin-bottom:10px"><h3>Preview</h3><span class="small muted">nothing moves until you apply</span></div>
-      <PlanPreview {plan} onapplied={() => { want = {}; plan = null; }} />
+      <PlanPreview bind:plan onapplied={() => { want = {}; plan = null; }} />
     </div>
   {:else if goal === "free"}
     <div class="panel empty">Drag a handle left to make room on that host, or right to let it take files from others.</div>

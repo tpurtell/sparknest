@@ -15,6 +15,8 @@
     oncontext,
     onload,
     crumbs = true,
+    tip = true,
+    onhover,
   }: {
     root: TreeNode;
     height?: string;
@@ -25,6 +27,10 @@
     /** Load children below the depth fetched so far. */
     onload?: (n: TreeNode) => Promise<TreeNode | null>;
     crumbs?: boolean;
+    /** The floating tooltip; off when the caller shows `onhover` itself. */
+    tip?: boolean;
+    /** The block under the pointer (null when none), and its path. */
+    onhover?: (h: { n: TreeNode; path: string[] } | null) => void;
   } = $props();
 
   // Electric palette for top-level blocks; children vary in lightness.
@@ -268,6 +274,7 @@
     } else {
       hover = { n, x, y, path: [...trail.slice(1), ...trailTo(it!)].map((t) => t.name) };
     }
+    onhover?.(hover);
     kick();
   }
 
@@ -345,7 +352,7 @@
   {#if crumbs}
     <div class="crumbs row">
       {#if trail.length > 1}
-        <button class="btn sm ghost" onclick={() => (trail = trail.slice(0, -1))} aria-label="Zoom out"><Icon name="up" size={14} /></button>
+        <button class="btn sm" onclick={() => (trail = trail.slice(0, -1))} title="Zoom out"><Icon name="up" size={14} /> Out</button>
       {/if}
       {#each trail as t, i}
         {#if i}<span class="faint">›</span>{/if}
@@ -357,12 +364,12 @@
   {/if}
   <div class="box" bind:this={box} style="height:{height}">
     <canvas class="gl" bind:this={canvas}
-      onpointermove={onmove} onpointerleave={() => { hover = null; kick(); }}
+      onpointermove={onmove} onpointerleave={() => { hover = null; onhover?.(null); kick(); }}
       onpointerdown={ondown} onpointerup={cancelPress} onpointercancel={cancelPress}
       {onclick} {oncontextmenu}></canvas>
     <canvas class="lbl" bind:this={labels} aria-hidden="true"></canvas>
     {#if failed}<div class="empty">Treemap needs WebGL2: {failed}</div>{/if}
-    {#if hover}
+    {#if hover && tip}
       <div class="tip panel" style="left:{Math.min(W - 280, hover.x + 14)}px;top:{Math.min(H - 110, hover.y + 14)}px">
         <div class="tiny faint path">{hover.path.slice(0, -1).join(" › ")}</div>
         <b>{hover.n.name}</b>

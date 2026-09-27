@@ -5,6 +5,7 @@
   import { get } from "../lib/api";
   import { app, startJob } from "../lib/state.svelte";
   import { human } from "../lib/format";
+  import { portal } from "../lib/portal";
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
@@ -14,7 +15,7 @@
   let results = $state<Hit[]>([]);
   let searching = $state(false);
   let repo = $state("");
-  let size = $state<{ files: number; bytes: number } | null>(null);
+  let size = $state<{ files: number; missing_files: number; missing_bytes: number } | null>(null);
   let sizeErr = $state("");
   let host = $state("");
 
@@ -60,7 +61,7 @@
     repo = id;
     size = null;
     sizeErr = "";
-    get<{ files: number; bytes: number }>(`/v1/hf/size?repo=${encodeURIComponent(id)}&kind=${kind}`)
+    get<{ files: number; missing_files: number; missing_bytes: number }>(`/v1/hf/size?repo=${encodeURIComponent(id)}&kind=${kind}`)
       .then((s) => {
         if (repo === id) size = s;
       })
@@ -70,7 +71,7 @@
   }
 
   const free = $derived(hosts.find((h) => h.name === host)?.free ?? 0);
-  const fits = $derived(!size || free > size.bytes);
+  const fits = $derived(!size || free > size.missing_bytes);
 
   function close() {
     open = false;
@@ -90,7 +91,7 @@
 <svelte:window onkeydown={(e) => open && e.key === "Escape" && close()} />
 {#if open}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-  <div class="bg" onclick={(e) => e.target === e.currentTarget && close()}>
+  <div class="bg" use:portal onclick={(e) => e.target === e.currentTarget && close()}>
     <div class="dlg panel glowline" role="dialog" aria-modal="true" aria-label="Download from the Hub">
       <div class="row">
         <h3>Download from the Hub</h3>
@@ -119,7 +120,7 @@
         <div class="pick">
           <div class="small">
             <b>{repo}</b>:
-            {#if size}{size.files} files, {human(size.bytes)}{:else if sizeErr}<span style="color:var(--bad)">{sizeErr}</span>{:else}<span class="muted">sizing…</span>{/if}
+            {#if size}{size.missing_files === size.files ? `${size.files} files, ${human(size.missing_bytes)}` : size.missing_files ? `${size.missing_files} of ${size.files} files missing, ${human(size.missing_bytes)}` : "already complete in the cluster"}{:else if sizeErr}<span style="color:var(--bad)">{sizeErr}</span>{:else}<span class="muted">sizing…</span>{/if}
           </div>
           <div class="row small">
             <span class="muted">to</span>
@@ -128,12 +129,12 @@
             </select>
             {#if !fits}<span class="tiny" style="color:var(--bad)">does not fit there</span>{/if}
           </div>
-          <div class="tiny muted">what the cluster already has of it is copied there first; hf fetches the rest</div>
+          <div class="tiny muted">hf fetches only what no host has, onto this host; what the cluster already holds stays where it is</div>
         </div>
       {/if}
       <div class="row end">
         <button class="btn ghost" onclick={close}>Cancel</button>
-        <button class="btn primary" disabled={!repo || !host || !fits || !!sizeErr} onclick={download}>Download</button>
+        <button class="btn primary" disabled={!repo || !host || !fits || !!sizeErr || size?.missing_files === 0} onclick={download}>Download</button>
       </div>
     </div>
   </div>

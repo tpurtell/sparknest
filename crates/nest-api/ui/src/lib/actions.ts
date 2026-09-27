@@ -1,9 +1,9 @@
 // Actions on a selection (a path or hf:org/name), shared by the treemap's
 // context menu, model details and the files list.
 
-import { post, api, type TreeNode, type Plan } from "./api";
+import { post, api, type TreeNode } from "./api";
 import { app, startJob, targets, toast, go } from "./state.svelte";
-import { pick, inform, confirm, openMenu, type MenuItem } from "./ui.svelte";
+import { pick, inform, confirm, openMenu, openPlace, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
 import { download, remove as deletePath } from "./files.svelte";
 
@@ -76,64 +76,6 @@ export async function removeFrom(selector: string, hosts?: string[]) {
   }
 }
 
-/** Gather `selector` on one host (default: where it is used most) and
- * remove the other hosts' copies, as a plan applied at once. */
-export async function consolidate(selector: string, host?: string) {
-  try {
-    const plan = await post<Plan>("/v1/plans", { goal: "consolidate", selector, host });
-    const target =
-      host ?? plan.steps.find((s) => s.kind === "replicate")?.host ?? plan.notes[0]?.split(":")[0] ?? "one host";
-    if (!plan.feasible) return inform(`Cannot move ${selLabel(selector)} to ${target}`, plan.blocked.join("\n"));
-    // Copies rules keep in place ("dodo: 1.2 GiB stays, rule "all" keeps it there").
-    const pinned = plan.notes.filter((n) => n.includes(" keeps it there"));
-    const pinnedHosts = pinned.map((n) => n.split(":")[0]);
-    const rules = [...new Set(pinned.flatMap((n) => [...n.matchAll(/"([^"]+)"/g)].map((m) => m[1])))];
-    if (!plan.steps.length) {
-      if (pinned.length)
-        return inform(
-          `Rules keep ${selLabel(selector)} where it is`,
-          `Rule${rules.length > 1 ? "s" : ""} ${rules.map((r) => `"${r}"`).join(", ")} ${rules.length > 1 ? "keep" : "keeps"} copies on ${pinnedHosts.join(", ")}, so nothing can be moved to ${target}. Change or delete the rule (Rules) to move it.`,
-        );
-      return toast(`${selLabel(selector)} is already only on ${target}`);
-    }
-    await post(`/v1/plans/${plan.id}/apply`);
-    const why = plan.notes.find((n) => n.startsWith(target + ":") && !n.includes(" keeps it there"))?.slice(target.length + 1).trim();
-    toast(`Moving ${selLabel(selector)} to ${target}${why ? ` (${why})` : ""}`);
-    if (pinned.length)
-      await inform(
-        `Moved what rules allow`,
-        `Copies on ${pinnedHosts.join(", ")} stay: rule${rules.length > 1 ? "s" : ""} ${rules.map((r) => `"${r}"`).join(", ")} ${rules.length > 1 ? "keep" : "keeps"} them there. The rest is moving to ${target}.`,
-      );
-  } catch (e) {
-    toast((e as Error).message, true);
-  }
-}
-
-export async function consolidateTo(selector: string) {
-  const h = await pick(
-    `Move ${selLabel(selector)} to one host`,
-    targets().filter((t) => t.kind === "host").map((t) => ({ name: t.name, kind: "host" })),
-    false,
-    "Copies what that host lacks, then removes the other hosts' copies (archive copies and rule-required copies stay).",
-  );
-  if (h?.length) await consolidate(selector, h[0]);
-}
-
-export async function offload(selector: string) {
-  if (!app.stores.length) return toast("No archive stores yet", true);
-  const s = await pick(
-    `Offload ${selLabel(selector)} into…`,
-    app.stores.map((s) => {
-      const g = s.gateways.find(([, h]) => h.healthy)?.[1];
-      return { name: s.name, kind: "archive", note: g ? `${human(g.free_bytes)} free` : "unreachable" };
-    }),
-    false,
-    "Copies into the archive, then removes the live copies. Reads stream through a gateway; copy back any time.",
-  );
-  if (!s?.length) return;
-  await startJob("/v1/offload", { selector, store: s[0] }, `Offloading ${selLabel(selector)} to ${s[0]}`);
-}
-
 export async function keepOn(selector: string) {
   const hosts = await pick(
     `Keep ${selLabel(selector)} on…`,
@@ -166,12 +108,9 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
   if (zoom && (n.children?.length || n.truncated)) items.push({ label: "Zoom in", icon: "zoom", run: zoom });
   if (n.kind === "repo") items.push({ label: "Model details", icon: "info", run: () => go("models", sel) });
   items.push(
+    { label: "Place…", icon: "target", hint: "hosts, replicas, archive", run: () => openPlace(sel, n.kind === "repo" ? n.name : selLabel(sel)) },
     { label: "Copy to…", icon: "copy", run: () => copyTo(sel) },
-    { label: "Copy to every host", icon: "sparkle", run: () => copyTo(sel, ["@all"]) },
     { label: "Keep on… (rule)", icon: "pin", run: () => keepOn(sel) },
-    { label: "Move to the host that uses it most", icon: "target", run: () => consolidate(sel) },
-    { label: "Move to one host…", icon: "target", run: () => consolidateTo(sel) },
-    { label: "Offload to archive…", icon: "archive", run: () => offload(sel), disabled: !app.stores.length },
     { sep: true, label: "" },
   );
   if (isHost) items.push({ label: `Remove from ${scope}`, icon: "trash", danger: true, run: () => removeFrom(sel, [scope!]) });

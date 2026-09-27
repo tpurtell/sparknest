@@ -221,6 +221,13 @@ export interface Copy {
   size: number;
   path: string;
   why: string;
+  /** Removed only once this node holds the file. */
+  keeper?: number;
+  /** Left out of the plan by the person editing it. */
+  skip?: boolean;
+  /** Model (org/name) or directory, and the file's name there. */
+  group?: string;
+  name?: string;
 }
 export type Step =
   | { kind: "evict"; host: string; bytes: number; copies: Copy[]; requires?: number }

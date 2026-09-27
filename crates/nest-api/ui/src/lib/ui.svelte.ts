@@ -49,6 +49,12 @@ export const confirm = (title: string, body = "", ok = "OK", danger = false) =>
 /** Tell the user something; resolves when dismissed. */
 export const inform = (title: string, body = "") => show<boolean>({ kind: "info", title, body }).then(() => undefined);
 
+/** The Place dialog (multi host / single host / archive) for a selection. */
+export const placing = $state({ open: false, selector: "", label: "" });
+export function openPlace(selector: string, label: string) {
+  Object.assign(placing, { open: true, selector, label });
+}
+
 export const pick = (
   title: string,
   options: { name: string; kind: string; note?: string }[],

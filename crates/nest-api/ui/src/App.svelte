@@ -7,6 +7,7 @@
   import Toasts from "./components/Toasts.svelte";
   import ContextMenu from "./components/ContextMenu.svelte";
   import Dialog from "./components/Dialog.svelte";
+  import PlaceDialog from "./components/PlaceDialog.svelte";
   import UploadTray from "./components/UploadTray.svelte";
   import Login from "./components/Login.svelte";
   import Overview from "./views/Overview.svelte";
@@ -50,6 +51,11 @@
   const flow = $derived(Object.values(app.rates).reduce((a, r) => a + r.read, 0));
 </script>
 
+<!-- Nothing in the app is dragged natively: a click-drag on a nav link
+     started the browser's link drag, and releasing it on the same link could
+     leave the page swallowing input. (Only drags starting in the page are
+     stopped; the app takes no drops.) -->
+<svelte:window ondragstart={(e) => e.preventDefault()} />
 <Background />
 {#if !app.authed}
   <Login />
@@ -62,7 +68,7 @@
       </button>
       <nav>
         {#each [...main, ...extra] as n}
-          <a href="#/{n.v}" class:on={route.view === n.v}>
+          <a href="#/{n.v}" class:on={route.view === n.v} draggable="false">
             <Icon name={n.icon} />
             <span>{n.label}</span>
             {#if n.v === "jobs" && running.length}<span class="count">{running.length}</span>{/if}
@@ -126,6 +132,7 @@
 <Toasts />
 <UploadTray />
 <ContextMenu />
+<PlaceDialog />
 <Dialog />
 
 <style>
@@ -136,6 +143,7 @@
   .bolt { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 10px; color: var(--spark); background: radial-gradient(circle, rgba(56, 232, 255, 0.25), transparent 70%); box-shadow: 0 0 22px rgba(56, 232, 255, 0.35); animation: flick 4s infinite; }
   @keyframes flick { 0%, 92%, 100% { opacity: 1; } 93% { opacity: 0.4; } 95% { opacity: 1; } 96% { opacity: 0.6; } }
   .side nav { display: flex; flex-direction: column; gap: 2px; }
+  .side nav a, .mnav a { user-select: none; -webkit-user-drag: none; }
   .side nav a { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border-radius: 10px; color: var(--muted); position: relative; transition: all 0.15s; }
   .side nav a:hover { color: var(--text); background: rgba(56, 232, 255, 0.05); }
   .side nav a.on { color: var(--text); background: linear-gradient(90deg, rgba(56, 232, 255, 0.16), transparent); }

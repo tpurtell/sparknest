@@ -1,27 +1,68 @@
+<script module lang="ts">
+  // What each repo lacks cluster-wide (hf's dry run against the hub cache),
+  // kept across visits; rechecked after ten minutes or a download of it.
+  type Missing = { files: number; missing_files: number; missing_bytes: number; at: number };
+  const missing = $state<Record<string, Missing>>({});
+</script>
+
 <script lang="ts">
   import { get, type Repo, type Readiness } from "../lib/api";
   import { app, route, go, targets, runningJobs, startJob, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
-  import { copyTo, offload, removeFrom, consolidate } from "../lib/actions";
+  import { removeFrom } from "../lib/actions";
   import JobStrip from "../components/JobStrip.svelte";
   import Drawer from "../components/Drawer.svelte";
   import ModelDetail from "./ModelDetail.svelte";
   import Icon from "../components/Icon.svelte";
   import DownloadDialog from "../components/DownloadDialog.svelte";
-  import { pick } from "../lib/ui.svelte";
+  import { pick, openPlace } from "../lib/ui.svelte";
 
   let downloading = $state(false);
 
-  // No host holds all of it: download the rest to one (the host holding
-  // most of it first), after copying there what the cluster has.
-  const complete = (r: Repo) => r.hosts?.some((h) => h.ready && !app.stores.some((s) => s.name === h.host));
+  const key = (r: Repo) => `${r.kind}:${r.repo}`;
+  const lacking = (r: Repo) => missing[key(r)]?.missing_files ?? 0;
+  const checkMissing = singleFlight(async () => {
+    const stale = repos.filter((r) => !r.error && !r.writing && !(Date.now() - (missing[key(r)]?.at ?? 0) < 600_000));
+    const next = async () => {
+      for (let r = stale.shift(); r; r = stale.shift()) {
+        try {
+          const s = await get<Omit<Missing, "at">>(`/v1/hf/size?repo=${encodeURIComponent(r.repo)}&kind=${r.kind}`);
+          missing[key(r)] = { ...s, at: Date.now() };
+        } catch {
+          // Unknown to the Hub (or offline): nothing to finish.
+          missing[key(r)] = { files: 0, missing_files: 0, missing_bytes: 0, at: Date.now() };
+        }
+      }
+    };
+    await Promise.all([next(), next(), next()]);
+  });
+  // A download of a repo that finishes changes what it lacks.
+  let downloadsBefore = new Set<string>();
+  $effect(() => {
+    const now = new Set(runningJobs().map((j) => /^hf download (\S+)/.exec(j.what)?.[1]).filter((x): x is string => !!x));
+    const done = [...downloadsBefore].filter((x) => !now.has(x));
+    downloadsBefore = now;
+    if (!done.length) return;
+    for (const k of Object.keys(missing)) if (done.includes(k.slice(k.indexOf(":") + 1))) delete missing[k];
+    checkMissing();
+  });
+
+  // Finishing downloads only what no host has, with hf, on the host chosen;
+  // nothing the cluster holds moves.
   async function finishOn(r: Repo) {
+    const m = missing[key(r)];
     const held = (h: Readiness) => h.bytes - h.missing_bytes;
+    const free = (h: string) => app.status?.nodes.find((n) => n.name === h)?.info?.free_bytes ?? 0;
     const opts = (r.hosts ?? [])
       .filter((h) => !app.stores.some((s) => s.name === h.host))
-      .sort((a, b) => held(b) - held(a))
-      .map((h) => ({ name: h.host, kind: "host", note: `${human(held(h))} of ${human(h.bytes)} here` }));
-    const got = await pick(`Finish ${r.repo} on…`, opts, false);
+      .sort((a, b) => free(b.host) - free(a.host))
+      .map((h) => ({ name: h.host, kind: "host", note: `${human(free(h.host))} free${held(h) ? ` · holds ${human(held(h))}` : ""}` }));
+    const got = await pick(
+      `Finish ${r.repo} on…`,
+      opts,
+      false,
+      `hf downloads the ${m?.missing_files ?? ""} files (${human(m?.missing_bytes ?? 0)}) no host has, onto the host you pick. Nothing already in the cluster moves.`,
+    );
     if (!got?.[0]) return;
     await startJob("/v1/hf/download", { repo: r.repo, kind: r.kind, host: got[0] }, `Finishing ${r.repo} on ${got[0]}`);
   }
@@ -39,6 +80,7 @@
       repos = v.repos;
       hub = v.hub;
       err = "";
+      checkMissing();
     } catch (e) {
       err = (e as Error).message;
     }
@@ -147,8 +189,8 @@
             · {r.last_open_ms ? `used ${ago(r.last_open_ms)}${lastHost ? " on " + lastHost[0] : ""}` : "unused in 30 days"}
           </div>
         </button>
-        {#if !r.error && !r.writing && !complete(r)}
-          <button class="btn sm finish" onclick={() => finishOn(r)} title="No host holds all of it: copy what the cluster has to one host, then download the rest"><Icon name="download" size={13} /> Finish</button>
+        {#if !r.error && !r.writing && lacking(r)}
+          <button class="btn sm finish" onclick={() => finishOn(r)} title="{lacking(r)} files ({human(missing[key(r)].missing_bytes)}) were never downloaded: fetch them with hf on a host"><Icon name="download" size={13} /> Finish</button>
         {/if}
         </div>
         {#if r.error}
@@ -176,9 +218,7 @@
             {/each}
           </div>
           <div class="acts">
-            <button class="btn sm" onclick={() => copyTo(r.selector, ["@all"])} title="Copy to every host"><Icon name="sparkle" size={14} /> All</button>
-            <button class="btn sm ghost" onclick={() => consolidate(r.selector)} title="Move to 1: keep it only on the host that uses it most"><Icon name="target" size={14} /> 1</button>
-            <button class="btn sm ghost" onclick={() => offload(r.selector)} title="Offload to an archive" disabled={!app.stores.length}><Icon name="archive" size={14} /></button>
+            <button class="btn sm" onclick={() => openPlace(r.selector, r.repo)} title="Place: spread or replicate over hosts, gather on one, or archive"><Icon name="target" size={14} /> Place…</button>
             <button class="btn sm ghost" onclick={() => go("models", r.selector)} title="Details"><Icon name="info" size={14} /></button>
           </div>
         {/if}
