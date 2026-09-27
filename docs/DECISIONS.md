@@ -1008,3 +1008,16 @@ it goes. Live stores on local NVMe are not paced.
 **Alternatives.** Mounting the share with `cache=none` (every client of the
 share loses its cache), or a lower global `vm.dirty_bytes` / a per-device
 `strict_limit` (host-wide knobs, root; still useful as belt and braces).
+
+## ADR-040 — Live stores are paced too, with a longer step (2026-09-28)
+
+**Context.** ADR-039 paced archive stores only. Transfers into a host's own
+store (replication, copies to `@all`, a spread import's staging copies)
+were left to the kernel, but a Spark receives over the fabric (up to
+11.6 GB/s) faster than its SSD writes, and with 128 GB of RAM tens of GB of
+dirty pages build up before throttling, evicting the page cache loaders
+depend on.
+
+**Decision.** The live store is paced at 256 MiB (flush, drop the pages;
+NVMe flushes are cheap), and the import's buffered copy writes through the
+paced writer and drops its source's pages as it reads.

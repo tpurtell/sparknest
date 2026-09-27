@@ -364,13 +364,18 @@ fn place(
                 store.reserve_room(from.metadata()?.len())?;
                 let st = store.begin_staging(key)?;
                 let mut buf = vec![0u8; 8 << 20];
-                let mut to = st.file();
+                let mut off = 0u64;
                 loop {
                     let n = std::io::Read::read(&mut from, &mut buf)?;
                     if n == 0 {
                         break;
                     }
-                    std::io::Write::write_all(&mut to, &buf[..n])?;
+                    // Paced (the store's step), and the source read once.
+                    st.write_all_at(&buf[..n], off)?;
+                    off += n as u64;
+                    if off % (256 << 20) < n as u64 {
+                        nest_store::drop_cached(&from);
+                    }
                     let mut p = progress.lock();
                     p.copied_bytes += n as u64;
                     if p.cancelled {

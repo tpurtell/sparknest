@@ -133,8 +133,15 @@ impl Node {
                 quarantine = true;
             }
         }
-        let store =
-            Arc::new(ObjectStore::open(&cfg.node.state_dir).context("opening object store")?);
+        // Transfers into the live store are paced too, with a longer step
+        // than archives: a Spark receives faster over the fabric than its
+        // SSD writes, and unbounded dirty pages evict the page cache that
+        // loaders depend on (ADR-039).
+        let store = Arc::new(
+            ObjectStore::open(&cfg.node.state_dir)
+                .context("opening object store")?
+                .paced(256 << 20),
+        );
         store.set_reserve(cfg.node.data_reserve_gib << 30);
         let (data, handler) = DataNode::new(id, store, tuning.lease);
         let mut mc = MetaNodeConfig::new(id, cfg.node.state_dir.clone(), cfg.cluster.name.clone());
