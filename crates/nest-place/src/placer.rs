@@ -1289,6 +1289,10 @@ impl Placer {
                         me.run_replicate(&job, m, vec![target], 8).await?;
                         continue;
                     }
+                    let requires = match step {
+                        crate::plan::Step::Evict { requires, .. } => *requires,
+                        _ => None,
+                    };
                     let (host, node, copies, store) = match step {
                         crate::plan::Step::Evict {
                             host, node, copies, ..
@@ -1342,6 +1346,41 @@ impl Placer {
                         };
                         me.run_replicate(&job, m, targets, 8).await?;
                         cancelled(&job)?;
+                    }
+                    // Consolidating: only what the chosen host now holds.
+                    let copies: Vec<_> = match requires {
+                        Some(keeper) => {
+                            let c = me.conn()?;
+                            let (keep, skip): (Vec<_>, Vec<_>) =
+                                copies.into_iter().partition(|x| {
+                                    query::has_live_replica(
+                                        &c,
+                                        x.file,
+                                        x.generation,
+                                        keeper.live_store(),
+                                    )
+                                    .unwrap_or(false)
+                                });
+                            if !skip.is_empty() {
+                                let mut j = job.lock();
+                                let p = j.hosts.entry(host.clone()).or_default();
+                                p.total_files += skip.len() as u64;
+                                for x in skip {
+                                    p.failed.push((
+                                        x.file,
+                                        format!(
+                                            "{}: kept, the target host has no copy yet",
+                                            x.path
+                                        ),
+                                    ));
+                                }
+                            }
+                            keep
+                        }
+                        None => copies,
+                    };
+                    if copies.is_empty() {
+                        continue;
                     }
                     let files = copies.iter().map(|c| (c.file, c.generation)).collect();
                     match admin::call(

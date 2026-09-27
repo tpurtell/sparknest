@@ -129,6 +129,10 @@ enum Cmd {
         /// Add copies where hosts read files over the network within this window.
         #[arg(long, value_name = "WINDOW", conflicts_with = "free")]
         speedup: Option<String>,
+        /// Move a selection to one host (--host, or the one that used it most)
+        /// and remove the other hosts' copies.
+        #[arg(long, value_name = "SELECTOR", conflicts_with_all = ["free", "tidy", "speedup"])]
+        consolidate: Option<String>,
         /// Hosts or @groups for --tidy / --speedup (default: all).
         #[arg(long = "host")]
         hosts: Vec<String>,
@@ -244,6 +248,9 @@ Examples:
   Tidy copies nobody opened on their host for a week:
     nest plan --tidy 7d
     nest plan --tidy 1m --host dodo --to nas
+  Keep a model only on the host that uses it most (or a chosen one):
+    nest plan --consolidate hf:Qwen/Qwen3-8B
+    nest plan --consolidate hf:Qwen/Qwen3-8B --host dodo
   Copy what hosts keep pulling over the network:
     nest plan --speedup 7d
     nest plan --speedup 7d --min 4GiB --keep-free 200GiB
@@ -1036,11 +1043,14 @@ async fn main() -> Result<()> {
             to,
             tidy,
             speedup,
+            consolidate,
             hosts,
             min,
             keep_free,
         } => {
-            let body = if let Some(w) = tidy {
+            let body = if let Some(sel) = consolidate {
+                json!({ "goal": "consolidate", "selector": abspath(sel), "host": hosts.first() })
+            } else if let Some(w) = tidy {
                 json!({ "goal": "tidy", "days": parse_days(w)?, "hosts": hosts, "archives": to })
             } else if let Some(w) = speedup {
                 let mut b = json!({ "goal": "speedup", "days": parse_days(w)?, "hosts": hosts });

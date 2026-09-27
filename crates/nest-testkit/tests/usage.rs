@@ -292,3 +292,60 @@ async fn space_tree_groups_by_model_and_weighs_copies() {
     assert_eq!(t.children.len(), 1);
     assert_eq!(t.children[0].name, "hub");
 }
+
+/// Consolidate: gathers a selection on the host that used it most, then
+/// removes the other hosts' copies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn consolidate_moves_a_selection_to_where_it_is_used() {
+    let c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    let f = write(&c, "model", 6 * MIB).await;
+    let j = p
+        .replicate(
+            Selector::parse("/model", "/hub").unwrap(),
+            vec!["n2".into()],
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(wait_job(&c, j).await.error.is_none());
+    c.converge().await;
+    // n3 has none, but reads it the most.
+    read_all(&c, 3, f, 6 * MIB).await;
+    read_all(&c, 3, f, 6 * MIB).await;
+    let plan = p
+        .plan(Goal::Consolidate {
+            selector: "/model".into(),
+            host: None,
+            hub: "/hub".into(),
+        })
+        .await
+        .unwrap();
+    assert!(plan.feasible, "{plan:?}");
+    assert!(
+        plan.notes.iter().any(|n| n.starts_with("n3: used most")),
+        "{:?}",
+        plan.notes
+    );
+    let kinds: Vec<(&str, String)> = plan
+        .steps
+        .iter()
+        .map(|s| match s {
+            Step::Replicate { host, .. } => ("add", host.clone()),
+            Step::Evict { host, .. } => ("drop", host.clone()),
+            Step::Offload { host, .. } => ("offload", host.clone()),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("add", "n3".to_string()),
+            ("drop", "n1".into()),
+            ("drop", "n2".into())
+        ]
+    );
+    let job = wait_job(&c, p.apply_plan(plan.id).await.unwrap()).await;
+    assert!(job.error.is_none(), "{job:?}");
+    c.converge().await;
+    assert_eq!(holders(&c, f), [3]);
+}

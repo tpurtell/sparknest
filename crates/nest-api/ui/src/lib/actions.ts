@@ -1,7 +1,7 @@
 // Actions on a selection (a path or hf:org/name), shared by the treemap's
 // context menu, model details and the files list.
 
-import { post, api, type TreeNode } from "./api";
+import { post, api, type TreeNode, type Plan } from "./api";
 import { app, startJob, targets, toast, go, poll } from "./state.svelte";
 import { pick, inform, openMenu, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
@@ -49,6 +49,34 @@ export async function removeFrom(selector: string, hosts?: string[]) {
   } catch (e) {
     toast((e as Error).message, true);
   }
+}
+
+/** Gather `selector` on one host (default: where it is used most) and
+ * remove the other hosts' copies, as a plan applied at once. */
+export async function consolidate(selector: string, host?: string) {
+  try {
+    const plan = await post<Plan>("/v1/plans", { goal: "consolidate", selector, host });
+    const target =
+      host ?? plan.steps.find((s) => s.kind === "replicate")?.host ?? plan.notes[0]?.split(":")[0] ?? "one host";
+    if (!plan.feasible) return inform(`Cannot move ${selLabel(selector)} to ${target}`, plan.blocked.join("\n"));
+    if (!plan.steps.length) return toast(`${selLabel(selector)} is already only on ${target}`);
+    await post(`/v1/plans/${plan.id}/apply`);
+    const why = plan.notes.find((n) => n.startsWith(target + ":"))?.slice(target.length + 1).trim();
+    toast(`Moving ${selLabel(selector)} to ${target}${why ? ` (${why})` : ""}`);
+    poll();
+  } catch (e) {
+    toast((e as Error).message, true);
+  }
+}
+
+export async function consolidateTo(selector: string) {
+  const h = await pick(
+    `Move ${selLabel(selector)} to one host`,
+    targets().filter((t) => t.kind === "host").map((t) => ({ name: t.name, kind: "host" })),
+    false,
+    "Copies what that host lacks, then removes the other hosts' copies (archive copies and rule-required copies stay).",
+  );
+  if (h?.length) await consolidate(selector, h[0]);
 }
 
 export async function offload(selector: string) {
@@ -101,6 +129,8 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
     { label: "Copy to…", icon: "copy", run: () => copyTo(sel) },
     { label: "Copy to every host", icon: "sparkle", run: () => copyTo(sel, ["@all"]) },
     { label: "Keep on… (rule)", icon: "pin", run: () => keepOn(sel) },
+    { label: "Move to the host that uses it most", icon: "target", run: () => consolidate(sel) },
+    { label: "Move to one host…", icon: "target", run: () => consolidateTo(sel) },
     { label: "Offload to archive…", icon: "archive", run: () => offload(sel), disabled: !app.stores.length },
     { sep: true, label: "" },
   );

@@ -13,6 +13,11 @@
 //! - **Speedup**: add copies on hosts that read a file over the network (or
 //!   from an archive) at least a threshold within a window, most-read first,
 //!   while the host keeps its free-space floor.
+//! - **Consolidate**: one selection onto one host (by default the host that
+//!   used it most in the last 30 days): copy what it lacks, then remove the
+//!   other hosts' copies. A copy elsewhere is removed only once the chosen
+//!   host holds that file (checked when applying); archive copies and
+//!   copies rules require stay.
 //!
 //! Plans only remove copies the placement engine could re-create; the last
 //! copy is never removed, rule-required copies are never removed, and every
@@ -49,6 +54,9 @@ pub enum Step {
         node: NodeId,
         bytes: u64,
         copies: Vec<Copy>,
+        /// Remove a copy only if this node then holds the file (consolidate).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requires: Option<NodeId>,
     },
     Offload {
         host: String,
@@ -105,6 +113,16 @@ pub enum Goal {
         /// Free space each host keeps; default a tenth of its disk.
         #[serde(default)]
         keep_free: Option<u64>,
+    },
+    Consolidate {
+        /// A path, or hf:org/name.
+        selector: String,
+        /// Where to; by default the host that used it most.
+        #[serde(default)]
+        host: Option<String>,
+        /// Namespace hub for hf selectors (filled by the API).
+        #[serde(default)]
+        hub: String,
     },
 }
 
@@ -437,6 +455,17 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
             let (min, keep) = (*min_remote_bytes, *keep_free);
             make_speedup(placer, w, goal, days, &nodes, min, keep)
         }
+        Goal::Consolidate {
+            selector,
+            host,
+            hub,
+        } => {
+            let sel = Selector::parse(selector, hub).map_err(NestError::Invalid)?;
+            let m = placer.manifest(&sel).await?;
+            let w = World::gather(placer, &[], nest_data::usage::KEEP_DAYS).await?;
+            let host = host.clone();
+            make_consolidate(placer, w, goal.clone(), &m, host.as_deref())
+        }
     }
 }
 
@@ -502,6 +531,7 @@ fn make_free(
                 node,
                 bytes: evict.iter().map(|c| c.size).sum(),
                 copies: evict,
+                requires: None,
             });
         }
         if deficit > 0 && !only.is_empty() {
@@ -588,6 +618,7 @@ fn make_tidy(mut w: World, goal: Goal, days: u64, nodes: &[NodeId]) -> Plan {
             node,
             bytes: copies.iter().map(|c| c.size).sum(),
             copies,
+            requires: None,
         });
     }
     for (node, copies) in only {
@@ -719,6 +750,154 @@ fn make_speedup(
                 node,
                 bytes: add.iter().map(|c| c.size).sum(),
                 copies: add,
+            });
+        }
+    }
+    let rows = w.host_rows(nodes.iter().map(|n| (*n, 0)));
+    Ok(w.finish(goal, rows, steps))
+}
+
+fn make_consolidate(
+    placer: &Placer,
+    mut w: World,
+    goal: Goal,
+    m: &crate::selector::Manifest,
+    host: Option<&str>,
+) -> NestResult<Plan> {
+    let files: HashSet<FileId> = m
+        .entries
+        .iter()
+        .filter(|e| e.stable)
+        .map(|e| e.file)
+        .collect();
+    let nodes: Vec<NodeId> = placer.nodes()?.into_iter().map(|h| h.node).collect();
+    let held = |w: &World, n: NodeId| -> u64 {
+        w.copies_on
+            .get(&n)
+            .map(|v| {
+                v.iter()
+                    .filter(|c| files.contains(&c.file))
+                    .map(|c| c.size)
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+    // The target: named, else most opens, then most bytes read, then most
+    // already held.
+    let target = match host {
+        Some(h) => placer
+            .resolve_hosts(&[h.to_string()])?
+            .first()
+            .map(|x| x.node)
+            .ok_or_else(|| NestError::Invalid(format!("unknown host {h}")))?,
+        None => {
+            let score = |n: NodeId| {
+                let (mut opens, mut bytes) = (0u64, 0u64);
+                if let Some(u) = w.usage.get(&n) {
+                    for f in &files {
+                        if let Some(x) = u.get(f) {
+                            opens += x.opens;
+                            bytes += x.local_bytes + x.remote_bytes + x.archive_bytes;
+                        }
+                    }
+                }
+                (opens, bytes, held(&w, n))
+            };
+            let best = nodes
+                .iter()
+                .copied()
+                .max_by_key(|n| score(*n))
+                .ok_or(NestError::NotFound)?;
+            let (opens, bytes, have) = score(best);
+            let why = if opens > 0 {
+                format!(
+                    "used most there: opened {opens}× and {} read in 30 days",
+                    human(bytes)
+                )
+            } else if have > 0 {
+                format!(
+                    "no host opened it in 30 days; it already holds the most ({})",
+                    human(have)
+                )
+            } else {
+                "no host holds or used it".into()
+            };
+            w.notes.push(format!("{}: {why}", w.host(best)));
+            best
+        }
+    };
+    let host_name = w.host(target);
+    let mut steps = Vec::new();
+    // 1. What the target lacks.
+    let have: HashSet<(FileId, Generation)> = w
+        .copies_on
+        .get(&target)
+        .map(|v| v.iter().map(|c| (c.file, c.generation)).collect())
+        .unwrap_or_default();
+    let add: Vec<Copy> = m
+        .entries
+        .iter()
+        .filter(|e| e.stable && !have.contains(&(e.file, e.generation)))
+        .map(|e| Copy {
+            file: e.file,
+            generation: e.generation,
+            size: e.size,
+            path: e.path.clone(),
+            why: format!("gathering it on {host_name}"),
+        })
+        .collect();
+    let need: u64 = add.iter().map(|c| c.size).sum();
+    if need > w.free_now.get(&target).copied().unwrap_or(0) {
+        w.blocked.push(format!(
+            "{host_name}: needs {} more but has {} free",
+            human(need),
+            human(w.free_now.get(&target).copied().unwrap_or(0))
+        ));
+    }
+    if !add.is_empty() {
+        let p = w.projected.entry(target).or_default();
+        *p = p.saturating_sub(need);
+        steps.push(Step::Replicate {
+            host: host_name.clone(),
+            node: target,
+            bytes: need,
+            copies: add,
+        });
+    }
+    // 2. Everyone else's copies, once the target holds them.
+    for &n in &nodes {
+        if n == target {
+            continue;
+        }
+        let mut drop = Vec::new();
+        let mut req = 0u64;
+        for c in w.copies_on.get(&n).cloned().unwrap_or_default() {
+            if !files.contains(&c.file) {
+                continue;
+            }
+            if w.required(c.file, n).is_some() {
+                req += c.size;
+                continue;
+            }
+            drop.push(Copy {
+                why: format!("kept on {host_name} instead"),
+                ..c
+            });
+        }
+        if req > 0 {
+            let h = w.host(n);
+            w.notes
+                .push(format!("{h}: {} stays, required by rules", human(req)));
+        }
+        if !drop.is_empty() {
+            let b: u64 = drop.iter().map(|c| c.size).sum();
+            *w.projected.entry(n).or_default() += b;
+            steps.push(Step::Evict {
+                host: w.host(n),
+                node: n,
+                bytes: b,
+                copies: drop,
+                requires: Some(target),
             });
         }
     }

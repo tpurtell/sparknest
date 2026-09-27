@@ -2,7 +2,7 @@
   import { get, type Readiness, type TreeNode, type HostUsage } from "../lib/api";
   import { app, runningJobs, startJob, go, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
-  import { copyTo, offload, keepOn, removeFrom, nodeMenu } from "../lib/actions";
+  import { copyTo, offload, keepOn, removeFrom, nodeMenu, consolidate, consolidateTo } from "../lib/actions";
   import Treemap from "../components/Treemap.svelte";
   import Icon from "../components/Icon.svelte";
 
@@ -69,6 +69,8 @@
       <button class="btn primary" onclick={() => copyTo(selector, ["@all"])}><Icon name="sparkle" size={15} /> Copy to every host</button>
       <button class="btn" onclick={() => copyTo(selector)}><Icon name="copy" size={15} /> Copy to…</button>
       <button class="btn" onclick={() => keepOn(selector)}><Icon name="pin" size={15} /> Keep on…</button>
+      <button class="btn" onclick={() => consolidate(selector)} title="Keep it only on the host that uses it most"><Icon name="target" size={15} /> Move to 1</button>
+      <button class="btn" onclick={() => consolidateTo(selector)}><Icon name="target" size={15} /> Move to…</button>
       <button class="btn" onclick={() => offload(selector)} disabled={!app.stores.length}><Icon name="archive" size={15} /> Offload…</button>
       <button class="btn danger" onclick={() => removeFrom(selector)}><Icon name="trash" size={15} /> Remove from…</button>
     </div>

@@ -114,6 +114,15 @@ impl Api {
         Selector::parse(&s, &self.hub).map_err(bad)
     }
 
+    /// A selector as typed, with mountpoint paths mapped into the namespace.
+    fn selector_string(&self, s: &str) -> String {
+        if s.starts_with('/') {
+            self.ns(s)
+        } else {
+            s.to_string()
+        }
+    }
+
     pub(crate) fn conn(&self) -> Result<rusqlite::Connection, ApiError> {
         self.vfs
             .data()
@@ -1165,6 +1174,13 @@ async fn make_plan(State(api): State<Api>, Json(r): Json<PlanReq>) -> R<serde_js
         serde_json::to_value(
             api.placer
                 .plan(match r {
+                    PlanReq::Goal(nest_place::plan::Goal::Consolidate {
+                        selector, host, ..
+                    }) => nest_place::plan::Goal::Consolidate {
+                        selector: api.selector_string(&selector),
+                        host,
+                        hub: api.hub.clone(),
+                    },
                     PlanReq::Goal(g) => g,
                     PlanReq::Free { free, archives } => {
                         nest_place::plan::Goal::Free { free, archives }

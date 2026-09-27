@@ -2,7 +2,7 @@
   import { get, type Repo, type Readiness } from "../lib/api";
   import { app, route, go, targets, runningJobs, startJob, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
-  import { copyTo, offload, removeFrom } from "../lib/actions";
+  import { copyTo, offload, removeFrom, consolidate } from "../lib/actions";
   import JobStrip from "../components/JobStrip.svelte";
   import Drawer from "../components/Drawer.svelte";
   import ModelDetail from "./ModelDetail.svelte";
@@ -152,6 +152,7 @@
           </div>
           <div class="acts">
             <button class="btn sm" onclick={() => copyTo(r.selector, ["@all"])} title="Copy to every host"><Icon name="sparkle" size={14} /> All</button>
+            <button class="btn sm ghost" onclick={() => consolidate(r.selector)} title="Move to 1: keep it only on the host that uses it most"><Icon name="target" size={14} /> 1</button>
             <button class="btn sm ghost" onclick={() => offload(r.selector)} title="Offload to an archive" disabled={!app.stores.length}><Icon name="archive" size={14} /></button>
             <button class="btn sm ghost" onclick={() => go("models", r.selector)} title="Details"><Icon name="info" size={14} /></button>
           </div>
@@ -174,8 +175,8 @@
   .lg.full { background: rgba(56, 232, 255, 0.55); box-shadow: 0 0 6px var(--spark); }
   .lg.part { background: linear-gradient(0deg, rgba(79, 141, 255, 0.7) 50%, transparent 50%); }
   .list { display: flex; flex-direction: column; gap: 8px; }
-  .colhead, .repo { display: grid; grid-template-columns: minmax(220px, 1fr) auto 118px; gap: 14px; align-items: center; }
-  .colhead { padding: 0 14px; grid-template-columns: minmax(220px, 1fr) auto 118px; }
+  .colhead, .repo { display: grid; grid-template-columns: minmax(220px, 1fr) auto 164px; gap: 14px; align-items: center; }
+  .colhead { padding: 0 14px; grid-template-columns: minmax(220px, 1fr) auto 164px; }
   .colhead::after { content: ""; }
   .cells { display: flex; gap: 4px; }
   .ch { width: var(--cw); height: 64px; position: relative; }
