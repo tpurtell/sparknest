@@ -5,7 +5,8 @@
 # tap on each host.
 #
 #   scripts/install-cluster.sh package     tarball + formula in dist/local-brew/
-#   scripts/install-cluster.sh install     brew-build it on every host (parallel)
+#   scripts/install-cluster.sh install [HOST...]  brew-build it on every host
+#                                          (or those), in parallel
 #   scripts/install-cluster.sh configure   node.toml + secret in /srv/sparknest,
 #                                          system unit staged in ~/.config/sparknest/
 #   scripts/install-cluster.sh all         the three in order
@@ -74,6 +75,8 @@ install_all() {
   local pids=()
   for h in "${SPARKNEST_HOSTS[@]}"; do
     IFS=: read -r host _ _ _ <<<"$h"
+    # `install HOST...` retries only those.
+    if [ $# -gt 0 ] && ! printf '%s\n' "$@" | grep -qx "$host"; then continue; fi
     ( install_host "$host" > "dist/install-logs/$host.log" 2>&1 \
         && echo "== $host: $(tail -1 "dist/install-logs/$host.log")" \
         || echo "== $host: FAILED (dist/install-logs/$host.log)" ) &
@@ -144,7 +147,7 @@ EOF
 
 case "${1:-}" in
   package) package ;;
-  install) install_all ;;
+  install) shift; install_all "$@" ;;
   configure) configure ;;
   all) package && install_all && configure ;;
   *) sed -n '2,17p' "$0" >&2; exit 2 ;;

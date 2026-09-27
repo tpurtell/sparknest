@@ -64,3 +64,89 @@ nest ui                                       # link to the web UI
 
 Rust workspace; `scripts/build.sh --check` runs formatting, lints and the
 test suite. Licensed under MIT or Apache-2.0, at your option.
+
+## Example: moving a real cluster in
+
+How sparknest went into service on raptor (an x86 workstation with a
+400 Gb port) and six DGX Sparks, starting from their existing Hugging Face
+caches: each host's `~/.cache/huggingface`, and a 5.9 TB cache on a drive of
+raptor's that was about to be reformatted. Hosts, ids and fabric addresses
+live in `scripts/cluster.env`.
+
+**1. Install and configure.** From a clean checkout on raptor (hosts reached
+over SSH; nothing published, the formula builds a tarball of `HEAD` from a
+local tap on each host):
+
+```sh
+scripts/install-cluster.sh all    # brew-build on every host, write /srv/sparknest/node.toml
+```
+
+Once per host, as root: the directories, and the unit that runs the daemon
+as you with `CAP_SYS_ADMIN` (for passthrough):
+
+```sh
+sudo mkdir -p /srv/sparknest /mnt/sparknest && sudo chown "$USER": /srv/sparknest /mnt/sparknest
+sudo cp ~/.config/sparknest/sparknestd@sparknest.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable sparknestd@sparknest
+```
+
+Bootstrap the first host once, then start everything:
+
+```sh
+sparknestd --config /srv/sparknest/node.toml --bootstrap   # on raptor; Ctrl-C at "sparknestd running"
+sudo systemctl start sparknestd@sparknest                  # every host
+nest status                                                # 7/7 serving
+nest store add models /mnt/models/sparknest --gateways raptor   # archive store (a NAS share)
+nest group set sparks ostrich dodo emu kiwi rhea moa
+```
+
+**2. Bring each host's cache in, without touching it.** On every host at
+once (safe to run in parallel); blobs are hard-linked into the store, so
+nothing is copied:
+
+```sh
+nest hf import ~/.cache/huggingface --wait
+export HF_HOME=/mnt/sparknest/hf-home      # try the models from sparknest
+```
+
+**3. Make it permanent.** The same import with `--move`: already-imported
+blobs are recognized, everything is verified again, and each cache is
+replaced by a symlink into sparknest's hub:
+
+```sh
+nest hf import ~/.cache/huggingface --move --wait
+```
+
+**4. One copy of each model.** The hosts' caches overlapped, so most models
+now had several copies. A free-space target above what any host can reach
+removes every redundant copy (never the last); nothing is archived without
+`--to`:
+
+```sh
+nest plan --free @all=8TiB     # review the proposal, then:
+nest plan apply ID --wait
+```
+
+**5. The big cache, spread over the cluster.** raptor's 5.9 TB cache did
+not fit on raptor. `--spread` copies blobs into raptor's store in ~64 GiB
+batches and hands each to the host with the most free space; the drive is
+only read, once, and blobs the cluster already has are skipped:
+
+```sh
+nest hf import /mnt/scratch/hf_cache --spread --wait
+```
+
+**6. Copies where they pay.** After a week or so of using the models,
+the usage each host recorded (what it opened, and what it read over the
+network) drives the speedup planner, which proposes copies on the hosts
+that keep reading a model from elsewhere:
+
+```sh
+nest plan --speedup 1w         # review, then: nest plan apply ID --wait
+```
+
+**7. Later.** After reformatting that drive it becomes a second archive
+store (`nest store add scratch /mnt/scratch/sparknest --gateways raptor`),
+and the models on the NAS are imported, spread, then offloaded back to its
+archive store (`nest offload SELECTOR --store models`), leaving the cluster
+free to pull any of them back on demand.
