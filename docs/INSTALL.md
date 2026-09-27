@@ -116,9 +116,33 @@ nest backup create /projects --name nightly --store nas
 
 ## Upgrades
 
-Stop every daemon, replace the binaries, start them again. Persisted
-formats are versioned and migrate on start. Mixed versions are not
-supported while new operations are in use, so upgrade all hosts together.
+Stop every daemon, replace the binaries, start them again. Our metadata
+schema migrates on start. When a release changes the Raft format, the
+hosts notice on start, agree once a majority of members run the new build,
+and re-found the cluster from the most advanced metadata; nothing needs
+doing by hand, and after a clean stop nothing is lost. A host still on the
+old build (or down) never counts toward that majority, so upgrading a
+minority by accident just leaves those hosts waiting unmounted. Upgrade all
+hosts together.
+
+## Power loss and fsck
+
+Metadata commits are not fsynced (ADR-026); an application's `fsync` still
+makes its file and the metadata it depends on durable on a majority. A host
+that went down while running (it notices from the kernel boot id) catches
+up with the cluster before it mounts, and checks its objects against the
+metadata: copies it lost are retired, damaged copies are replaced from
+another host, and files no host holds any more are logged as lost. If most
+hosts went down at once, they re-found the cluster from the most advanced
+surviving metadata when a majority is back.
+
+Nothing that might be the only copy of data is deleted: objects the
+metadata no longer knows go to `/.lost+found/<date-time>/<host>/<path>`.
+
+- `nest fsck` checks this host while running (`-y` applies the standard,
+  non-destructive fixes; `--deep` verifies Hugging Face blobs against the
+  SHA-256 in their names).
+- `sparknestd fsck` reports the same without a daemon.
 
 ## Disaster recovery
 

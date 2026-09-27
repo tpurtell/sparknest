@@ -630,3 +630,39 @@ outages are rare, and file data is what matters.
    the dirty path. `nest upgrade prepare` remains the recommended manual
    route. Tested with simulated in-process clusters, not real installs.
 7. **Batch delete** in `nest`: many unlinks per Raft entry, in chunks.
+
+## ADR-027 — Recovery as built (2026-09-27; implements ADR-026)
+
+- **HELLO** (RPC service 6) runs from process start: build, Raft format,
+  phase (recovering: dirty, disk format, applied position; running: leader),
+  incarnation, and the plan and seed a host holds. Start-up decides *normal*,
+  *join* (set Raft state aside under `pre-join-*`, adopt the running
+  cluster's incarnation, catch up from a snapshot) or *re-found*.
+- **Plans** are proposed by the lowest-id recovering host once a majority of
+  voters recover (immediately if all do, else after a grace period, 10 s),
+  accepted by each host at most once, and committed only with a majority of
+  acceptances; an uncommitted acceptance expires after a minute.
+- **Seeds**: the most advanced metadata (applied term, index; lowest id on
+  ties), Raft rows cleared, marked with the new incarnation, SHA-256
+  checked on every participant. Old state is kept under `pre-refound-<id>`.
+- **Founding**: the seed host initializes the group as its only voter,
+  snapshots and purges, then adds the other voters, so no host ever
+  replays a log that lacks the seeded state.
+- **Incarnations**: every Raft message carries one; a mismatch is refused.
+  A clean host that returns to a re-founded cluster joins afresh.
+- **fsck** runs on every host that did not trust its local state: after
+  catching up, before admission (nothing is served until then). Unknown
+  objects are deleted only when the host caught up with the incarnation it
+  last reconciled; otherwise they go to `/.lost+found/<run>/<host>/<path>`,
+  with paths recovered from set-aside metadata. Snapshot-install
+  reconciliation stands down while a host recovers.
+- **No mount-blocking decisions**: every resolution fsck applies keeps the
+  bytes (lost+found) and records what happened, so none needs a person to
+  choose before mounting; `nest fsck` lists anything a person may want to
+  act on (e.g. an unknown object newer than the cluster's version of a
+  file).
+- **Tests** simulate all of it in process: `TestCluster::power_loss` rolls a
+  host's disk back to a saved durable point and changes its boot id;
+  `tests/recovery.rs` covers a full outage with uneven loss, a lossless
+  whole-cluster upgrade, a lone upgraded host (waits, then joins) and a host
+  absent during a re-found.
