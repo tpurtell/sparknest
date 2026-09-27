@@ -339,6 +339,28 @@ fn settle(n: &mut TreeNode, max: usize) {
     n.children = fold(std::mem::take(&mut n.children), max);
 }
 
+/// Resolve `abs` to a regular file, following a final symlink too (hf 2.0:
+/// snapshot → repo `blobs/<sha>` link → shared `/hub/blobs/xx/<sha>`).
+fn follow(c: &Connection, ns: &Ns, abs: &str) -> NestResult<Option<FileId>> {
+    let mut path = abs.to_string();
+    for _ in 0..8 {
+        let Ok((id, dir)) = selector::resolve_path(c, &path) else {
+            return Ok(None);
+        };
+        if ns.kind.get(&id) != Some(&FileKind::Symlink) {
+            return Ok(Some(id));
+        }
+        let t = query::readlink(c, id).map_err(sql)?.unwrap_or_default();
+        let t = String::from_utf8_lossy(&t);
+        path = if t.starts_with('/') {
+            t.into_owned()
+        } else {
+            format!("{}/{t}", ns.path(dir))
+        };
+    }
+    Ok(None)
+}
+
 pub fn tree(c: &Connection, req: &TreeReq) -> NestResult<TreeNode> {
     let ns = Ns::load(c, req.store)?;
     let mut b = Builder {
@@ -434,7 +456,7 @@ pub fn tree(c: &Connection, req: &TreeReq) -> NestResult<TreeNode> {
                                 } else {
                                     format!("{}/{t}", ns.path(dir))
                                 };
-                                selector::resolve_path(c, &abs).ok().map(|(id, _)| id)
+                                follow(c, &ns, &abs)?
                             }
                             None => None,
                         };

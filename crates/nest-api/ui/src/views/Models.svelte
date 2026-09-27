@@ -183,8 +183,9 @@
   .cell { width: var(--cw); height: 30px; border-radius: 7px; border: 1px solid rgba(90, 170, 255, 0.18); background: rgba(8, 18, 38, 0.8); position: relative; overflow: hidden; cursor: pointer; padding: 0; transition: transform 0.1s, border-color 0.15s; }
   .cell:hover { border-color: var(--spark); transform: translateY(-1px); }
   .cell i { position: absolute; left: 0; right: 0; bottom: 0; height: var(--p); background: linear-gradient(0deg, rgba(79, 141, 255, 0.75), rgba(56, 232, 255, 0.55)); transition: height 0.6s ease; }
-  .cell.full { border-color: rgba(56, 232, 255, 0.55); box-shadow: 0 0 12px rgba(56, 232, 255, 0.35), inset 0 0 10px rgba(56, 232, 255, 0.25); }
-  .cell.full i { background: linear-gradient(0deg, rgba(56, 232, 255, 0.45), rgba(120, 240, 255, 0.35)); }
+  .cell.full { border-color: rgba(120, 240, 255, 0.9); box-shadow: 0 0 14px rgba(56, 232, 255, 0.55), inset 0 0 12px rgba(160, 250, 255, 0.35); }
+  .cell.full i { background: linear-gradient(0deg, #1f8bff, #38e8ff 70%, #b8f7ff); }
+  .cell.full .lbl { color: #021018; text-shadow: none; font-weight: 700; }
   .cell.fly { border-color: var(--spark); }
   .cell.fly i { animation: pulse 1s ease-in-out infinite; }
   .cell.fly::after { content: ""; position: absolute; inset: 0; background: linear-gradient(0deg, transparent, rgba(255, 255, 255, 0.25), transparent); animation: rise-sweep 1.2s linear infinite; }

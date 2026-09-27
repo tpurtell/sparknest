@@ -41,7 +41,8 @@
             <i class="ours" style="width:{pct(i.object_bytes, i.total_bytes)}%"></i>
           </div>
           <div class="row tiny muted mono"><span>{human(i.object_bytes)} held · {i.objects} files</span><span class="spacer"></span>
-            {#if app.rates[h.name]}<span>↓{rate(app.rates[h.name].read)} ↑{rate(app.rates[h.name].served)}</span>{/if}</div>
+            {#if app.rates[h.name]?.read > 1e5}<span class="live">↓{rate(app.rates[h.name].read)}</span>{/if}
+            {#if app.rates[h.name]?.served > 1e5}<span class="live">↑{rate(app.rates[h.name].served)}</span>{/if}</div>
         {/if}
       </button>
     {/each}
@@ -85,6 +86,7 @@
   .cap i { display: block; height: 100%; }
   .cap .other { background: #34445f; }
   .cap .ours { background: linear-gradient(90deg, var(--spark-2), var(--spark)); box-shadow: 0 0 10px rgba(56, 232, 255, 0.7); }
+  .live { color: var(--spark); }
   .sec { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
   .ell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @media (max-width: 899px) { .tiles { grid-template-columns: repeat(2, 1fr); } }

@@ -39,11 +39,16 @@ void main() {
   float e = min(d.x, d.y) / dpr;
   vec3 c = vColor;
   float lvl = vExtra.x;
-  // Body: darker toward the bottom, deeper levels a touch brighter.
-  vec3 body = c * (0.22 + 0.18 * (1.0 - vUv.y) + 0.06 * lvl);
-  // Edge glow.
+  // Body: lit from the top, a soft core glow, deeper levels a touch brighter.
+  float core = 1.0 - smoothstep(0.0, 0.75, length((vUv - vec2(0.5, 0.42)) * vec2(1.0, 1.3)));
+  vec3 body = c * (0.14 + 0.2 * (1.0 - vUv.y) + 0.22 * core + 0.05 * lvl);
+  // A slow sheen drifting across large blocks.
+  float sheen = smoothstep(0.0, 0.5, 1.0 - abs(fract(vUv.x * 0.5 + vUv.y * 0.3 - t * 0.03) * 2.0 - 1.0));
+  body += c * sheen * 0.05;
+  // Edge glow, brightest along the top edge.
   float edge = exp(-e / 1.1);
-  vec3 col = body + c * edge * 0.95 + vec3(0.6, 0.9, 1.0) * exp(-e / 0.5) * 0.25;
+  float top = exp(-(vPx.y / dpr) / 2.0);
+  vec3 col = body + c * edge * 0.95 + vec3(0.6, 0.9, 1.0) * (exp(-e / 0.5) * 0.25 + top * 0.25);
   if (has(flags, 2.0)) {
     // Free space: dark with faint diagonal hatching.
     float s = mod(gl_FragCoord.x + gl_FragCoord.y, 14.0 * dpr);

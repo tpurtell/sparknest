@@ -29,8 +29,8 @@
 {/if}
 
 <style>
-  .strip { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-  .job { display: flex; gap: 12px; align-items: center; padding: 10px 14px; color: var(--spark); border-color: rgba(56, 232, 255, 0.35); }
+  .strip { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); }
+  .job { min-width: 0; display: flex; gap: 12px; align-items: center; padding: 10px 14px; color: var(--spark); border-color: rgba(56, 232, 255, 0.35); }
   .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; color: var(--text); }
   .what { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @media (max-width: 520px) { .strip { grid-template-columns: 1fr; } }

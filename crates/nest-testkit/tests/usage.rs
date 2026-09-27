@@ -224,7 +224,12 @@ async fn space_tree_groups_by_model_and_weighs_copies() {
     let cfg = file(rb, "cfg", 1000).await;
     let snaps = mk(repo, "snapshots").await;
     let r1 = mk(snaps, "r1").await;
-    v.symlink(r1, b"model.bin", b"../../../blobs/ab/abc")
+    // hf 2.0: the snapshot names the repo's blob link, which points at the
+    // shared store.
+    v.symlink(rb, b"sha-abc", b"../../blobs/ab/abc")
+        .await
+        .unwrap();
+    v.symlink(r1, b"model.bin", b"../../blobs/sha-abc")
         .await
         .unwrap();
     v.symlink(r1, b"config.json", b"../../blobs/cfg")

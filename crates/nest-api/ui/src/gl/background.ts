@@ -31,13 +31,16 @@ void main() {
   // Nebula: domain-warped fbm in deep blues.
   vec2 w = vec2(fbm(q * 1.6 + tt), fbm(q * 1.6 - tt + 4.0));
   float n = fbm(q * 2.2 + w * 1.4 + vec2(tt * 0.7, -tt * 0.4));
-  vec3 col = mix(vec3(0.004, 0.012, 0.035), vec3(0.02, 0.07, 0.17), smoothstep(0.25, 0.85, n));
-  col += vec3(0.05, 0.02, 0.12) * smoothstep(0.55, 0.95, fbm(q * 1.1 - w + tt * 0.5));
+  vec3 col = mix(vec3(0.006, 0.016, 0.045), vec3(0.03, 0.12, 0.28), smoothstep(0.2, 0.9, n));
+  col += vec3(0.09, 0.03, 0.22) * smoothstep(0.5, 0.95, fbm(q * 1.1 - w + tt * 0.5));
+  // A slow aurora band sweeping across.
+  float band = exp(-pow((q.y + 0.35 * sin(q.x * 1.3 + t * 0.05) - 0.1) * 3.2, 2.0));
+  col += vec3(0.02, 0.18, 0.3) * band * (0.35 + 0.65 * fbm(q * 4.0 + vec2(t * 0.04, 0.0)));
   // Filaments: thin ridges of a second warped field.
   float r = fbm(q * 3.0 + w * 2.0 - vec2(0.0, t * 0.02));
   float ridge = 1.0 - abs(r * 2.0 - 1.0);
-  float fil = pow(ridge, 28.0) * (0.35 + 0.65 * energy);
-  col += vec3(0.25, 0.75, 1.0) * fil * 0.55;
+  float fil = pow(ridge, 22.0) * (0.5 + 0.9 * energy);
+  col += vec3(0.25, 0.8, 1.0) * fil * 0.9;
   // Sparks: sparse cells with a drifting bright point.
   vec2 g = q * 22.0 + vec2(0.0, t * 0.25);
   vec2 id = floor(g); vec2 f = fract(g) - 0.5;
@@ -49,7 +52,7 @@ void main() {
     col += vec3(0.5, 0.9, 1.0) * smoothstep(0.08, 0.0, d) * tw * 0.8;
   }
   // Vignette.
-  col *= 1.0 - 0.55 * dot(q * 0.9, q * 0.9);
+  col *= 1.0 - 0.45 * dot(q * 0.9, q * 0.9);
   o = vec4(col, 1.0);
 }`;
 

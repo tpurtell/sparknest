@@ -1,7 +1,7 @@
 /* sparknest — electric blue on deep space. */
 :root {
   --bg: #030712;
-  --panel: rgba(10, 20, 42, 0.62);
+  --panel: rgba(8, 18, 40, 0.5);
   --panel-solid: #0a1428;
   --panel-hi: rgba(20, 38, 72, 0.7);
   --line: rgba(90, 170, 255, 0.16);
@@ -99,6 +99,7 @@ input[type="checkbox"] { accent-color: var(--spark); }
 .spacer { flex: 1; }
 .stack { display: flex; flex-direction: column; gap: 14px; }
 .grid { display: grid; gap: 14px; }
+.grid > *, .stack > * { min-width: 0; }
 
 /* Progress bars */
 .bar { height: 6px; border-radius: 99px; background: rgba(90, 140, 220, 0.14); overflow: hidden; position: relative; }

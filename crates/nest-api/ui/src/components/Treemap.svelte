@@ -40,10 +40,24 @@
   let W = $state(0);
   let H = $state(0);
 
+  // Collapse chains of single directories ("home/tj/Developer") so nested
+  // headers do not eat the space. Actions use the deepest node's selector.
+  function compact(n: TreeNode): TreeNode {
+    let cur = n;
+    let name = n.name;
+    while (cur.children?.length === 1 && cur.children[0].children?.length && (cur.kind === "dir" || cur.kind === "group") && cur !== root) {
+      cur = cur.children[0];
+      name = name + "/" + cur.name;
+    }
+    const kids = cur.children?.map(compact);
+    return cur === n && kids === undefined ? n : { ...cur, name, children: kids };
+  }
+  const view = $derived({ ...root, children: root.children?.map(compact) });
+
   $effect(() => {
     // New data: keep the zoom if the same path still exists.
     const names = untrack(() => trail.slice(1).map((n) => n.name));
-    const t: TreeNode[] = [root];
+    const t: TreeNode[] = [view];
     for (const nm of names) {
       const c = t[t.length - 1].children?.find((x) => x.name === nm);
       if (!c) break;
@@ -51,7 +65,7 @@
     }
     trail = t;
   });
-  const current = $derived(trail[trail.length - 1] ?? root);
+  const current = $derived(trail[trail.length - 1] ?? view);
 
   interface Item {
     key: string;

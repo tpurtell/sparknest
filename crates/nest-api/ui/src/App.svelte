@@ -124,7 +124,7 @@
   .brand span:last-child { background: linear-gradient(90deg, #e9f8ff, var(--spark)); -webkit-background-clip: text; background-clip: text; color: transparent; }
   .bolt { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 10px; color: var(--spark); background: radial-gradient(circle, rgba(56, 232, 255, 0.25), transparent 70%); box-shadow: 0 0 22px rgba(56, 232, 255, 0.35); animation: flick 4s infinite; }
   @keyframes flick { 0%, 92%, 100% { opacity: 1; } 93% { opacity: 0.4; } 95% { opacity: 1; } 96% { opacity: 0.6; } }
-  nav { display: flex; flex-direction: column; gap: 2px; }
+  .side nav { display: flex; flex-direction: column; gap: 2px; }
   .side nav a { display: flex; align-items: center; gap: 12px; padding: 9px 12px; border-radius: 10px; color: var(--muted); position: relative; transition: all 0.15s; }
   .side nav a:hover { color: var(--text); background: rgba(56, 232, 255, 0.05); }
   .side nav a.on { color: var(--text); background: linear-gradient(90deg, rgba(56, 232, 255, 0.16), transparent); }
@@ -146,7 +146,7 @@
     .top { padding: 10px 12px; justify-content: flex-start; }
     .hide-s { display: none; }
     main { padding: 2px 12px 96px; }
-    .tabs { display: flex; position: fixed; left: 8px; right: 8px; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 50; justify-content: space-around; padding: 6px; border-radius: 18px; background: rgba(6, 13, 30, 0.9); }
+    .tabs { display: flex; flex-direction: row; position: fixed; left: 8px; right: 8px; bottom: max(8px, env(safe-area-inset-bottom)); z-index: 50; justify-content: space-around; padding: 6px; border-radius: 18px; background: rgba(6, 13, 30, 0.9); }
     .tabs a, .tabs button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 10px; color: var(--muted); padding: 6px 2px; border-radius: 12px; background: none; border: 0; position: relative; }
     .tabs .on { color: var(--spark); background: rgba(56, 232, 255, 0.1); }
     .tabs .count { position: absolute; top: 2px; right: 18%; }

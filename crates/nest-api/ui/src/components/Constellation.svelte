@@ -36,10 +36,13 @@
     let i = 0;
     caps.forEach((c, k) => {
       const f = rings === 1 ? 1 : 0.45 + (0.55 * k) / (rings - 1);
-      const rx = n <= 2 ? W * 0.22 : maxR * f * (W > H * 1.3 ? 1.35 : 1);
-      const ry = n <= 2 ? 0 : maxR * f;
+      let rx = n <= 2 ? W * 0.22 : maxR * f * (W > H * 1.3 ? 1.35 : 1);
+      let ry = n <= 2 ? 0 : maxR * f;
       const circ = 2 * Math.PI * Math.max(ry, 40);
       const orb = Math.max(15, Math.min(58, circ / c / 2.9, (Math.min(W, H) / 5) * (n <= 4 ? 1 : 0.8)));
+      // Keep whole orbs (and their status dot) inside the frame.
+      rx = Math.min(rx, W / 2 - orb - 12);
+      ry = Math.min(ry, H / 2 - orb - 12);
       for (let j = 0; j < c; j++) {
         const a = -Math.PI / 2 + (2 * Math.PI * j) / c + k * 0.35;
         out.push({ x: cx + (n <= 2 ? (j ? rx : -rx) : rx * Math.cos(a)), y: cy + (n <= 2 ? 0 : ry * Math.sin(a)), r: orb });
@@ -134,6 +137,10 @@
           onmouseenter={() => (hover = h.name)} onmouseleave={() => (hover = null)}>
           <circle r={r * (active ? 1.9 : 1.55)} fill="url(#halo)" class:pulse={active} />
           <circle r={r} fill="url(#core)" stroke="rgba(110,200,255,0.25)" />
+          <g class="reactor" style="animation-duration:{18 + (i % 5) * 4}s">
+            <circle r={r * 1.14} fill="none" stroke="rgba(56,232,255,0.35)" stroke-width="1" stroke-dasharray="2 {Math.max(4, r * 0.18)}" />
+            <circle r={r * 1.24} fill="none" stroke="rgba(79,141,255,0.18)" stroke-width="1" stroke-dasharray="{r * 0.9} {r * 0.5}" />
+          </g>
           <!-- capacity ring: other used (slate), sparknest (spark) -->
           <circle r={ringR} fill="none" stroke="rgba(80,120,180,0.18)" stroke-width={Math.max(3, r * 0.12)} />
           <circle r={ringR} fill="none" stroke="#3b4d6b" stroke-width={Math.max(3, r * 0.12)}
@@ -175,7 +182,15 @@
 </div>
 
 <style>
-  .wrap { position: relative; width: 100%; height: clamp(320px, 58vh, 640px); }
+  .wrap {
+    position: relative; width: 100%; height: clamp(320px, 58vh, 640px);
+    /* holographic floor: faint dots, brighter toward the middle */
+    background:
+      radial-gradient(ellipse at 50% 50%, rgba(56, 232, 255, 0.07), transparent 65%),
+      radial-gradient(circle, rgba(110, 200, 255, 0.16) 1px, transparent 1.6px) 0 0 / 22px 22px;
+    -webkit-mask: radial-gradient(ellipse at 50% 50%, #000 55%, transparent 95%);
+    mask: radial-gradient(ellipse at 50% 50%, #000 55%, transparent 95%);
+  }
   canvas, svg { position: absolute; inset: 0; width: 100%; height: 100%; }
   svg { overflow: visible; }
   .orb { cursor: pointer; outline: none; transition: transform 0.2s; }
@@ -188,6 +203,8 @@
   .st.ok { fill: var(--ok); filter: drop-shadow(0 0 4px var(--ok)); }
   .pulse { animation: pulse 1.6s ease-in-out infinite; }
   .orbit { animation: spin 6s linear infinite; }
+  .reactor { animation: spin 20s linear infinite; transform-origin: 0 0; }
+  .orb:hover .reactor circle { stroke: rgba(56, 232, 255, 0.7); }
   @keyframes spin { to { transform: rotate(360deg); } }
   .tip { position: absolute; z-index: 5; padding: 10px 12px; width: 240px; pointer-events: none; background: rgba(6, 13, 30, 0.92); }
   .spark { color: var(--spark); }
