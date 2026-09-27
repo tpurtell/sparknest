@@ -52,6 +52,9 @@ pub struct ClusterJob {
     pub finished_ms: Option<u64>,
     #[serde(default)]
     pub cancelled: bool,
+    /// What happened, for people (e.g. per-repo outcomes of an hf import).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// Node-side jobs to tell when cancelled.
     #[serde(skip)]
     host_jobs: Vec<(NodeId, u64)>,
@@ -778,10 +781,57 @@ impl Placer {
 
     /// Import a local directory into the namespace (this node's store).
     pub fn import(self: &Arc<Self>, opts: crate::import::ImportOptions) -> u64 {
+        let what = format!("import {} -> {}", opts.src.display(), opts.dst);
+        tracing::info!(src = %opts.src.display(), dst = %opts.dst, r#move = opts.r#move, copy = opts.copy, "import started");
+        self.local_job(what, move |vfs, progress, _| {
+            crate::import::run(vfs, opts, progress)
+        })
+    }
+
+    /// Bring a Hugging Face cache into the hub (see `hfimport`).
+    pub fn hf_import(self: &Arc<Self>, opts: crate::hfimport::HfImportOptions) -> u64 {
+        let what = format!("hf import {} -> {}", opts.src.display(), opts.hub);
+        tracing::info!(src = %opts.src.display(), hub = %opts.hub, r#move = opts.r#move, hf = ?opts.hf, "hf import started");
+        self.local_job(what, move |vfs, progress, notes| async move {
+            let outcomes = Arc::new(Mutex::new(Vec::new()));
+            let r = crate::hfimport::run(vfs, opts, progress, outcomes.clone()).await;
+            let mut n = notes.lock();
+            for o in outcomes.lock().iter() {
+                n.push(format!(
+                    "{}: {}{}{}",
+                    o.repo,
+                    o.status,
+                    if o.moved { ", moved" } else { "" },
+                    if o.note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", o.note)
+                    }
+                ));
+            }
+            r
+        })
+    }
+
+    /// A job that runs on this node over an `ImportProgress`: its progress
+    /// is mirrored into the job under this host's name (files, bytes and
+    /// rate like any other job), it can be cancelled, and `notes` lines end
+    /// up on the job.
+    fn local_job<F, Fut>(self: &Arc<Self>, what: String, work: F) -> u64
+    where
+        F: FnOnce(
+                Arc<Vfs>,
+                Arc<Mutex<crate::import::ImportProgress>>,
+                Arc<Mutex<Vec<String>>>,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = NestResult<()>> + Send + 'static,
+    {
         let id = self.next_job.fetch_add(1, Ordering::Relaxed);
         let job = Arc::new(Mutex::new(ClusterJob {
             id,
-            what: format!("import {} -> {}", opts.src.display(), opts.dst),
+            what,
             started_ms: now_ms(),
             ..Default::default()
         }));
@@ -789,9 +839,49 @@ impl Placer {
         let progress = Arc::new(Mutex::new(crate::import::ImportProgress::default()));
         self.imports.lock().insert(id, progress.clone());
         let vfs = self.vfs.clone();
+        let host = self
+            .nodes()
+            .ok()
+            .and_then(|n| n.into_iter().find(|h| h.node == vfs.data().id()))
+            .map(|h| h.name)
+            .unwrap_or_else(|| "here".into());
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let mirror = {
+            let (job, progress, notes) = (job.clone(), progress.clone(), notes.clone());
+            move || {
+                let p = progress.lock().clone();
+                let (df, db) = p.done();
+                let mut j = job.lock();
+                j.notes = notes.lock().clone();
+                j.hosts.insert(
+                    host.clone(),
+                    admin::JobProgress {
+                        total_files: p.total_files,
+                        done_files: df,
+                        total_bytes: p.total_bytes,
+                        done_bytes: db,
+                        failed: p.errors.iter().map(|e| (FileId(0), e.clone())).collect(),
+                        finished: p.finished,
+                        cancelled: p.cancelled,
+                    },
+                );
+            }
+        };
+        let ticker = {
+            let (mirror, progress) = (mirror.clone(), progress.clone());
+            tokio::spawn(async move {
+                while !progress.lock().finished {
+                    mirror();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+        };
+        let fut = work(vfs, progress.clone(), notes);
         tokio::spawn(async move {
-            let r = crate::import::run(vfs, opts, progress.clone()).await;
+            let r = fut.await;
             progress.lock().finished = true;
+            ticker.abort();
+            mirror();
             let mut j = job.lock();
             j.finished = true;
             j.finished_ms = Some(now_ms());
@@ -822,9 +912,15 @@ impl Placer {
             if j.finished {
                 return Err(NestError::Invalid("job already finished".into()));
             }
-            if !["replicate ", "offload ", "apply plan "]
-                .iter()
-                .any(|k| j.what.starts_with(k))
+            if ![
+                "replicate ",
+                "offload ",
+                "apply plan ",
+                "import ",
+                "hf import ",
+            ]
+            .iter()
+            .any(|k| j.what.starts_with(k))
             {
                 return Err(NestError::Invalid(format!(
                     "{} cannot be cancelled",
@@ -834,6 +930,9 @@ impl Placer {
             j.cancelled = true;
             j.host_jobs.clone()
         };
+        if let Some(p) = self.imports.lock().get(&id) {
+            p.lock().cancelled = true;
+        }
         tracing::info!(job = id, "job cancelled");
         for (node, hid) in hosts {
             if let Err(e) = admin::call(

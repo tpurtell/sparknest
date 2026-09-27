@@ -8,6 +8,12 @@
 //! source that was already imported (re-running skips it). Directories and
 //! symlinks (targets verbatim, so Hugging Face's relative links keep
 //! working) are recreated; other file types are skipped.
+//!
+//! When a source is on another filesystem than the store and `copy` is set,
+//! the file is copied straight into the store instead of linked (one pass,
+//! no FUSE round trips); smaller batches keep the metadata close behind.
+//! `import_entries` imports an explicit list of files to namespace paths
+//! (used by `nest hf import` to put blobs where huggingface_hub looks).
 
 use nest_data::Vfs;
 use nest_meta::{Command, Reply, SealPolicy, query};
@@ -42,6 +48,9 @@ pub struct ImportOptions {
     pub r#move: bool,
     #[serde(default = "auto")]
     pub seal: SealMode,
+    /// Copy files that cannot be hard-linked (another filesystem).
+    #[serde(default)]
+    pub copy: bool,
 }
 
 fn auto() -> SealMode {
@@ -63,9 +72,55 @@ pub struct ImportProgress {
     pub skipped: u64,
     pub errors: Vec<String>,
     pub finished: bool,
+    /// Regular files and bytes found under the source before starting.
+    #[serde(default)]
+    pub total_files: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Stop at the next file; what was imported stays.
+    #[serde(default)]
+    pub cancelled: bool,
+    /// Bytes copied (not linked) so far, counted as they are written.
+    #[serde(default)]
+    pub copied_bytes: u64,
+}
+
+impl ImportProgress {
+    /// Files and bytes dealt with so far (imported, adopted or skipped).
+    pub fn done(&self) -> (u64, u64) {
+        (
+            self.files + self.adopted + self.skipped,
+            self.bytes + self.adopted_bytes + self.copied_bytes,
+        )
+    }
+}
+
+/// Count regular files and bytes under `dir` (for progress).
+fn scan(dir: &std::path::Path) -> (u64, u64) {
+    let (mut files, mut bytes) = (0, 0);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(md) = e.path().symlink_metadata() else {
+                continue;
+            };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else if md.is_file() {
+                files += 1;
+                bytes += md.len();
+            }
+        }
+    }
+    (files, bytes)
 }
 
 const BATCH: usize = 256;
+/// Flush a batch of copies once this many bytes are waiting.
+const COPY_BATCH_BYTES: u64 = 4 << 30;
 
 /// Files under `blobs/` that are not content: the shared-blob layout's
 /// `.refs` hints and marker, which huggingface_hub rewrites in place.
@@ -120,6 +175,15 @@ pub async fn run(
             "import source must be a directory".into(),
         ));
     }
+    let src = opts.src.clone();
+    let (tf, tb) = tokio::task::spawn_blocking(move || scan(&src))
+        .await
+        .unwrap_or((0, 0));
+    {
+        let mut p = progress.lock();
+        p.total_files = tf;
+        p.total_bytes = tb;
+    }
     // Destination: create along the path.
     let mut dst = FileId::ROOT;
     for comp in opts.dst.split('/').filter(|c| !c.is_empty()) {
@@ -141,6 +205,9 @@ pub async fn run(
     let mut pending: Vec<Pending> = Vec::new();
     let mut dirs_seen: Vec<PathBuf> = Vec::new();
     while let Some((dir, id, in_blobs)) = stack.pop() {
+        if progress.lock().cancelled {
+            break;
+        }
         dirs_seen.push(dir.clone());
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -153,6 +220,9 @@ pub async fn run(
             }
         };
         for e in entries.flatten() {
+            if progress.lock().cancelled {
+                break;
+            }
             let path = e.path();
             let name = e.file_name().as_bytes().to_vec();
             let Ok(md) = std::fs::symlink_metadata(&path) else {
@@ -240,15 +310,20 @@ pub async fn run(
                         _ => false,
                     },
                 });
-                if pending.len() >= BATCH {
-                    flush(&vfs, &mut pending, opts.r#move, &progress).await?;
+                if full(&pending) {
+                    flush(&vfs, &mut pending, opts.r#move, opts.copy, &progress).await?;
                 }
             } else {
                 progress.lock().skipped += 1;
             }
         }
     }
-    flush(&vfs, &mut pending, opts.r#move, &progress).await?;
+    flush(&vfs, &mut pending, opts.r#move, opts.copy, &progress).await?;
+    if progress.lock().cancelled {
+        return Err(NestError::Io(
+            "cancelled; what was imported stays, the rest of the source is untouched".into(),
+        ));
+    }
     if opts.r#move {
         // Remove now-empty source directories, deepest first.
         dirs_seen.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
@@ -259,11 +334,64 @@ pub async fn run(
     Ok(())
 }
 
+fn full(pending: &[Pending]) -> bool {
+    pending.len() >= BATCH || pending.iter().map(|p| p.size).sum::<u64>() >= COPY_BATCH_BYTES
+}
+
+/// One file into the store under `key`: a hard link, or with `copy` (and
+/// only when linking is impossible across filesystems) a copy. Returns
+/// whether it was copied.
+fn place(
+    store: &nest_store::ObjectStore,
+    src: &std::path::Path,
+    key: ObjectKey,
+    copy: bool,
+    progress: &Mutex<ImportProgress>,
+) -> Result<bool, String> {
+    match store.link_from(src, key) {
+        Ok(_) => Ok(false),
+        Err(e) if e.raw_os_error() == Some(18) && copy => {
+            let run = || -> std::io::Result<()> {
+                let mut from = std::fs::File::open(src)?;
+                store.reserve_room(from.metadata()?.len())?;
+                let st = store.begin_staging(key)?;
+                let mut buf = vec![0u8; 8 << 20];
+                let mut to = st.file();
+                loop {
+                    let n = std::io::Read::read(&mut from, &mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    std::io::Write::write_all(&mut to, &buf[..n])?;
+                    let mut p = progress.lock();
+                    p.copied_bytes += n as u64;
+                    if p.cancelled {
+                        return Err(std::io::Error::other("cancelled"));
+                    }
+                }
+                store.commit_staging(st)?;
+                Ok(())
+            };
+            run()
+                .map(|_| true)
+                .map_err(|e| format!("{}: copying: {e}", src.display()))
+        }
+        Err(e) => Err(match e.raw_os_error() {
+            Some(18) => format!(
+                "{}: not on the same filesystem as the sparknest store (import links; pass --copy to copy)",
+                src.display()
+            ),
+            _ => format!("{}: {e}", src.display()),
+        }),
+    }
+}
+
 async fn flush(
     vfs: &Vfs,
     pending: &mut Vec<Pending>,
     mv: bool,
-    progress: &Mutex<ImportProgress>,
+    copy: bool,
+    progress: &Arc<Mutex<ImportProgress>>,
 ) -> NestResult<()> {
     if pending.is_empty() {
         return Ok(());
@@ -282,15 +410,13 @@ async fn flush(
     let store = vfs.data().store().clone();
     let me = vfs.data().id();
     let srcs: Vec<PathBuf> = batch.iter().map(|p| p.src.clone()).collect();
-    let linked: Vec<Result<(), String>> = tokio::task::spawn_blocking(move || {
+    let pr = progress.clone();
+    let linked: Vec<Result<bool, String>> = tokio::task::spawn_blocking(move || {
         srcs.iter()
             .enumerate()
             .map(|(i, s)| {
                 let key = ObjectKey::new(FileId(first.0 + i as u64), nest_types::Generation(1));
-                store.link_from(s, key).map(|_| ()).map_err(|e| match e.raw_os_error() {
-                    Some(18) => format!("{}: not on the same filesystem as the sparknest store (import links, it does not copy)", s.display()),
-                    _ => format!("{}: {e}", s.display()),
-                })
+                place(&store, s, key, copy, &pr)
             })
             .collect()
     })
@@ -301,7 +427,7 @@ async fn flush(
     let mut idx = Vec::new();
     for (i, (p, l)) in batch.iter().zip(&linked).enumerate() {
         match l {
-            Ok(()) => {
+            Ok(_) => {
                 cmds.push(Command::Import {
                     parent: p.parent,
                     name: p.name.clone(),
@@ -333,10 +459,14 @@ async fn flush(
         for (r, i) in results.into_iter().zip(idx) {
             let p = &batch[i];
             let key = ObjectKey::new(FileId(first.0 + i as u64), nest_types::Generation(1));
+            let copied = matches!(linked[i], Ok(true));
             match r {
                 Ok(_) => {
                     pr.files += 1;
-                    pr.bytes += p.size;
+                    // Copies were counted as they were written.
+                    if !copied {
+                        pr.bytes += p.size;
+                    }
                     if mv {
                         to_unlink.push(p.src.clone());
                     }
@@ -363,4 +493,87 @@ async fn flush(
     .await
     .expect("blocking task");
     Ok(())
+}
+
+/// One regular file to import to an exact namespace path.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    /// A regular file, or a symlink to one (followed).
+    pub src: PathBuf,
+    /// Absolute namespace path.
+    pub dst: String,
+    pub seal: bool,
+}
+
+/// Import `entries` to their namespace paths, creating directories. A
+/// destination that already exists is left alone (counted as skipped).
+pub async fn import_entries(
+    vfs: &Arc<Vfs>,
+    entries: Vec<Entry>,
+    mv: bool,
+    copy: bool,
+    progress: &Arc<Mutex<ImportProgress>>,
+) -> NestResult<()> {
+    let mut dirs: std::collections::HashMap<String, FileId> = std::collections::HashMap::new();
+    let mut pending: Vec<Pending> = Vec::new();
+    for e in entries {
+        if progress.lock().cancelled {
+            break;
+        }
+        let Some((parent_path, name)) = e.dst.rsplit_once('/') else {
+            continue;
+        };
+        let parent = match dirs.get(parent_path) {
+            Some(id) => *id,
+            None => {
+                let mut id = FileId::ROOT;
+                let mut created = 0;
+                for comp in parent_path.split('/').filter(|c| !c.is_empty()) {
+                    let (i, c) = ensure_dir(vfs, id, comp.as_bytes()).await?;
+                    id = i;
+                    created += c as u64;
+                }
+                progress.lock().dirs += created;
+                dirs.insert(parent_path.to_string(), id);
+                id
+            }
+        };
+        let exists = vfs
+            .data()
+            .with_reader(|c| query::lookup(c, parent, name.as_bytes()))
+            .map_err(sql)?
+            .is_some();
+        let real = match std::fs::canonicalize(&e.src) {
+            Ok(r) => r,
+            Err(err) => {
+                progress
+                    .lock()
+                    .errors
+                    .push(format!("{}: {err}", e.src.display()));
+                continue;
+            }
+        };
+        let Ok(md) = std::fs::metadata(&real) else {
+            continue;
+        };
+        if exists {
+            let mut p = progress.lock();
+            p.skipped += 1;
+            p.adopted_bytes += md.len();
+            continue;
+        }
+        pending.push(Pending {
+            src: real,
+            parent,
+            name: name.as_bytes().to_vec(),
+            perm: md.mode() & 0o7777,
+            size: md.len(),
+            mtime: Timestamp(md.mtime() * 1_000_000_000 + md.mtime_nsec()),
+            seal: e.seal,
+        });
+        if full(&pending) {
+            flush(vfs, &mut pending, mv, copy, progress).await?;
+        }
+    }
+    flush(vfs, &mut pending, mv, copy, progress).await
 }

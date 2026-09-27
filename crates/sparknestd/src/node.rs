@@ -365,6 +365,8 @@ impl Node {
                 dst: dst.clone(),
                 r#move: true,
                 seal: nest_place::import::SealMode::None,
+                // The rescue sits in the state directory, next to the store.
+                copy: true,
             });
             tracing::warn!(job, to = %dst, "importing files written while sparknest was not mounted");
         }

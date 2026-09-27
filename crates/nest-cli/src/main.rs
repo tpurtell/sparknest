@@ -195,8 +195,15 @@ enum Cmd {
         #[arg(long, requires = "id")]
         cancel: bool,
     },
+    /// Hugging Face caches.
+    Hf {
+        #[command(subcommand)]
+        cmd: HfCmd,
+    },
     /// Import a local directory into the namespace without copying (hard
-    /// links into this node's store; must be on the same filesystem).
+    /// links into this node's store; same filesystem, or --copy).
+    /// A relative DST is inside sparknest: `nest import ~/models models`
+    /// creates /models. For Hugging Face caches use `nest hf import`.
     Import {
         src: PathBuf,
         dst: String,
@@ -206,6 +213,39 @@ enum Cmd {
         /// none | all | blobs | auto (follow the destination's policy)
         #[arg(long, default_value = "auto")]
         seal: String,
+        /// Copy files on another filesystem than the store (default: only
+        /// hard-link, which moves no data).
+        #[arg(long)]
+        copy: bool,
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HfCmd {
+    /// Bring an existing Hugging Face cache into sparknest's hub, in the
+    /// form huggingface_hub writes: blobs are hard-linked (or copied from
+    /// another filesystem) to where hf looks, then `hf download` finishes
+    /// each snapshot (fetching only what the source never finished) or,
+    /// offline, the source's snapshot links are mirrored. Every file is
+    /// verified. Sources are left alone unless --move.
+    ///
+    /// SRC: a hub cache (models--* inside), an HF_HOME (hub/ inside), or
+    /// one models--org--name directory.
+    Import {
+        src: PathBuf,
+        /// After verifying, remove the source and leave a symlink to
+        /// sparknest's hub in its place (the whole cache when every repo
+        /// made it, else each repo that did).
+        #[arg(long = "move")]
+        mv: bool,
+        /// Do not ask the Hub: mirror the source's snapshots exactly.
+        #[arg(long)]
+        offline: bool,
+        /// Only hard-link: fail files on another filesystem than the store.
+        #[arg(long)]
+        no_copy: bool,
         #[arg(long)]
         wait: bool,
     },
@@ -459,14 +499,50 @@ fn human(b: u64) -> String {
     }
 }
 
-/// Absolute paths are sent as given (the daemon translates mountpoint
-/// paths); relative paths are made absolute against the cwd.
+/// A namespace path from what the user typed. Absolute paths are sent as
+/// given (the daemon maps paths under its mountpoint into the namespace, so
+/// `/mnt/sparknest/hub` and `/hub` both work). A relative path is relative
+/// to the working directory when that is inside a sparknest mount, and to
+/// the namespace root otherwise: `nest import ~/models models` from a home
+/// directory lands in `/models`, not in `/home/you/models`.
 fn abspath(p: &str) -> String {
     if p.starts_with('/') || p.starts_with("hf:") || p.starts_with("hf-dataset:") {
         return p.to_string();
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    cwd.join(p).to_string_lossy().into_owned()
+    if sparknest_mounts().iter().any(|m| cwd.starts_with(m)) {
+        return cwd.join(p).to_string_lossy().into_owned();
+    }
+    format!("/{}", p.trim_start_matches("./"))
+}
+
+/// A program on PATH, as an absolute path.
+fn which(prog: &str) -> Option<String> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(prog))
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
+/// Mountpoints of sparknest filesystems on this machine.
+fn sparknest_mounts() -> Vec<PathBuf> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            // "... <mount point> <options> ... - <fstype> <source> ..."
+            let (pre, post) = l.split_once(" - ")?;
+            post.starts_with("fuse.sparknest ")
+                .then(|| {
+                    pre.split(' ')
+                        .nth(4)
+                        .map(|m| PathBuf::from(m.replace("\\040", " ")))
+                })
+                .flatten()
+        })
+        .collect()
 }
 
 async fn wait_job(c: &Client, id: u64) -> Result<Value> {
@@ -1317,18 +1393,56 @@ async fn main() -> Result<()> {
             }
             None => c.get("/v1/jobs").await?,
         },
+        Cmd::Hf {
+            cmd:
+                HfCmd::Import {
+                    src,
+                    mv,
+                    offline,
+                    no_copy,
+                    wait,
+                },
+        } => {
+            let src = std::fs::canonicalize(src).with_context(|| format!("{}", src.display()))?;
+            let hf = if *offline {
+                None
+            } else {
+                let found = which("hf");
+                if found.is_none() {
+                    eprintln!("hf not found on PATH: mirroring snapshots offline");
+                }
+                found
+            };
+            let v = c
+                .post(
+                    "/v1/hf/import",
+                    json!({ "src": src, "move": mv, "hf": hf, "copy": !no_copy }),
+                )
+                .await?;
+            let id = v["job"].as_u64().unwrap_or(0);
+            if *wait {
+                let v = wait_job(&c, id).await?;
+                for n in v["job"]["notes"].as_array().into_iter().flatten() {
+                    println!("  {}", n.as_str().unwrap_or(""));
+                }
+                v
+            } else {
+                v
+            }
+        }
         Cmd::Import {
             src,
             dst,
             mv,
             seal,
+            copy,
             wait,
         } => {
             let src = std::fs::canonicalize(src).with_context(|| format!("{}", src.display()))?;
             let v = c
                 .post(
                     "/v1/import",
-                    json!({ "src": src, "dst": abspath(dst), "move": mv, "seal": seal }),
+                    json!({ "src": src, "dst": abspath(dst), "move": mv, "seal": seal, "copy": copy }),
                 )
                 .await?;
             let id = v["job"].as_u64().unwrap_or(0);

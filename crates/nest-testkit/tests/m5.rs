@@ -77,6 +77,7 @@ async fn import_seal_replicate_evict_rules() {
         dst: "/hub".into(),
         r#move: true,
         seal: SealMode::Auto,
+        copy: false,
     });
     c.eventually("import done", Duration::from_secs(10), |c| {
         c.node(1).placer.job(id).is_some_and(|j| j.finished)
@@ -404,6 +405,7 @@ async fn run_import(
         dst: "/hub".into(),
         r#move: mv,
         seal: SealMode::Auto,
+        copy: false,
     });
     c.eventually("import done", Duration::from_secs(10), |c| {
         c.node(node).placer.job(id).is_some_and(|j| j.finished)

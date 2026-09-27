@@ -13,6 +13,7 @@
 
 pub mod admin;
 pub mod backup;
+pub mod hfimport;
 pub mod import;
 pub mod logs;
 pub mod placer;

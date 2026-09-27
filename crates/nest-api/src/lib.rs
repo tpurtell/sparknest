@@ -148,6 +148,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/backups/meta", post(meta_snapshot))
         .route("/v1/hf", get(hf_repos))
         .route("/v1/hf/detail", get(hf_detail))
+        .route("/v1/hf/import", post(hf_import))
         .route("/v1/logs", get(logs))
         .route("/v1/space/tree", get(space_tree))
         .route("/v1/web", get(web_info))
@@ -551,6 +552,9 @@ struct ImportReq {
     r#move: bool,
     #[serde(default)]
     seal: Option<SealMode>,
+    /// Copy files that cannot be hard-linked (another filesystem).
+    #[serde(default)]
+    copy: bool,
 }
 
 async fn import(State(api): State<Api>, Json(r): Json<ImportReq>) -> R<serde_json::Value> {
@@ -559,8 +563,36 @@ async fn import(State(api): State<Api>, Json(r): Json<ImportReq>) -> R<serde_jso
         dst: api.ns(&r.dst),
         r#move: r.r#move,
         seal: r.seal.unwrap_or(SealMode::Auto),
+        copy: r.copy,
     };
     Ok(Json(json!({ "job": api.placer.import(opts) })))
+}
+
+#[derive(Deserialize)]
+struct HfImportReq {
+    src: String,
+    #[serde(default)]
+    r#move: bool,
+    /// The `hf` program to finalize with; absent: mirror snapshots offline.
+    hf: Option<String>,
+    #[serde(default = "yes")]
+    copy: bool,
+}
+
+async fn hf_import(State(api): State<Api>, Json(r): Json<HfImportReq>) -> R<serde_json::Value> {
+    let mount_hub = api
+        .mountpoint
+        .as_ref()
+        .map(|m| std::path::Path::new(m).join(api.hub.trim_start_matches('/')));
+    let opts = nest_place::hfimport::HfImportOptions {
+        src: r.src.into(),
+        hub: api.hub.clone(),
+        mount_hub,
+        hf: r.hf.map(Into::into),
+        r#move: r.r#move,
+        copy: r.copy,
+    };
+    Ok(Json(json!({ "job": api.placer.hf_import(opts) })))
 }
 
 async fn cluster(State(api): State<Api>) -> R<serde_json::Value> {
