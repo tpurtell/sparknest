@@ -76,8 +76,14 @@ async function pollOnce() {
   }
 }
 
+let runningIds = new Set<number>();
+
 function apply(status: Status, stores: Store[], jobs: Job[], groups: { name: string; members: string[] }[]) {
   {
+    // A job that just finished changed what views show: refetch them.
+    const running = new Set(jobs.filter((j) => !j.finished).map((j) => j.id));
+    if ([...runningIds].some((id) => !running.has(id))) app.changed++;
+    runningIds = running;
     const now = performance.now();
     const rates: Record<string, Rates> = {};
     for (const n of status.nodes) {

@@ -139,7 +139,9 @@ pub(crate) async fn events(
                     // Debounce: a burst of commits is one notice.
                     tokio::time::sleep(Duration::from_millis(700)).await;
                     while changed_rx.try_recv().is_ok() {}
-                    if tx.send(Event::default().event("changed").data("")).await.is_err() {
+                    // Browsers drop events with empty data (SSE spec): say
+                    // something.
+                    if tx.send(Event::default().event("changed").data("1")).await.is_err() {
                         return;
                     }
                 }
