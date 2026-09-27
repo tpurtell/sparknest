@@ -808,6 +808,16 @@ impl Vfs {
                 }
                 me.fences.lock().remove(&(file, o.epoch));
             };
+            // A stable file must be durable on its holder (ADR-026).
+            let f = o.file.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || f.sync_data())
+                .await
+                .expect("blocking task")
+            {
+                tracing::error!(key = ?o.key, error = %e, "fdatasync before finalize failed");
+                *open = true;
+                return;
+            }
             let (size, mtime) = match me.d.store().stat(o.key) {
                 Ok(s) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -885,8 +895,12 @@ impl Vfs {
                     f.set_len(size)?;
                     Ok(DataResp::Done)
                 }
-                OwnerOp::Fsync => {
-                    f.sync_all()?;
+                OwnerOp::Fsync { data_only } => {
+                    if data_only {
+                        f.sync_data()?;
+                    } else {
+                        f.sync_all()?;
+                    }
                     Ok(DataResp::Done)
                 }
             }
@@ -912,8 +926,9 @@ impl Vfs {
         }
     }
 
-    async fn owner_fsync(&self, file: FileId, epoch: Epoch) -> NestResult<()> {
-        self.owner_mutate(file, epoch, None, OwnerOp::Fsync).await?;
+    async fn owner_fsync(&self, file: FileId, epoch: Epoch, data_only: bool) -> NestResult<()> {
+        self.owner_mutate(file, epoch, None, OwnerOp::Fsync { data_only })
+            .await?;
         let o = self
             .owned
             .lock()
@@ -984,9 +999,14 @@ impl Vfs {
                 self.owner_leave(file, epoch, writer).await;
                 Ok(DataResp::Done)
             }
-            DataReq::Fsync { file, epoch } => {
-                self.owner_fsync(file, epoch).await.map(|_| DataResp::Done)
-            }
+            DataReq::Fsync {
+                file,
+                epoch,
+                data_only,
+            } => self
+                .owner_fsync(file, epoch, data_only)
+                .await
+                .map(|_| DataResp::Done),
             DataReq::Stat { file } => self.serve_stat(file),
             DataReq::Fence {
                 file,
@@ -1261,11 +1281,17 @@ impl Vfs {
         Ok(())
     }
 
-    pub async fn fsync(&self, fh: u64) -> NestResult<()> {
+    /// An application's `fsync` (`data_only`: `fdatasync`). The owner's
+    /// object gets the same call; then the metadata the file depends on is
+    /// made durable on a majority (ADR-026). Stable content was already
+    /// synced when it became stable.
+    pub async fn fsync(&self, fh: u64, data_only: bool) -> NestResult<()> {
         let h = self.handle(fh)?;
         let a = self.raw_attr(h.file)?;
         match (a.gen_state, a.owner) {
-            (GenState::Owned, Some(o)) if o == self.me() => self.owner_fsync(h.file, a.epoch).await,
+            (GenState::Owned, Some(o)) if o == self.me() => {
+                self.owner_fsync(h.file, a.epoch, data_only).await?
+            }
             (GenState::Owned, Some(o)) => {
                 match self
                     .call(
@@ -1273,17 +1299,25 @@ impl Vfs {
                         &DataReq::Fsync {
                             file: h.file,
                             epoch: a.epoch,
+                            data_only,
                         },
                     )
                     .await
                 {
-                    Ok(_) | Err(NestError::Stale) => Ok(()),
-                    Err(e) => Err(e),
+                    // Stale: finalized meanwhile, which syncs the object.
+                    Ok(_) | Err(NestError::Stale) => {}
+                    Err(e) => return Err(e),
                 }
             }
-            // Stable content is already settled.
-            _ => Ok(()),
+            _ => {}
         }
+        self.sync_metadata().await
+    }
+
+    /// Make every namespace change this node has seen durable on a majority
+    /// (`fsync` on a directory, and the tail of a file `fsync`).
+    pub async fn sync_metadata(&self) -> NestResult<()> {
+        self.d.meta().sync_barrier().await
     }
 
     // ------------------------------------------------------------ data
@@ -1640,9 +1674,10 @@ impl Vfs {
                         writer: Some(writer),
                         size: *size,
                     },
-                    OwnerOp::Fsync => DataReq::Fsync {
+                    OwnerOp::Fsync { data_only } => DataReq::Fsync {
                         file: h.file,
                         epoch,
+                        data_only: *data_only,
                     },
                 };
                 let r = self.call(owner, &req).await;
@@ -2160,5 +2195,7 @@ enum OwnerOp {
         data: Vec<u8>,
     },
     Truncate(u64),
-    Fsync,
+    Fsync {
+        data_only: bool,
+    },
 }

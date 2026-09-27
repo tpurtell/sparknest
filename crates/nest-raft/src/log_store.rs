@@ -136,6 +136,16 @@ impl LogStore {
         .map(|v| v.map(|i| i as u64))
     }
 
+    /// The id of the entry at `index`, if the log holds it.
+    pub fn log_id_at(&self, index: u64) -> rusqlite::Result<Option<LogId>> {
+        let c = self.db.lock();
+        let b: Option<Vec<u8>> = c
+            .prepare_cached("SELECT entry FROM log WHERE idx = ?1")?
+            .query_row(params![index as i64], |r| r.get(0))
+            .optional()?;
+        Ok(b.map(|b| dec::<Entry>(&b)).transpose()?.map(|e| e.log_id))
+    }
+
     /// Make every entry appended so far durable (fsync the WAL).
     pub async fn sync(&self) -> io::Result<()> {
         let path = self.path.clone();

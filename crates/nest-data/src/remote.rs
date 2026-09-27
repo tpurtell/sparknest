@@ -50,6 +50,8 @@ pub(crate) enum DataReq {
     Fsync {
         file: FileId,
         epoch: Epoch,
+        /// `fdatasync` rather than `fsync`.
+        data_only: bool,
     },
     /// Live size/mtime of a file this node owns.
     Stat {

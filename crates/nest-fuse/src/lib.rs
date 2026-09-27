@@ -604,12 +604,12 @@ impl Filesystem for Fs {
         _req: &Request,
         _i: INodeNo,
         fh: FileHandle,
-        _datasync: bool,
+        datasync: bool,
         reply: ReplyEmpty,
     ) {
         let vfs = self.vfs.clone();
         self.spawn(async move {
-            match vfs.fsync(fh.0).await {
+            match vfs.fsync(fh.0, datasync).await {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -653,8 +653,15 @@ impl Filesystem for Fs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        // Namespace changes are durable once committed.
-        reply.ok();
+        // Namespace changes commit without an fsync (ADR-026): make them
+        // durable on a majority, as a directory fsync promises.
+        let vfs = self.vfs.clone();
+        self.spawn(async move {
+            match vfs.sync_metadata().await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn statfs(&self, _req: &Request, _i: INodeNo, reply: ReplyStatfs) {

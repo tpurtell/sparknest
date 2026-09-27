@@ -194,3 +194,33 @@ async fn commit_latency_breakdown() {
         }
     }
 }
+
+/// An application's fsync makes the file's metadata durable on a majority:
+/// it succeeds with one of three hosts down and fails, rather than pretend,
+/// when no majority can confirm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn fsync_waits_for_a_durable_majority() {
+    let mut c = ready(3).await;
+    let v1 = c.node(1).vfs.clone();
+    let (_, fh, _) = v1
+        .create(FileId::ROOT, b"f", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    v1.write(fh, 0, vec![1u8; 4096]).await.unwrap();
+    v1.fsync(fh, false).await.unwrap();
+    v1.fsync(fh, true).await.unwrap();
+    v1.sync_metadata().await.unwrap();
+
+    c.stop(3).await;
+    v1.write(fh, 4096, vec![2u8; 4096]).await.unwrap();
+    v1.fsync(fh, false).await.unwrap();
+    v1.release(fh, None).await;
+
+    c.stop(2).await;
+    let t = std::time::Instant::now();
+    assert!(
+        v1.sync_metadata().await.is_err(),
+        "no majority left to confirm"
+    );
+    assert!(t.elapsed() < Duration::from_secs(30));
+}

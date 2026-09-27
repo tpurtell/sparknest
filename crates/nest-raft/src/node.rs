@@ -57,6 +57,8 @@ impl MetaNodeConfig {
 enum MetaReq {
     Propose(Request),
     ReadIndex,
+    /// Make the log durable up to this entry (once it is here).
+    Sync(crate::LogId),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,6 +72,7 @@ enum MetaResp {
     /// Definitely not appended: the leader has lost contact with a quorum.
     NoQuorum,
     Failed(String),
+    Synced,
 }
 
 pub struct MetaNode {
@@ -86,6 +89,9 @@ pub struct MetaNode {
 
 struct MetaService {
     raft: Raft,
+    log: LogStore,
+    /// How long a Sync waits for the entry to arrive.
+    sync_wait: Duration,
     /// A leader that has not heard from a quorum for this long refuses new
     /// writes instead of appending entries that may commit much later.
     lease_ms: u64,
@@ -95,6 +101,8 @@ impl Handler for MetaService {
     fn call(&self, _peer: NodeId, body: Bytes) -> BoxFuture<'static, Result<Bytes, String>> {
         let raft = self.raft.clone();
         let lease_ms = self.lease_ms;
+        let log = self.log.clone();
+        let sync_wait = self.sync_wait;
         async move {
             let req: MetaReq = nest_rpc::decode(&body).map_err(|e| e.to_string())?;
             let stale_leader = {
@@ -131,12 +139,50 @@ impl Handler for MetaService {
                     )) => MetaResp::NotLeader(f.leader_id),
                     Err(e) => MetaResp::Failed(e.to_string()),
                 },
+                MetaReq::Sync(want) => match sync_to(&raft, &log, want, sync_wait).await {
+                    Ok(()) => MetaResp::Synced,
+                    Err(e) => MetaResp::Failed(e),
+                },
             };
             nest_rpc::encode(&resp)
                 .map(Bytes::from)
                 .map_err(|e| e.to_string())
         }
         .boxed()
+    }
+}
+
+/// Wait until the local log holds exactly `want`, then fsync the log.
+async fn sync_to(
+    raft: &Raft,
+    log: &LogStore,
+    want: crate::LogId,
+    wait: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let log2 = log.clone();
+        let here = tokio::task::spawn_blocking(move || log2.log_id_at(want.index()))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if here == Some(want) {
+            return log.sync().await.map_err(|e| e.to_string());
+        }
+        // Not here yet (lagging) or superseded locally by the leader soon:
+        // wait for more log, then look again.
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("entry did not arrive in time".into());
+        }
+        let _ = raft
+            .wait(Some(left.min(Duration::from_millis(100))))
+            .log_index_at_least(Some(want.index()), "sync barrier")
+            .await;
+        if here.is_some() {
+            // Present but different: give the leader a moment to repair it.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -151,6 +197,7 @@ impl MetaNode {
         std::fs::create_dir_all(&cfg.dir)
             .with_context(|| format!("creating {}", cfg.dir.display()))?;
         let log = LogStore::open(&cfg.dir.join("raft.sqlite")).context("opening raft log")?;
+        let log_handle = log.clone();
         let startup_committed = log.persisted_committed()?.unwrap_or(0);
         let sm = StateMachine::open(&cfg.dir, handler).context("opening state machine")?;
         let meta_path = sm.meta_path().to_path_buf();
@@ -182,6 +229,8 @@ impl MetaNode {
             service::META,
             Arc::new(MetaService {
                 raft: raft.clone(),
+                log: log_handle,
+                sync_wait: cfg.propose_deadline,
                 lease_ms: cfg.election_max_ms,
             }),
         );
@@ -393,6 +442,45 @@ impl MetaNode {
             }
             _ => Err(NestError::Io("unexpected meta response".into())),
         }
+    }
+
+    /// Durability barrier (ADR-026): return once a majority of voters have
+    /// fsynced their Raft log up to everything this node has applied. Behind
+    /// an application's fsync, so metadata it depends on survives a full
+    /// power outage even though commits are not fsynced by default.
+    pub async fn sync_barrier(&self) -> Result<(), NestError> {
+        let m = self.metrics();
+        let Some(want) = m.last_applied else {
+            return Ok(());
+        };
+        let voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
+        let need = voters.len() / 2 + 1;
+        let body: Bytes = nest_rpc::encode(&MetaReq::Sync(want))
+            .map_err(|e| NestError::Io(e.to_string()))?
+            .into();
+        let mut calls = futures::stream::FuturesUnordered::new();
+        for v in voters {
+            let (rpc, body) = (self.rpc.clone(), body.clone());
+            self.learn_addr(NodeId(v));
+            let timeout = self.cfg.propose_deadline;
+            calls.push(async move {
+                rpc.call(NodeId(v), service::META, body, timeout)
+                    .await
+                    .ok()
+                    .and_then(|b| nest_rpc::decode::<MetaResp>(&b).ok())
+            });
+        }
+        use futures::StreamExt;
+        let mut acks = 0;
+        while let Some(r) = calls.next().await {
+            if matches!(r, Some(MetaResp::Synced)) {
+                acks += 1;
+                if acks >= need {
+                    return Ok(());
+                }
+            }
+        }
+        Err(NestError::NoQuorum)
     }
 
     /// Linearizable read barrier: after this returns, the local database
