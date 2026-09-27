@@ -13,6 +13,10 @@ try {
 }
 
 export const hasToken = () => token !== "";
+/** A link that downloads `path` (a file, or a directory as .tar). */
+export const downloadUrl = (path: string) =>
+  `/v1/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(token)}`;
+export const authHeader = () => "Bearer " + token;
 export function setToken(t: string) {
   token = t.trim();
   try {
@@ -108,6 +112,7 @@ export interface Job {
   started_ms: number;
   finished_ms?: number;
   cancelled?: boolean;
+  notes?: string[];
 }
 export interface Readiness {
   host: string;

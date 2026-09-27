@@ -38,6 +38,9 @@
           </div>
         {/each}
       </div>
+      {#if j.notes?.length}
+        <div class="notes">{#each j.notes as n}<div class="small" class:bad={/: failed/.test(n)}>{n}</div>{/each}</div>
+      {/if}
       {#if total}<div class="tiny muted mono">{human(done)} of {human(total)}</div>{/if}
     </div>
   {:else}
@@ -55,4 +58,6 @@
   .hosts { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
   .h { display: flex; flex-direction: column; gap: 5px; }
   .fail { color: #ffb3c5; word-break: break-all; }
+  .notes { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; border-left: 2px solid var(--line-hi); }
+  .notes .bad { color: #ffb3c5; }
 </style>

@@ -7,6 +7,7 @@
   import Toasts from "./components/Toasts.svelte";
   import ContextMenu from "./components/ContextMenu.svelte";
   import Dialog from "./components/Dialog.svelte";
+  import UploadTray from "./components/UploadTray.svelte";
   import Login from "./components/Login.svelte";
   import Overview from "./views/Overview.svelte";
   import Models from "./views/Models.svelte";
@@ -114,6 +115,7 @@
   </div>
 {/if}
 <Toasts />
+<UploadTray />
 <ContextMenu />
 <Dialog />
 

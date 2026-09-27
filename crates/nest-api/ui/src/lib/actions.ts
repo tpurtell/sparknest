@@ -5,6 +5,7 @@ import { post, api, type TreeNode } from "./api";
 import { app, startJob, targets, toast, go, poll } from "./state.svelte";
 import { confirm, pick, openMenu, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
+import { download, remove as deletePath } from "./files.svelte";
 
 export async function copyTo(selector: string, hosts?: string[]) {
   const to =
@@ -99,6 +100,14 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
   );
   if (isHost) items.push({ label: `Remove from ${scope}`, icon: "trash", danger: true, run: () => removeFrom(sel, [scope!]) });
   items.push({ label: "Remove from…", icon: "trash", danger: true, run: () => removeFrom(sel) });
-  if (n.path) items.push({ sep: true, label: "" }, { label: "Show in files", icon: "files", run: () => go("files", n.path!) });
+  if (n.path) {
+    const dir = n.kind === "dir" || n.kind === "group";
+    items.push(
+      { sep: true, label: "" },
+      { label: dir ? "Download as .tar" : "Download", icon: "up", run: () => download(n.path!) },
+      { label: "Show in files", icon: "files", run: () => go("files", n.kind === "file" ? n.path!.slice(0, n.path!.lastIndexOf("/")) || "/" : n.path!) },
+      { label: "Delete everywhere…", icon: "trash", danger: true, run: () => deletePath(n.path!, n.kind !== "file") },
+    );
+  }
   openMenu(x, y, n.name, sub, items);
 }

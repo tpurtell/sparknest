@@ -5,6 +5,8 @@
 //! Paths in requests are namespace paths ("/hub/...") or paths under this
 //! node's mountpoint, which are translated.
 
+mod transfer;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -51,7 +53,7 @@ pub fn web_token(secret: &[u8]) -> String {
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl From<NestError> for ApiError {
     fn from(e: NestError) -> Self {
@@ -76,15 +78,15 @@ impl IntoResponse for ApiError {
     }
 }
 
-type R<T> = Result<Json<T>, ApiError>;
+pub(crate) type R<T> = Result<Json<T>, ApiError>;
 
-fn bad(msg: impl Into<String>) -> ApiError {
+pub(crate) fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
 impl Api {
     /// Namespace path for a namespace path or a path under our mountpoint.
-    fn ns(&self, p: &str) -> String {
+    pub(crate) fn ns(&self, p: &str) -> String {
         if let Some(mp) = &self.mountpoint {
             let mp = mp.trim_end_matches('/');
             if let Some(rest) = p.strip_prefix(mp)
@@ -109,7 +111,7 @@ impl Api {
         Selector::parse(&s, &self.hub).map_err(bad)
     }
 
-    fn conn(&self) -> Result<rusqlite::Connection, ApiError> {
+    pub(crate) fn conn(&self) -> Result<rusqlite::Connection, ApiError> {
         self.vfs
             .data()
             .meta()
@@ -151,6 +153,12 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf/import", post(hf_import))
         .route("/v1/logs", get(logs))
         .route("/v1/space/tree", get(space_tree))
+        .route("/v1/download", get(transfer::download))
+        .route(
+            "/v1/upload",
+            put(transfer::upload).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/v1/mkdir", post(transfer::mkdir))
         .route("/v1/web", get(web_info))
         .route("/v1/cluster", get(cluster))
         .route("/v1/cluster/remove", post(cluster_remove))
@@ -170,7 +178,13 @@ pub async fn serve_tcp(api: Api, addr: std::net::SocketAddr) -> anyhow::Result<(
                     .headers()
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v.strip_prefix("Bearer ").is_some_and(|t| t == token));
+                    .is_some_and(|v| v.strip_prefix("Bearer ").is_some_and(|t| t == token))
+                    // A download is a plain link, which cannot send a
+                    // header: it may carry the token in its query.
+                    || (req.uri().path() == "/v1/download"
+                        && req.uri().query().is_some_and(|q| {
+                            q.split('&').any(|kv| kv.strip_prefix("token=") == Some(token.as_str()))
+                        }));
                 if ok {
                     next.run(req).await
                 } else {
