@@ -99,10 +99,25 @@ pub struct FabricSection {
     /// Optional verbs device / netdev / address filter (e.g. `["mlx5_0"]`).
     #[serde(default)]
     pub devices: Vec<String>,
-    /// Remote chunk reads outstanding at once from this host (the incast
-    /// cap; 4 MiB each). 0: the built-in default.
+    /// Deprecated: the incast cap as a count of 4 MiB chunks (read as
+    /// `inflight_mib = 4 × max_inflight`). 0: unset.
     #[serde(default)]
     pub max_inflight: u32,
+    /// Remote reads outstanding at once from this host, MiB (the incast
+    /// cap). 0: 2 ms of this host's links, at least 64 MiB.
+    #[serde(default)]
+    pub inflight_mib: u64,
+}
+
+impl FabricSection {
+    /// The incast cap in bytes (0: the fabric's default).
+    pub fn inflight_bytes(&self) -> u64 {
+        match (self.inflight_mib, self.max_inflight) {
+            (0, 0) => 0,
+            (0, n) => n as u64 * (4 << 20),
+            (m, _) => m << 20,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

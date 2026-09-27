@@ -340,12 +340,7 @@ impl Vfs {
 
     /// This host's RDMA link rate, bytes/s (0 without a fabric).
     pub fn link_bps(&self) -> u64 {
-        self.fabric()
-            .map(|f| {
-                let devs: Vec<String> = f.rails().iter().map(|r| r.ibdev.clone()).collect();
-                crate::diskprobe::link_bytes_per_s(&devs)
-            })
-            .unwrap_or(0)
+        self.fabric().map_or(0, |f| f.link_bytes_per_s())
     }
 
     /// The copies a STABLE generation can be read from, when there are

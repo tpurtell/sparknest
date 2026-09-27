@@ -4,19 +4,23 @@
 //! Read protocol (all on RC queue pairs; TCP only sets links up):
 //! ```text
 //! client                                            server
-//!   acquire landing slot (remote-writable pool)
+//!   take bytes from the in-flight budget
+//!   acquire landing slot (smallest tier that fits; remote-writable)
 //!   SEND ReadReq{slot, file, gen, off, len, addr, rkey}  ->
-//!                                        acquire staging slot
-//!                                        source.read_into(staging) (checks generation)
-//!                 <- RDMA WRITE_WITH_IMM(staging -> addr), imm = slot<<23 | len
+//!                                        acquire staging slot (tiered too)
+//!                                        small: source.try_read_now, right here
+//!                                        else:  source.read_into (checks generation)
+//!                 <- RDMA WRITE_WITH_IMM(staging -> addr), imm = slot id
+//!                    (the length is the completion's byte count)
 //!                 <- or SEND ReadErr{slot, code}
 //!   complete the waiter for (device, slot)
 //! ```
 //! Each lane's receive ring absorbs requests, error replies and
 //! write-with-imm notifications; a per-lane window keeps a node's requests
-//! plus its responses within the peer's ring.
+//! plus its responses within the peer's ring. Links are made only between
+//! hosts speaking the same `PROTOCOL` (ADR-032); otherwise reads use TCP.
 
-use crate::pool::{Pool, Slot};
+use crate::pool::{Slot, Tiers};
 use crate::rail::Rail;
 use crate::sys::{self, nf_wc};
 use crate::verbs::{Context, Cq, Qp, QpInfo, Region};
@@ -32,21 +36,34 @@ use tokio::sync::{Semaphore, oneshot};
 
 #[derive(Clone, Debug)]
 pub struct FabricConfig {
-    /// Largest single read; also the slot size of both pools.
+    /// Largest single read; also the slot size of the largest tier.
     pub chunk: usize,
-    /// Landing slots per device (registered for remote write).
+    /// Landing slots per device (registered for remote write) of `chunk`.
     pub client_slots: u32,
-    /// Staging slots per device.
+    /// Staging slots per device of `chunk`.
     pub server_slots: u32,
+    /// Smaller slot tiers for small reads (page faults, lookup rows, kernel
+    /// requests), below `chunk`.
+    pub small_tiers: Vec<Tier>,
     /// Outstanding requests per lane (per direction).
     pub window: u32,
-    /// Remote reads this host has outstanding at once, over all peers: the
-    /// incast cap. Many hosts answering one reader at the same moment
-    /// overflow switch buffers, and every dropped packet then costs a
-    /// retransmit timeout (the fabric is lossy without PFC).
-    pub max_inflight: u32,
+    /// Bytes of remote reads this host has outstanding at once, over all
+    /// peers: the incast cap (0: 2 ms of this host's links, at least
+    /// 64 MiB). Many hosts answering one reader at the same moment overflow
+    /// switch buffers, and every dropped packet then costs a retransmit
+    /// timeout (the fabric is lossy without PFC). Counted in bytes: a page
+    /// read costs a thousandth of a chunk.
+    pub inflight_bytes: u64,
     /// Optional device/netdev/address filter.
     pub devices: Vec<String>,
+}
+
+/// A slot tier: its size, and landing and staging slots per device.
+#[derive(Clone, Copy, Debug)]
+pub struct Tier {
+    pub size: usize,
+    pub landing: u32,
+    pub staging: u32,
 }
 
 impl Default for FabricConfig {
@@ -55,12 +72,28 @@ impl Default for FabricConfig {
             chunk: 4 << 20,
             client_slots: 128,
             server_slots: 64,
-            window: 32,
-            max_inflight: 16,
+            small_tiers: vec![
+                Tier {
+                    size: 4 << 10,
+                    landing: 2048,
+                    staging: 1024,
+                },
+                Tier {
+                    size: 128 << 10,
+                    landing: 512,
+                    staging: 256,
+                },
+            ],
+            window: 128,
+            inflight_bytes: 0,
             devices: Vec::new(),
         }
     }
 }
+
+/// The read protocol links speak; hosts pair only with the same one.
+/// 2: imm carries the whole slot id, the length is the completion's count.
+const PROTOCOL: u32 = 2;
 
 /// Supplies file bytes for requests this node serves. Implemented by the
 /// data service so generation fencing and serving rules stay in one place.
@@ -114,10 +147,12 @@ const RING_SLOT: usize = 128;
 const KIND_READ: u8 = 1;
 const KIND_ERR: u8 = 2;
 
-const IMM_LEN_BITS: u32 = 23;
 /// Reads up to this size may be served on the completion thread
-/// (`ReadSource::try_read_now`); larger ones go to the async path.
-const FAST_SERVE_MAX: usize = 64 << 10;
+/// (`ReadSource::try_read_now`); larger ones go to the async path. The
+/// largest FUSE request is 128 KiB.
+const FAST_SERVE_MAX: usize = 128 << 10;
+/// Unit of the in-flight byte budget.
+const BUDGET_UNIT: usize = 4 << 10;
 
 fn err_code(e: &NestError) -> u8 {
     match e {
@@ -194,8 +229,8 @@ struct Device {
     id: u32,
     ctx: Arc<Context>,
     cq: Arc<Cq>,
-    landing: Arc<Pool>,
-    staging: Arc<Pool>,
+    landing: Tiers,
+    staging: Tiers,
     mtu: u32,
 }
 
@@ -249,8 +284,14 @@ struct LaneOffer {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum FabricReq {
-    /// Here are my rails with a fresh QP on each; pair by subnet.
+    /// Here are my rails with a fresh QP on each; pair by subnet. (Protocol
+    /// 1: refused now.)
     Connect { lanes: Vec<LaneOffer> },
+    /// The same, speaking read protocol `protocol`.
+    ConnectV {
+        lanes: Vec<LaneOffer>,
+        protocol: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -278,8 +319,10 @@ pub struct Fabric {
     source: Mutex<Option<Weak<dyn ReadSource>>>,
     rt: tokio::runtime::Handle,
     stop: Arc<AtomicBool>,
-    /// The incast cap (`max_inflight` permits).
+    /// The incast cap, in `BUDGET_UNIT`s of bytes.
     inflight: Arc<Semaphore>,
+    /// This host's links, bytes per second.
+    link_bps: u64,
     pub stats: Stats,
 }
 
@@ -314,7 +357,6 @@ impl Fabric {
         if rails.is_empty() {
             return Ok(None);
         }
-        assert!(cfg.chunk < (1 << IMM_LEN_BITS) && cfg.client_slots < (1 << (32 - IMM_LEN_BITS)));
         let mut devices: Vec<Arc<Device>> = Vec::new();
         for r in &rails {
             if devices.iter().any(|d| d.ctx.name == r.ibdev) {
@@ -322,9 +364,27 @@ impl Fabric {
             }
             let ctx = Context::open(&r.ibdev)?;
             let (_, mtu) = ctx.port(r.port)?;
-            let cq = Cq::new(&ctx, 16384, true)?;
-            let landing = Pool::new(&ctx, cfg.client_slots, cfg.chunk, true)?;
-            let staging = Pool::new(&ctx, cfg.server_slots, cfg.chunk, false)?;
+            // Every lane's sends and receives complete here: sized for a
+            // few dozen peers at the full window.
+            let cq = Cq::new(&ctx, 65536, true)?;
+            let small = cfg.small_tiers.iter().filter(|t| t.size < cfg.chunk);
+            let landing = Tiers::new(
+                &ctx,
+                &small
+                    .clone()
+                    .map(|t| (t.size, t.landing))
+                    .chain([(cfg.chunk, cfg.client_slots)])
+                    .collect::<Vec<_>>(),
+                true,
+            )?;
+            let staging = Tiers::new(
+                &ctx,
+                &small
+                    .map(|t| (t.size, t.staging))
+                    .chain([(cfg.chunk, cfg.server_slots)])
+                    .collect::<Vec<_>>(),
+                false,
+            )?;
             devices.push(Arc::new(Device {
                 id: devices.len() as u32,
                 ctx,
@@ -335,7 +395,16 @@ impl Fabric {
             }));
         }
         let _ = me;
-        let max_inflight = cfg.max_inflight.max(1) as usize;
+        let link = link_bytes_per_s(&rails);
+        let budget = match cfg.inflight_bytes {
+            0 => (link / 500).max(64 << 20),
+            b => b.max(cfg.chunk as u64),
+        };
+        tracing::info!(
+            link_gbit = link * 8 / 1_000_000_000,
+            inflight_mib = budget >> 20,
+            "fabric read budget"
+        );
         let fabric = Arc::new(Fabric {
             cfg,
             rails,
@@ -350,7 +419,8 @@ impl Fabric {
             source: Mutex::new(None),
             rt: tokio::runtime::Handle::current(),
             stop: Arc::new(AtomicBool::new(false)),
-            inflight: Arc::new(Semaphore::new(max_inflight)),
+            inflight: Arc::new(Semaphore::new((budget / BUDGET_UNIT as u64) as usize)),
+            link_bps: link,
             stats: Stats::default(),
         });
         for d in &fabric.devices {
@@ -397,16 +467,22 @@ impl Fabric {
         self.cfg.chunk
     }
 
-    /// Landing slots free on the tightest device: speculative readahead only
-    /// uses spare slots so demanded reads always find one.
+    /// This host's RDMA links, bytes per second (the rails' ports summed).
+    pub fn link_bytes_per_s(&self) -> u64 {
+        self.link_bps
+    }
+
+    /// Chunk-sized landing slots free on the tightest device: speculative
+    /// readahead only uses spare slots so demanded reads always find one.
     pub fn spare_landing(&self) -> usize {
         self.devices
             .iter()
-            .map(|d| d.landing.available())
+            .map(|d| d.landing.big().available())
             .min()
             .unwrap_or(0)
     }
 
+    /// Chunk-sized landing slots per device.
     pub fn landing_slots(&self) -> usize {
         self.cfg.client_slots as usize
     }
@@ -473,7 +549,19 @@ impl Fabric {
 
     /// Server side of link setup: pair offered rails with ours by subnet.
     fn accept(&self, peer: NodeId, req: FabricReq) -> FabricResp {
-        let FabricReq::Connect { lanes } = req;
+        let lanes = match req {
+            FabricReq::ConnectV { lanes, protocol } if protocol == PROTOCOL => lanes,
+            FabricReq::ConnectV { protocol, .. } => {
+                return FabricResp::Refused(format!(
+                    "read protocol {protocol} (this host speaks {PROTOCOL})"
+                ));
+            }
+            FabricReq::Connect { .. } => {
+                return FabricResp::Refused(format!(
+                    "read protocol 1 (this host speaks {PROTOCOL})"
+                ));
+            }
+        };
         let mut pairs = Vec::new();
         let mut made = Vec::new();
         for (i, offer) in lanes.iter().enumerate() {
@@ -544,8 +632,11 @@ impl Fabric {
             lanes.push(lane);
             psns.push(psn);
         }
-        let body = nest_rpc::encode(&FabricReq::Connect { lanes: offers })
-            .map_err(|e| NestError::Io(e.to_string()))?;
+        let body = nest_rpc::encode(&FabricReq::ConnectV {
+            lanes: offers,
+            protocol: PROTOCOL,
+        })
+        .map_err(|e| NestError::Io(e.to_string()))?;
         let resp = self
             .rpc
             .call(
@@ -610,13 +701,13 @@ impl Fabric {
             [link.next.fetch_add(1, Ordering::Relaxed) as usize % link.lanes.len()]
         .clone();
         let t0 = std::time::Instant::now();
-        // The incast cap: held until the answer (or failure) arrives.
+        // The incast cap, in bytes: held until the answer (or failure).
         let _cap = self
             .inflight
-            .acquire()
+            .acquire_many(len.div_ceil(BUDGET_UNIT).max(1) as u32)
             .await
             .map_err(|_| NestError::Unavailable("fabric stopped".into()))?;
-        let slot = lane.dev.landing.acquire().await;
+        let slot = lane.dev.landing.acquire(len).await;
         let t1 = std::time::Instant::now();
         let _permit = lane
             .window
@@ -634,10 +725,10 @@ impl Fabric {
             return Err(NestError::Unavailable("RDMA link failed".into()));
         }
         let (tx, rx) = oneshot::channel();
-        let key = (lane.dev.id, slot.index());
+        let key = (lane.dev.id, slot.id());
         let mut msg = [0u8; MSG_SIZE];
         ReadReq {
-            slot: slot.index(),
+            slot: slot.id(),
             file: file.0,
             generation: generation.0,
             offset,
@@ -741,8 +832,8 @@ impl Fabric {
         }
         match (kind, wc.opcode) {
             (WR_RING, sys::NF_OP_RECV_IMM) => {
-                let slot = wc.imm >> IMM_LEN_BITS;
-                let len = (wc.imm & ((1 << IMM_LEN_BITS) - 1)) as usize;
+                let slot = wc.imm;
+                let len = wc.byte_len as usize;
                 let w = self.pending.lock().remove(&(dev.id, slot));
                 if let Some(w) = w {
                     w.complete(len);
@@ -788,7 +879,7 @@ impl Fabric {
         let mut spare = None;
         if len <= FAST_SERVE_MAX
             && let Some(src) = self.source.lock().as_ref().and_then(|w| w.upgrade())
-            && let Some(mut slot) = lane.dev.staging.try_acquire()
+            && let Some(mut slot) = lane.dev.staging.try_acquire(len)
         {
             let t = std::time::Instant::now();
             match src.try_read_now(
@@ -817,7 +908,7 @@ impl Fabric {
                     let t0 = std::time::Instant::now();
                     let slot = match spare {
                         Some(s) => s,
-                        None => lane.dev.staging.acquire().await,
+                        None => lane.dev.staging.acquire(len).await,
                     };
                     let t1 = std::time::Instant::now();
                     let (slot, r) = src
@@ -847,10 +938,10 @@ impl Fabric {
     fn answer(&self, lane: &Arc<Lane>, req: &ReadReq, result: Result<(Slot, usize), NestError>) {
         match result {
             Ok((slot, n)) => {
-                let id = wr(WR_WRITE, lane.id, slot.index());
+                let id = wr(WR_WRITE, lane.id, slot.id());
                 let (ptr, lkey) = (slot.ptr(), slot.lkey());
                 self.in_flight.lock().insert(id, slot);
-                let imm = (req.slot << IMM_LEN_BITS) | n as u32;
+                let imm = req.slot;
                 // SAFETY: the staging slot stays alive in `in_flight`
                 // until this write completes; the remote range is the
                 // landing slot the client named for this request.
@@ -937,4 +1028,15 @@ fn poller(weak: Weak<Fabric>, dev: Arc<Device>, stop: Arc<AtomicBool>) {
         }
         idle_spins = 0;
     }
+}
+
+/// The rails' links in bytes per second: each device port once (a port
+/// carrying two subnets is two rails but one link).
+fn link_bytes_per_s(rails: &[Rail]) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    rails
+        .iter()
+        .filter(|r| seen.insert((r.ibdev.clone(), r.port)))
+        .map(|r| r.rate_gbps as u64 * 1_000_000_000 / 8)
+        .sum()
 }

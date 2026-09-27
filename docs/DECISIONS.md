@@ -813,3 +813,43 @@ application's advice (FUSE has no channel for it); per-host memory only
 **Consequences.** One metadata write per file when first judged. The
 kernel's own read-around still applies to mapped files opened without
 MADV_RANDOM; only passthrough avoids FUSE for those entirely.
+
+## ADR-032 — Fabric reads: size tiers, a byte budget, small reads served inline (2026-09-27)
+
+**Context.** Engram rows over the network (ADR-031, a model's lookup
+tables read from other hosts) came back in ~650 µs for 4 KiB. The serving
+host spent ~400 µs per request: a task, a blocking-pool hop (each a thread
+wake from the Sparks' deep idle states), two metadata queries, a stat and
+an open per request. The reader waited ~400 µs more for one of 16 reads in
+flight, a count sized for 4 MiB chunks. Every read, however small, held a
+4 MiB slot at each end, and a lane allowed 32 outstanding requests. The
+reply's immediate packed slot (9 bits) and length (23 bits), so slots were
+capped at 512 per device. raptor's link rate was also counted twice (one
+400 Gb/s port carrying two subnets is two rails, one link).
+
+**Decision.**
+- Landing and staging slots come in tiers per device: 4 KiB (2048 / 1024),
+  128 KiB (512 / 256) and the 4 MiB chunk (128 / 64). A read takes the
+  smallest tier it fits, or a larger free one. The small tiers add
+  ~108 MiB registered per device.
+- The immediate carries the whole slot id; the length is the completion's
+  byte count. Hosts pair only when they speak the same read protocol (a new
+  `ConnectV { protocol }` request, protocol 2); during a rolling upgrade
+  mismatched hosts fall back to TCP rather than misread replies.
+- The incast cap counts bytes, in 4 KiB units: by default 2 ms of the
+  host's link rate, at least 64 MiB (`[fabric] inflight_mib`; the old
+  `max_inflight` is read as that many 4 MiB chunks). The per-lane window
+  is 128 (was 32); the completion queue holds 65536 entries.
+- A server answers reads up to 128 KiB on the fabric's completion thread
+  when the object is already open (`ReadSource::try_read_now`): one pread
+  into a staging slot and the RDMA write, no hops. Served objects of STABLE
+  generations stay open, fully re-checked every 2 s and against the lease
+  and fences on every read; other reads take the async path, which opens
+  them.
+- Link rate counts each device port once.
+
+**Consequences.** Rows and page faults no longer compete with bulk reads
+for slots or the in-flight cap. A cold small read can stall a completion
+thread for about one disk read (~0.1–0.2 ms); if that shows under load,
+serve page-cache hits inline (RWF_NOWAIT) and send misses to the pool.
+Tier sizes and the budget are starting points, to be tuned by benchmark.

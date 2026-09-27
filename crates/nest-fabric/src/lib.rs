@@ -15,6 +15,6 @@ pub use sys::{
 };
 pub mod verbs;
 
-pub use engine::{Fabric, FabricConfig, ReadBuf, ReadSource, Stats};
-pub use pool::{Pool, Slot};
+pub use engine::{Fabric, FabricConfig, ReadBuf, ReadSource, Stats, Tier};
+pub use pool::{Pool, Slot, Tiers};
 pub use rail::{Rail, discover};

@@ -219,9 +219,7 @@ impl Node {
             (mode, Some(fc)) => {
                 let mut fc = fc.clone();
                 fc.devices = cfg.fabric.devices.clone();
-                if cfg.fabric.max_inflight > 0 {
-                    fc.max_inflight = cfg.fabric.max_inflight;
-                }
+                fc.inflight_bytes = cfg.fabric.inflight_bytes();
                 match nest_fabric::Fabric::start(id, fc, rpc.clone()) {
                     Ok(Some(f)) => {
                         vfs.attach_fabric(f.clone());
@@ -252,9 +250,7 @@ impl Node {
             let (slot, rpc2, vfs2) = (Arc::downgrade(&fabric), rpc.clone(), vfs.clone());
             let mut fc = tuning.fabric.clone().expect("checked");
             fc.devices = cfg.fabric.devices.clone();
-            if cfg.fabric.max_inflight > 0 {
-                fc.max_inflight = cfg.fabric.max_inflight;
-            }
+            fc.inflight_bytes = cfg.fabric.inflight_bytes();
             tokio::spawn(async move {
                 for _ in 0..40 {
                     tokio::time::sleep(Duration::from_secs(15)).await;

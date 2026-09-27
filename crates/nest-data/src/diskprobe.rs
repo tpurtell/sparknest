@@ -102,20 +102,3 @@ pub fn measure(store: &nest_store::ObjectStore) -> Option<u64> {
     let bytes = read.into_inner();
     (bytes >= 64 << 20 && secs > 0.0).then(|| (bytes as f64 / secs) as u64)
 }
-
-/// This host's RDMA links, in bytes per second (sum of the rails in use),
-/// from sysfs (`/sys/class/infiniband/<dev>/ports/1/rate`, "200 Gb/sec").
-pub fn link_bytes_per_s(devices: &[String]) -> u64 {
-    devices
-        .iter()
-        .filter_map(|d| {
-            std::fs::read_to_string(format!("/sys/class/infiniband/{d}/ports/1/rate")).ok()
-        })
-        .filter_map(|r| {
-            r.split_whitespace()
-                .next()
-                .and_then(|g| g.parse::<f64>().ok())
-        })
-        .map(|gbit| (gbit * 1e9 / 8.0) as u64)
-        .sum()
-}
