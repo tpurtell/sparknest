@@ -3,7 +3,6 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-
 ## 2026-09-27 — Usage, goal-based plans, space treemaps, hf import, a new UI
 
 - **Usage statistics (ADR-028).** Every host records per file and day:

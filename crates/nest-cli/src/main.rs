@@ -42,8 +42,10 @@ enum Cmd {
         #[arg(long)]
         unseal: bool,
     },
-    /// Remove files or trees in bulk: many entries per metadata commit,
-    /// far faster than `rm -r` through the mount.
+    /// Remove files or trees in bulk (far faster than `rm -r` through the mount)
+    ///
+    /// Many entries go into each metadata commit: tens of thousands of
+    /// entries a second, against a few hundred through the mount.
     Rm {
         #[arg(required = true)]
         paths: Vec<String>,
@@ -53,8 +55,10 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Wait until this host serves and its mount is up (for services that
-    /// depend on it, e.g. `ExecStartPre=nest wait-ready`).
+    /// Wait until this host serves and its mount is up
+    ///
+    /// For services that depend on sparknest, e.g. in a systemd unit:
+    /// `ExecStartPre=nest wait-ready`.
     WaitReady {
         /// Give up after this many seconds (0: wait forever).
         #[arg(long, default_value_t = 0)]
@@ -77,7 +81,9 @@ enum Cmd {
         policy: String,
     },
     /// Which hosts hold a complete copy of a selection
-    /// (a path, or hf:org/name[@revision]).
+    ///
+    /// A selection is a path, or hf:org/name[@revision] (hf-dataset: for
+    /// datasets).
     Where {
         selector: String,
         #[arg(long, value_delimiter = ',')]
@@ -90,6 +96,7 @@ enum Cmd {
         hosts: Vec<String>,
         #[arg(long, default_value_t = 8)]
         parallel: usize,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
@@ -104,10 +111,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RuleCmd,
     },
-    /// Plan (and apply) changes toward a goal:
-    ///   make room:  nest plan --free raptor=800GiB --free @sparks=400GiB --to nas
-    ///   tidy:       nest plan --tidy 7d [--host dodo] [--to nas]
-    ///   speed up:   nest plan --speedup 7d [--min 1GiB] [--keep-free 200GiB]
+    /// Plan changes toward a goal: make room, tidy up, or speed up
+    ///
+    /// A plan only proposes and says why for every file; `nest plan apply
+    /// ID` carries it out. Rule-required copies and the last copy of a file
+    /// are never removed.
+    #[command(after_long_help = PLAN_EXAMPLES)]
     Plan {
         #[command(subcommand)]
         cmd: Option<PlanCmd>,
@@ -156,6 +165,7 @@ enum Cmd {
         store: String,
         #[arg(long, default_value_t = 8)]
         parallel: usize,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
@@ -167,6 +177,7 @@ enum Cmd {
     /// Converge rules (all, or one by name).
     Reconcile {
         name: Option<String>,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
@@ -188,6 +199,7 @@ enum Cmd {
     /// List jobs, or show one.
     Jobs {
         id: Option<u64>,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
         /// Cancel job ID: files not yet started are skipped, nothing is
@@ -195,15 +207,17 @@ enum Cmd {
         #[arg(long, requires = "id")]
         cancel: bool,
     },
-    /// Hugging Face caches.
+    /// Hugging Face caches (import)
     Hf {
         #[command(subcommand)]
         cmd: HfCmd,
     },
-    /// Import a local directory into the namespace without copying (hard
-    /// links into this node's store; same filesystem, or --copy).
-    /// A relative DST is inside sparknest: `nest import ~/models models`
-    /// creates /models. For Hugging Face caches use `nest hf import`.
+    /// Import a local directory without copying (hard links into the store)
+    ///
+    /// The source must be on the same filesystem as this node's store, or
+    /// pass --copy. A relative DST is inside sparknest. For Hugging Face
+    /// caches use `nest hf import`, which also finalizes each model.
+    #[command(after_long_help = IMPORT_EXAMPLES)]
     Import {
         src: PathBuf,
         dst: String,
@@ -217,23 +231,57 @@ enum Cmd {
         /// hard-link, which moves no data).
         #[arg(long)]
         copy: bool,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
 }
 
+const PLAN_EXAMPLES: &str = "\
+Examples:
+  Make room; sole copies may go to the nas archive:
+    nest plan --free raptor=800GiB --free @sparks=400GiB --to nas
+  Tidy copies nobody opened on their host for a week:
+    nest plan --tidy 7d
+    nest plan --tidy 1m --host dodo --to nas
+  Copy what hosts keep pulling over the network:
+    nest plan --speedup 7d
+    nest plan --speedup 7d --min 4GiB --keep-free 200GiB
+  Carry out a plan:
+    nest plan apply 1234567 --wait";
+
+const IMPORT_EXAMPLES: &str = "\
+Examples:
+  A directory on the store's filesystem, into /datasets/imagenet:
+    nest import ~/data/imagenet datasets/imagenet
+  From a NAS mount, copying, and deleting the source afterwards:
+    nest import /mnt/nas/corpus corpora --copy --move --wait";
+
+const HF_IMPORT_EXAMPLES: &str = "\
+Examples:
+  The default cache, leaving it in place:
+    nest hf import ~/.cache/huggingface --wait
+  Another disk's cache, moved (the old directory becomes a link):
+    nest hf import /mnt/scratch/hf_cache --move --wait
+  One model, without asking the Hub:
+    nest hf import ~/hf/hub/models--Qwen--Qwen3-8B --offline";
+
 #[derive(Subcommand, Debug)]
 enum HfCmd {
-    /// Bring an existing Hugging Face cache into sparknest's hub, in the
-    /// form huggingface_hub writes: blobs are hard-linked (or copied from
-    /// another filesystem) to where hf looks, then `hf download` finishes
-    /// each snapshot (fetching only what the source never finished) or,
-    /// offline, the source's snapshot links are mirrored. Every file is
-    /// verified. Sources are left alone unless --move.
+    /// Bring an existing Hugging Face cache into sparknest's hub
     ///
-    /// SRC: a hub cache (models--* inside), an HF_HOME (hub/ inside), or
+    /// Blobs are hard-linked (or copied from another filesystem) to where
+    /// huggingface_hub looks, then `hf download` finishes each snapshot,
+    /// fetching only what the source never finished; offline (or when the
+    /// Hub refuses), the source's snapshot links are mirrored. Refs are
+    /// copied and every file is verified. The source is left alone unless
+    /// --move.
+    ///
+    /// SRC is a hub cache (models--* inside), an HF_HOME (hub/ inside), or
     /// one models--org--name directory.
+    #[command(after_long_help = HF_IMPORT_EXAMPLES)]
     Import {
+        /// A hub cache, an HF_HOME, or one models--org--name directory.
         src: PathBuf,
         /// After verifying, remove the source and leave a symlink to
         /// sparknest's hub in its place (the whole cache when every repo
@@ -246,6 +294,7 @@ enum HfCmd {
         /// Only hard-link: fail files on another filesystem than the store.
         #[arg(long)]
         no_copy: bool,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
@@ -256,6 +305,7 @@ enum PlanCmd {
     /// Execute a proposed plan.
     Apply {
         id: u64,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
@@ -319,6 +369,7 @@ enum BackupCmd {
         name: String,
         #[arg(long)]
         store: String,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
@@ -327,6 +378,7 @@ enum BackupCmd {
     Restore {
         id: u64,
         dst: String,
+        /// Follow progress until the job finishes.
         #[arg(long)]
         wait: bool,
     },
