@@ -46,13 +46,29 @@ pub struct Archive {
     pub config: ArchiveConfig,
     pub identity: String,
     pub store: Arc<ObjectStore>,
+    /// Last marker check: (when, result).
+    checked: parking_lot::Mutex<Option<(std::time::Instant, bool)>>,
 }
 
 impl Archive {
     /// Healthy means the marker is present: never read from or write into an
-    /// unmounted share's empty mountpoint.
+    /// unmounted share's empty mountpoint. Checked at most every few
+    /// seconds: this runs on the metadata apply path, and reading the marker
+    /// on a saturated disk once stalled raptor's applies for minutes.
     pub fn healthy(&self) -> bool {
-        nest_store::marker_ok(std::path::Path::new(&self.config.path), &self.identity)
+        if let Some((at, ok)) = *self.checked.lock()
+            && at.elapsed() < std::time::Duration::from_secs(5)
+        {
+            return ok;
+        }
+        self.healthy_now()
+    }
+
+    /// The marker read now (explicit health checks: `nest store ls`).
+    pub fn healthy_now(&self) -> bool {
+        let ok = nest_store::marker_ok(std::path::Path::new(&self.config.path), &self.identity);
+        *self.checked.lock() = Some((std::time::Instant::now(), ok));
+        ok
     }
 }
 
@@ -248,6 +264,7 @@ impl DataNode {
             config,
             identity,
             store: Arc::new(store),
+            checked: parking_lot::Mutex::new(None),
         });
         self.archives.lock().insert(id, a.clone());
         Some(a)

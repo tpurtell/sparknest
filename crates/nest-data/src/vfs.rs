@@ -197,6 +197,10 @@ pub struct Vfs {
     /// only against the lease and fences. STABLE generations only: their
     /// bytes never change.
     serve_files: Mutex<HashMap<ObjectKey, (Arc<std::fs::File>, std::time::Instant)>>,
+    /// Transfers into each archive store at once (a single disk or share
+    /// gains nothing from more; dozens of queued offloads once pinned
+    /// hundreds of threads on a 150 MB/s disk).
+    archive_slots: Mutex<HashMap<nest_types::StoreId, Arc<tokio::sync::Semaphore>>>,
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
     fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
@@ -289,6 +293,7 @@ impl Vfs {
             fences: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             serve_files: Mutex::new(HashMap::new()),
+            archive_slots: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
             fence_hooks: Mutex::new(Vec::new()),
             fabric: Mutex::new(None),
@@ -2430,6 +2435,21 @@ impl Vfs {
         if self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
             return Ok(0);
         }
+        let _slot = if crate::is_archive(target) {
+            let sem = self
+                .archive_slots
+                .lock()
+                .entry(target)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(ARCHIVE_TRANSFERS)))
+                .clone();
+            Some(
+                sem.acquire_owned()
+                    .await
+                    .map_err(|_| NestError::Unavailable("shutting down".into()))?,
+            )
+        } else {
+            None
+        };
         self.fetch_into(&a, &dest).await?;
         let r = self
             .propose(Command::PublishReplica {
@@ -2577,15 +2597,26 @@ impl Vfs {
             .await
             .expect("blocking task")
             .map_err(io)?;
-        let staging = Arc::new(Mutex::new(Some(staging)));
         let fab = self.fabric();
         let chunk: u64 = fab.as_ref().map(|f| f.chunk() as u64).unwrap_or(4 << 20);
         let window = 16usize;
+        // One writer thread per transfer, fed the chunks as they arrive:
+        // a blocking thread per chunk (16 per transfer, waiting on a paced
+        // disk) once exhausted the runtime's blocking pool and starved the
+        // metadata apply.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(window);
+        let writer =
+            tokio::task::spawn_blocking(move || -> std::io::Result<nest_store::Staging> {
+                while let Some((off, bytes)) = rx.blocking_recv() {
+                    staging.write_all_at(&bytes, off)?;
+                }
+                Ok(staging)
+            });
         let mut next = 0u64;
         let mut inflight = futures::stream::FuturesUnordered::new();
         use futures::StreamExt;
         let fetch = |off: u64| {
-            let (fab, st) = (fab.clone(), staging.clone());
+            let (fab, st) = (fab.clone(), tx.clone());
             let (file, generation, size) = (a.id, a.generation, a.size);
             async move {
                 let len = (size - off).min(chunk) as usize;
@@ -2609,25 +2640,34 @@ impl Vfs {
                         bytes.len()
                     )));
                 }
-                tokio::task::spawn_blocking(move || {
-                    let g = st.lock();
-                    g.as_ref().expect("staging open").write_all_at(&bytes, off)
-                })
-                .await
-                .expect("blocking task")
-                .map_err(io)
+                st.send((off, bytes))
+                    .await
+                    .map_err(|_| NestError::Io("the writer stopped".into()))
             }
         };
+        let mut failed = None;
         while next < a.size || !inflight.is_empty() {
-            while inflight.len() < window && next < a.size {
+            while failed.is_none() && inflight.len() < window && next < a.size {
                 inflight.push(fetch(next));
                 next += chunk;
             }
-            if let Some(r) = inflight.next().await {
-                r?;
+            match inflight.next().await {
+                Some(Err(e)) if failed.is_none() => failed = Some(e),
+                Some(_) => {}
+                None => break,
             }
         }
-        let st = staging.lock().take().expect("staging open");
+        drop(inflight);
+        drop(tx);
+        // The writer's own error (a full disk, ...) explains a failed send.
+        let written = writer.await.map_err(|e| NestError::Io(e.to_string()))?;
+        if let Some(e) = failed {
+            return Err(match written {
+                Err(w) => io(w),
+                Ok(_) => e,
+            });
+        }
+        let st = written.map_err(io)?;
         let store = dest.clone();
         let size = a.size;
         tokio::task::spawn_blocking(move || {
@@ -2803,6 +2843,9 @@ impl Vfs {
         Ok((cap, t.files + t.dirs))
     }
 }
+
+/// Transfers into one archive store at once.
+const ARCHIVE_TRANSFERS: usize = 2;
 
 /// How long a handle trusts a STABLE generation's attributes on the fast
 /// path.

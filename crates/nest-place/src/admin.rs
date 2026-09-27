@@ -500,7 +500,7 @@ impl Handler for AdminService {
                         Some(arch) => {
                             let cap = arch.store.capacity().ok();
                             StoreHealth {
-                                healthy: arch.healthy(),
+                                healthy: arch.healthy_now(),
                                 total_bytes: cap.map(|c| c.total).unwrap_or(0),
                                 free_bytes: cap.map(|c| c.free).unwrap_or(0),
                                 objects: usage.0,

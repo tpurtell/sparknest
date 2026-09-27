@@ -1021,3 +1021,24 @@ depend on.
 **Decision.** The live store is paced at 256 MiB (flush, drop the pages;
 NVMe flushes are cheap), and the import's buffered copy writes through the
 paced writer and drops its source's pages as it reads.
+
+## ADR-041 — Transfers never park threads by the dozen; the apply path never waits on an archive disk (2026-09-28)
+
+**Context.** With pacing (ADR-039/040), queued offloads into the scratch
+disk (~150 MB/s) pinned raptor's Tokio blocking pool at its 512-thread cap:
+each transfer wrote its 16 in-flight chunks from 16 blocking threads that
+waited on the same file and a slow disk. Work needing a blocking thread
+queued behind them, and the metadata apply, which checked the archive's
+marker file on the saturated disk, fell behind the cluster; raptor lost its
+session over and over (not serving, reads flapping off the fabric).
+
+**Decision.**
+- A transfer writes through one writer thread fed by a bounded channel.
+- At most 2 transfers write into one archive store at a time; the rest
+  wait as tasks, holding no thread.
+- Hot paths (the apply, reads) use an archive's health as checked within
+  the last 5 s; explicit checks (`nest store ls`) read the marker afresh.
+
+**Next.** Completion-driven transfer writes through io_uring (`RWF_DSYNC`,
+from the fabric's landing slots, a fixed number in flight per transfer and
+per device) replace the writer and flusher threads.
