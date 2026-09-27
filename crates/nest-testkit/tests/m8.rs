@@ -456,3 +456,30 @@ async fn crashed_minority_host_recovers_against_the_quorum() {
     assert_eq!(v1.read(fh, 0, 64).await.unwrap(), b"stray bytes");
     v1.release(fh, None).await;
 }
+
+/// `sparknestd fsck` without a daemon: reports what the local metadata and
+/// the object store disagree on, changing nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn offline_fsck_reports_without_changing_anything() {
+    let mut c = ready(3).await;
+    let kept = write_file(&c.node(1).vfs, b"kept", 100).await;
+    let gone = write_file(&c.node(1).vfs, b"gone", 100).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        [kept, gone].iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|a| a.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    c.stop(1).await;
+    let store = nest_store::ObjectStore::open_readonly(&c.state_dir(1)).unwrap();
+    std::fs::remove_file(store.path(nest_store::ObjectKey::new(gone, Generation(1)))).unwrap();
+    let stray = nest_store::ObjectKey::new(FileId(4242), Generation(2));
+    std::fs::write(store.path(stray), b"x").unwrap();
+
+    let r = sparknestd::offline::fsck(&c.node_config(1)).unwrap();
+    assert_eq!(r.missing, vec!["/gone".to_string()]);
+    assert_eq!(r.unknown, vec!["0000000000001092.2".to_string()]);
+    assert!(r.damaged.is_empty());
+    assert!(store.exists(stray), "report only");
+}

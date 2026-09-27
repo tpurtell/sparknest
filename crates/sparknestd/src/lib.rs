@@ -4,6 +4,7 @@
 pub mod config;
 pub mod export;
 mod node;
+pub mod offline;
 pub mod recovery;
 pub mod runstate;
 

@@ -47,6 +47,10 @@ enum Sub {
         #[arg(long)]
         link: bool,
     },
+    /// Check this host's objects against its local metadata without a
+    /// running daemon (report only; repairs need the cluster: use
+    /// `nest fsck -y` once it runs). Uses the node config for paths.
+    Fsck,
 }
 
 #[tokio::main]
@@ -90,6 +94,31 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let cfg = Config::load(&args.config)?;
+    if let Some(Sub::Fsck) = &args.cmd {
+        let r = sparknestd::offline::fsck(&cfg)?;
+        println!(
+            "{}: {} objects, {} copies listed here; {} missing, {} wrong size, {} unknown objects",
+            cfg.node.name,
+            r.objects,
+            r.listed,
+            r.missing.len(),
+            r.damaged.len(),
+            r.unknown.len()
+        );
+        for m in r.missing.iter().take(50) {
+            println!("  missing  {m}");
+        }
+        for d in r.damaged.iter().take(50) {
+            println!("  damaged  {d}");
+        }
+        for u in r.unknown.iter().take(50) {
+            println!("  unknown  {u}");
+        }
+        if !(r.missing.is_empty() && r.damaged.is_empty() && r.unknown.is_empty()) {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     tracing::info!(node = %cfg.node.name, id = %cfg.node.id, cluster = %cfg.cluster.name, "configuration loaded");
     if args.check {
         return Ok(());

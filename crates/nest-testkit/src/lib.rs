@@ -191,6 +191,11 @@ impl TestCluster {
         }
     }
 
+    /// Node `id`'s configuration (as its daemon would load it).
+    pub fn node_config(&self, id: u64) -> Config {
+        self.config(id, self.addrs[&id])
+    }
+
     /// Start node `id` on a throwaway address without registering it, to
     /// watch whether it would come up (e.g. under a timeout). Abandoning the
     /// future leaves nothing on the node's real address.

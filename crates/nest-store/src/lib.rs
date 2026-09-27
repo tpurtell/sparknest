@@ -81,6 +81,24 @@ impl ObjectStore {
         Self::open_with_staging(root, "staging")
     }
 
+    /// Open for inspection only: nothing is created or cleaned up.
+    pub fn open_readonly(root: &Path) -> io::Result<Self> {
+        let objects = root.join("objects");
+        if !objects.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} has no objects directory", root.display()),
+            ));
+        }
+        Ok(ObjectStore {
+            root: root.to_path_buf(),
+            objects,
+            staging: root.join("staging"),
+            reserve: std::sync::atomic::AtomicU64::new(0),
+            room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+        })
+    }
+
     /// Open with a named staging directory (archive stores shared by several
     /// gateways give each gateway its own, so none discards another's
     /// in-flight transfers).
