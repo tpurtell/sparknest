@@ -19,6 +19,9 @@ what is next. Keep entries short; link to benchmarks and ADRs.
 - UI: dialogs float on the screen (not the page), the model window fits the
   screen with a treemap, hover details and zoom-out, the animated backdrop
   shows through everywhere, nav links can no longer start a native drag.
+- Fixed (ADR-044): opens of sealed files with a local sole copy failed with
+  EIO on that host (passthrough answered with a flag the kernel refuses, and
+  a new backing file per open). One mode and backing file per open inode.
 - Next: measure the scratch disk idle; daily fstrim (root checklist).
 
 ## 2026-09-27 — Reads from other hosts made fast (ADR-030…035)

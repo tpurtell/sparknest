@@ -1112,3 +1112,30 @@ asked to move.
 one control. Placement may take several passes when hosts lack room, and
 the plan says how many files fell short. Plans stay in memory on the node
 that made them (as before).
+
+## ADR-044 — One I/O mode and one backing file per open inode; passthrough opens carry no other flags (2026-09-28)
+
+**Context.** Every open of a sealed file whose only copy was local failed
+with EIO on its own host: 30–99% of each host's sole copies (on kiwi, the
+drafter checkpoint a four-Spark launch needed). The FUSE frontend answered
+passthrough opens with FOPEN_KEEP_CACHE, which the kernel refuses beside
+FOPEN_PASSTHROUGH (fs/fuse/iomode.c accepts only direct I/O, parallel direct
+writes and no-flush there), and registered a new backing file for every
+open, while the kernel keeps one I/O mode per inode: every concurrent open
+must name the same backing file, and an inode open through the page cache
+refuses passthrough (and the reverse). Any refusal is EIO for the caller.
+The bug dates from M2; it surfaced once many hub files were sealed with a
+single copy. FUSE over io_uring is not involved (the same with it off).
+
+**Decision.** The frontend keeps, per inode with open handles, the backing
+file its passthrough opens share (or none) and a handle count. The first
+open decides: passthrough when the VFS offers the local file, else through
+the daemon. Later opens follow it until the last handle is released,
+whatever the VFS would choose now (a new copy elsewhere, a scattered read
+pattern). A writer opening a file that is passed through gets ETXTBSY (only
+sealed files are). Passthrough answers carry no flags. Unit tests pin both
+rules against the kernel's mask.
+
+**Verified.** rhea, with io_uring: one open, four concurrent opens (same
+bytes), mmap and a reopen of a sealed 8 MiB file; all 521 of rhea's sole
+copies open (477 failed before).

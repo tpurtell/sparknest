@@ -60,8 +60,8 @@ struct Inner {
     ttl: Duration,
     uid: u32,
     gid: u32,
-    /// Passthrough registrations, kept until release.
-    backing: Mutex<HashMap<u64, BackingId>>,
+    /// Inodes with open handles and how the kernel opened them (`InodeIo`).
+    io: Mutex<HashMap<u64, InodeIo>>,
     passthrough: AtomicBool,
     passthrough_warned: AtomicBool,
     uring_wanted: bool,
@@ -82,6 +82,64 @@ const SEAL_XATTR: &[u8] = b"user.sparknest.sealed";
 
 fn errno(e: &NestError) -> Errno {
     Errno::from_i32(e.errno())
+}
+
+/// An inode with open handles. The kernel keeps one I/O mode per inode
+/// across all its open files (fs/fuse/iomode.c): every passthrough open of
+/// it must name the same backing file, and while any file is open through
+/// passthrough every other open must be too (and the reverse: an inode open
+/// through the page cache refuses passthrough). A refused open is EIO for
+/// the caller. So the first open decides, and later opens follow it until
+/// the last handle is released.
+struct InodeIo<B = BackingId> {
+    /// The backing file all passthrough opens share; none when the inode is
+    /// open through the daemon.
+    backing: Option<B>,
+    opens: u64,
+}
+
+impl<B> Default for InodeIo<B> {
+    fn default() -> Self {
+        InodeIo {
+            backing: None,
+            opens: 0,
+        }
+    }
+}
+
+/// The only flags the kernel accepts beside FOPEN_PASSTHROUGH are direct
+/// I/O, parallel direct writes and no-flush (FOPEN_PASSTHROUGH_MASK); any
+/// other (FOPEN_KEEP_CACHE) fails the open with EIO.
+const PASSTHROUGH_OPEN: FopenFlags = FopenFlags::empty();
+
+/// How to answer one open of an inode.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// The inode is open through passthrough: the same backing file.
+    Share,
+    /// First open, and the VFS offers the local file: register it.
+    Register,
+    /// Through the daemon, in the mode the VFS chose.
+    Daemon,
+    /// A writer while the inode is passed through (only sealed files are).
+    Busy,
+}
+
+impl<B> InodeIo<B> {
+    /// `offered`: the VFS handed over a local file for passthrough.
+    fn answer(&self, offered: bool, passthrough: bool, writable: bool) -> Answer {
+        if self.backing.is_some() {
+            if writable {
+                Answer::Busy
+            } else {
+                Answer::Share
+            }
+        } else if self.opens == 0 && offered && passthrough {
+            Answer::Register
+        } else {
+            Answer::Daemon
+        }
+    }
 }
 
 fn ino(f: FileId) -> INodeNo {
@@ -133,32 +191,67 @@ impl Inner {
             OpenMode::Direct => {
                 FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES
             }
+            // Through the daemon (a sealed file keeps its pages).
             OpenMode::Cached | OpenMode::Passthrough(_) => FopenFlags::FOPEN_KEEP_CACHE,
         }
     }
 
-    /// Reply to open/create in the best mode available; falls back from
-    /// passthrough to the page cache if the kernel refuses the backing file.
-    fn register_backing(
-        &self,
-        fh: u64,
-        file: &std::fs::File,
-        open_backing: impl FnOnce(&std::fs::File) -> std::io::Result<BackingId>,
-    ) -> Option<()> {
-        if !self.passthrough.load(Ordering::Relaxed) {
-            return None;
-        }
-        match open_backing(file) {
-            Ok(id) => {
-                self.backing.lock().insert(fh, id);
-                Some(())
+    /// Answer an open of `ino` (VFS handle `fh`, VFS mode `mode`) in the mode
+    /// the inode is already open in, or, for its first open, the best one:
+    /// passthrough when the VFS offers the local file. The kernel accepts no
+    /// flags beside FOPEN_PASSTHROUGH but direct I/O and no-flush, so a
+    /// passthrough answer carries none.
+    fn answer_open(&self, ino: u64, fh: u64, mode: OpenMode, writable: bool, reply: ReplyOpen) {
+        let mut io = self.io.lock();
+        let st = io.entry(ino).or_default();
+        let offered = matches!(mode, OpenMode::Passthrough(_));
+        match st.answer(offered, self.passthrough.load(Ordering::Relaxed), writable) {
+            Answer::Share => {
+                st.opens += 1;
+                let id = st.backing.as_ref().expect("shared backing");
+                return reply.opened_passthrough(FileHandle(fh), PASSTHROUGH_OPEN, id);
             }
-            Err(e) => {
-                if !self.passthrough_warned.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(error = %e, "FUSE passthrough unavailable (needs CAP_SYS_ADMIN); sealed files use the page cache");
+            Answer::Busy => {
+                if st.opens == 0 {
+                    io.remove(&ino);
                 }
-                self.passthrough.store(false, Ordering::Relaxed);
-                None
+                drop(io);
+                let vfs = self.vfs.clone();
+                tokio::spawn(async move { vfs.release(fh, None).await });
+                return reply.error(Errno::ETXTBSY);
+            }
+            Answer::Register => {
+                let OpenMode::Passthrough(f) = &mode else {
+                    unreachable!("offered")
+                };
+                match reply.open_backing(f) {
+                    Ok(id) => {
+                        st.opens = 1;
+                        let id = st.backing.insert(id);
+                        return reply.opened_passthrough(FileHandle(fh), PASSTHROUGH_OPEN, id);
+                    }
+                    Err(e) => {
+                        if !self.passthrough_warned.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(error = %e, "FUSE passthrough unavailable (needs CAP_SYS_ADMIN); sealed files use the page cache");
+                        }
+                        self.passthrough.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+            Answer::Daemon => {}
+        }
+        st.opens += 1;
+        reply.opened(FileHandle(fh), self.open_flags(&mode));
+    }
+
+    /// A handle of `ino` is gone.
+    fn closed(&self, ino: u64) {
+        let mut io = self.io.lock();
+        if let Some(st) = io.get_mut(&ino) {
+            st.opens = st.opens.saturating_sub(1);
+            if st.opens == 0 {
+                // Dropping the backing id closes it in the kernel.
+                io.remove(&ino);
             }
         }
     }
@@ -433,25 +526,11 @@ impl Filesystem for Fs {
 
     fn open(&self, _req: &Request, i: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let fs = self.inner.clone();
+        let acc = flags.0 & libc::O_ACCMODE;
+        let writable = acc == libc::O_WRONLY || acc == libc::O_RDWR;
         self.spawn(async move {
             match fs.vfs.open(fid(i), flags.0).await {
-                Ok((fh, mode)) => {
-                    if let OpenMode::Passthrough(f) = &mode
-                        && fs
-                            .register_backing(fh, f, |f| reply.open_backing(f))
-                            .is_some()
-                    {
-                        let id = fs.backing.lock();
-                        let id = id.get(&fh).expect("just registered");
-                        reply.opened_passthrough(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE, id);
-                        return;
-                    }
-                    let flags = match mode {
-                        OpenMode::Passthrough(_) => FopenFlags::FOPEN_KEEP_CACHE,
-                        ref m => fs.open_flags(m),
-                    };
-                    reply.opened(FileHandle(fh), flags);
-                }
+                Ok((fh, mode)) => fs.answer_open(i.0, fh, mode, writable, reply),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -476,11 +555,27 @@ impl Filesystem for Fs {
                 .await
             {
                 Ok((a, fh, mode)) => {
-                    let fl = match mode {
-                        OpenMode::Passthrough(_) => FopenFlags::FOPEN_KEEP_CACHE,
-                        ref m => fs.open_flags(m),
+                    // An existing file (no O_EXCL) may be open through
+                    // passthrough, which a create cannot answer with.
+                    let passed_through = {
+                        let mut io = fs.io.lock();
+                        let st = io.entry(a.id.0).or_default();
+                        if st.backing.is_none() {
+                            st.opens += 1;
+                        }
+                        st.backing.is_some()
                     };
-                    reply.created(&fs.ttl, &fs.attr(&a), Generation(0), FileHandle(fh), fl);
+                    if passed_through {
+                        fs.vfs.release(fh, None).await;
+                        return reply.error(Errno::ETXTBSY);
+                    }
+                    reply.created(
+                        &fs.ttl,
+                        &fs.attr(&a),
+                        Generation(0),
+                        FileHandle(fh),
+                        fs.open_flags(&mode),
+                    );
                 }
                 Err(e) => reply.error(errno(&e)),
             }
@@ -609,7 +704,7 @@ impl Filesystem for Fs {
             flags = _flags.0,
             "release"
         );
-        self.backing.lock().remove(&fh.0);
+        self.closed(_i.0);
         let vfs = self.vfs.clone();
         self.spawn(async move {
             vfs.release(fh.0, lock_owner.map(|o| o.0)).await;
@@ -973,7 +1068,7 @@ pub fn mount(vfs: Arc<Vfs>, cfg: &MountConfig) -> std::io::Result<Mounted> {
         ttl: cfg.ttl,
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
-        backing: Mutex::new(HashMap::new()),
+        io: Mutex::new(HashMap::new()),
         passthrough: AtomicBool::new(false),
         passthrough_warned: AtomicBool::new(false),
         uring_wanted: cfg.io_uring,
@@ -1074,5 +1169,50 @@ fn invalidator(n: Notifier, rx: std::sync::mpsc::Receiver<Inval>) {
             Inval::Data(f) => n.inval_inode(ino(f), 0, 0),
             Inval::Stop => return,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fs/fuse/iomode.c: FOPEN_PASSTHROUGH_MASK.
+    const KERNEL_PASSTHROUGH_MASK: FopenFlags = FopenFlags::FOPEN_PASSTHROUGH
+        .union(FopenFlags::FOPEN_DIRECT_IO)
+        .union(FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES)
+        .union(FopenFlags::FOPEN_NOFLUSH);
+
+    #[test]
+    fn passthrough_opens_carry_only_flags_the_kernel_accepts() {
+        let sent = PASSTHROUGH_OPEN | FopenFlags::FOPEN_PASSTHROUGH;
+        assert!(KERNEL_PASSTHROUGH_MASK.contains(sent), "{sent:?}");
+    }
+
+    /// Every open of an inode follows the first until the last closes: one
+    /// backing file shared, never a second one, never a page-cache open
+    /// beside a passthrough one (or the reverse).
+    #[test]
+    fn opens_of_one_inode_share_its_mode() {
+        let mut st: InodeIo<u32> = InodeIo::default();
+        // First reader: passthrough offered, registered.
+        assert_eq!(st.answer(true, true, false), Answer::Register);
+        st.backing = Some(7);
+        st.opens = 1;
+        // Three more ranks: the same backing, whatever the VFS offers now
+        // (a second copy elsewhere makes it offer the daemon path).
+        assert_eq!(st.answer(true, true, false), Answer::Share);
+        assert_eq!(st.answer(false, true, false), Answer::Share);
+        assert_eq!(st.answer(false, false, false), Answer::Share);
+        // A writer is refused while it is passed through.
+        assert_eq!(st.answer(false, true, true), Answer::Busy);
+
+        // Opened through the daemon first: later opens never pass through.
+        let mut st: InodeIo<u32> = InodeIo::default();
+        assert_eq!(st.answer(false, true, false), Answer::Daemon);
+        st.opens = 1;
+        assert_eq!(st.answer(true, true, false), Answer::Daemon);
+        // No passthrough available: the daemon path.
+        let st: InodeIo<u32> = InodeIo::default();
+        assert_eq!(st.answer(true, false, false), Answer::Daemon);
     }
 }
