@@ -22,6 +22,10 @@ what is next. Keep entries short; link to benchmarks and ADRs.
 - Fixed (ADR-044): opens of sealed files with a local sole copy failed with
   EIO on that host (passthrough answered with a flag the kernel refuses, and
   a new backing file per open). One mode and backing file per open inode.
+- Released v0.1.0 (https://github.com/tpurtell/sparknest/releases/tag/v0.1.0)
+  and added it to tpurtell/local-ai-tap with Linux ARM64/AMD64 bottles
+  (bottles-20260928-2). All seven hosts now install the published bottle
+  (`brew install tpurtell/local-ai/sparknest`) instead of the local tap.
 - Next: measure the scratch disk idle; daily fstrim (root checklist).
 
 ## 2026-09-27 — Reads from other hosts made fast (ADR-030…035)
