@@ -481,3 +481,40 @@ async fn reservations_answer_by_callback() {
     assert_eq!(get(&f2, 2, 0, 16).await.err(), Some(NestError::Stale));
     assert!(f2.stats.read_now.load(std::sync::atomic::Ordering::Relaxed) >= 1601);
 }
+
+/// Replacing a link must release the old lanes' QPs and rings once their
+/// grace passes; before the fix every re-link kept them for the life of the
+/// process (130k QPs on a busy host after one large replication).
+#[tokio::test(flavor = "multi_thread")]
+async fn replaced_links_release_their_lanes() {
+    let cfg = FabricConfig {
+        chunk: 1 << 20,
+        client_slots: 4,
+        server_slots: 4,
+        window: 4,
+        devices: vec![],
+        lane_grace: Duration::ZERO,
+        ..FabricConfig::default()
+    };
+    let Some((rpc1, f1)) = node(1, cfg.clone()).await else {
+        return;
+    };
+    let (rpc2, f2) = node(2, cfg).await.unwrap();
+    rpc2.set_peer(NodeId(1), rpc1.local_addr());
+    rpc1.set_peer(NodeId(2), rpc2.local_addr());
+    let src: Arc<dyn ReadSource> = Arc::new(Pattern);
+    f1.set_source(Arc::downgrade(&src));
+    let read = || f2.read(NodeId(1), FileId(7), Generation(3), 0, 4096);
+    read().await.unwrap();
+    let steady = f2.lane_count();
+    for _ in 0..50 {
+        f2.drop_link(NodeId(1));
+        read().await.unwrap();
+    }
+    f2.drop_link(NodeId(1));
+    f1.drop_link(NodeId(2));
+    assert_eq!(f2.lane_count(), 0, "client lanes leaked");
+    assert_eq!(f1.lane_count(), 0, "server lanes leaked");
+    read().await.unwrap();
+    assert_eq!(f2.lane_count(), steady);
+}

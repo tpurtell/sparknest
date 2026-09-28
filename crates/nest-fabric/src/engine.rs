@@ -57,6 +57,10 @@ pub struct FabricConfig {
     pub inflight_bytes: u64,
     /// Optional device/netdev/address filter.
     pub devices: Vec<String>,
+    /// How long a dead lane (failed, or replaced by a new link) stays
+    /// registered before its QP and ring are released: long enough for the
+    /// NIC to flush its outstanding work into the completion queue.
+    pub lane_grace: Duration,
 }
 
 /// A slot tier: its size, and landing and staging slots per device.
@@ -88,6 +92,7 @@ impl Default for FabricConfig {
             window: 128,
             inflight_bytes: 0,
             devices: Vec::new(),
+            lane_grace: Duration::from_secs(10),
         }
     }
 }
@@ -352,6 +357,19 @@ struct Lane {
     window: Arc<Semaphore>,
     peer: NodeId,
     dead: AtomicBool,
+    /// When the lane died; the expiry sweep releases it after `lane_grace`.
+    dead_at: Mutex<Option<std::time::Instant>>,
+}
+
+impl Lane {
+    /// Marks the lane dead; returns whether it was alive.
+    fn kill(&self) -> bool {
+        let was_alive = !self.dead.swap(true, Ordering::SeqCst);
+        if was_alive {
+            *self.dead_at.lock() = Some(std::time::Instant::now());
+        }
+        was_alive
+    }
 }
 
 /// A read in flight. The pending table owns its landing slot until the
@@ -700,6 +718,7 @@ impl Fabric {
             window: Arc::new(Semaphore::new(self.cfg.window as usize)),
             peer,
             dead: AtomicBool::new(false),
+            dead_at: Mutex::new(None),
         });
         for i in 0..depth {
             self.post_ring(&lane, i)?;
@@ -756,11 +775,16 @@ impl Fabric {
             }
             let lane = match self.new_lane(rail, peer) {
                 Ok(l) => l,
-                Err(e) => return FabricResp::Refused(e.to_string()),
+                Err(e) => {
+                    self.retire_lanes(&made.into_iter().map(|(_, l)| l).collect::<Vec<_>>());
+                    return FabricResp::Refused(e.to_string());
+                }
             };
             let psn = rand::random::<u32>() & 0xff_ffff;
             let mtu = lane.dev.mtu.min(offer.qp.mtu);
             if let Err(e) = lane.qp.connect(rail.gid_index, psn, &offer.qp, mtu) {
+                made.push((rail.clone(), lane));
+                self.retire_lanes(&made.into_iter().map(|(_, l)| l).collect::<Vec<_>>());
                 return FabricResp::Refused(e.to_string());
             }
             pairs.push((i as u32, self.qp_info(&lane, psn)));
@@ -781,10 +805,61 @@ impl Fabric {
     }
 
     fn retire(&self, link: &Link) {
-        for l in &link.lanes {
-            l.dead.store(true, Ordering::SeqCst);
+        self.retire_lanes(&link.lanes);
+    }
+
+    /// Takes lanes out of service without failing their requests; the
+    /// expiry sweep releases them once nothing refers to them.
+    fn retire_lanes(&self, lanes: &[Arc<Lane>]) {
+        for l in lanes {
+            l.kill();
             l.qp.set_error();
         }
+    }
+
+    /// Releases dead lanes that no link uses and nothing else holds, once
+    /// their grace period has passed. Without this every replaced or failed
+    /// link kept its QP and registered ring for the life of the process.
+    fn reap_lanes(&self) -> usize {
+        let now = std::time::Instant::now();
+        let live: std::collections::HashSet<u32> = self
+            .links
+            .lock()
+            .values()
+            .flat_map(|link| link.lanes.iter().map(|l| l.id))
+            .collect();
+        let mut released = Vec::new();
+        self.lanes.lock().retain(|id, lane| {
+            let expired = !live.contains(id)
+                && lane
+                    .dead_at
+                    .lock()
+                    .is_some_and(|at| now.duration_since(at) >= self.cfg.lane_grace)
+                && Arc::strong_count(lane) == 1;
+            if expired {
+                released.push(lane.clone());
+            }
+            !expired
+        });
+        // Dropped outside the lock: destroying a QP is a syscall.
+        let count = released.len();
+        drop(released);
+        count
+    }
+
+    /// Registered lanes, live and not yet released.
+    pub fn lane_count(&self) -> usize {
+        self.lanes.lock().len()
+    }
+
+    /// Retires the link to `peer` as a replacement would, then releases
+    /// every lane whose grace has passed. For tests and diagnostics.
+    #[doc(hidden)]
+    pub fn drop_link(&self, peer: NodeId) -> usize {
+        if let Some(old) = self.links.lock().remove(&peer) {
+            self.retire(&old);
+        }
+        self.reap_lanes()
     }
 
     async fn link(&self, peer: NodeId) -> Result<Arc<Link>, NestError> {
@@ -820,7 +895,7 @@ impl Fabric {
             protocol: PROTOCOL,
         })
         .map_err(|e| NestError::Io(e.to_string()))?;
-        let resp = self
+        let resp = match self
             .rpc
             .call(
                 peer,
@@ -829,11 +904,17 @@ impl Fabric {
                 Duration::from_secs(5),
             )
             .await
-            .map_err(|e| NestError::Unavailable(e.to_string()))?;
-        let resp: FabricResp = nest_rpc::decode(&resp).map_err(|e| NestError::Io(e.to_string()))?;
-        let pairs = match resp {
-            FabricResp::Accepted { pairs } => pairs,
-            FabricResp::Refused(why) => {
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                // The peer may have connected its side: let the sweep release ours.
+                self.retire_lanes(&lanes);
+                return Err(NestError::Unavailable(e.to_string()));
+            }
+        };
+        let pairs = match nest_rpc::decode(&resp) {
+            Ok(FabricResp::Accepted { pairs }) => pairs,
+            Ok(FabricResp::Refused(why)) => {
                 for l in &lanes {
                     self.lanes.lock().remove(&l.id);
                 }
@@ -841,14 +922,22 @@ impl Fabric {
                     "peer refused RDMA link: {why}"
                 )));
             }
+            Err(e) => {
+                self.retire_lanes(&lanes);
+                return Err(NestError::Io(e.to_string()));
+            }
         };
         let mut used = Vec::new();
         for (i, remote) in pairs {
             let lane = lanes[i as usize].clone();
             let mtu = lane.dev.mtu.min(remote.mtu);
-            lane.qp
+            if let Err(e) = lane
+                .qp
                 .connect(lane.local.gid_index, psns[i as usize], &remote, mtu)
-                .map_err(|e| NestError::Io(e.to_string()))?;
+            {
+                self.retire_lanes(&lanes);
+                return Err(NestError::Io(e.to_string()));
+            }
             used.push(lane);
         }
         for l in &lanes {
@@ -1010,6 +1099,7 @@ impl Fabric {
     /// Fail reads made with `Reservation::send` that have waited past
     /// `READ_TIMEOUT` (their lane is retired, as `read` does on a timeout).
     fn expire(&self) {
+        self.reap_lanes();
         let now = std::time::Instant::now();
         let old: Vec<(u32, u32)> = self
             .pending
@@ -1037,7 +1127,7 @@ impl Fabric {
     /// Take a lane out of service: the QP enters the error state (so the
     /// NIC stops touching its buffers) and requests sent on it fail.
     fn fail_lane(&self, lane: &Lane) {
-        if !lane.dead.swap(true, Ordering::SeqCst) {
+        if lane.kill() {
             tracing::warn!(peer = %lane.peer, rail = %lane.local.addr, "RDMA lane failed");
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
             lane.qp.set_error();
