@@ -53,6 +53,7 @@ package() {
   mkdir -p "$stage/bin" "$stage/libexec/sparknest" "$stage/share/sparknest" "$stage/share/doc/sparknest"
   install -m 0755 "$bindir/sparknestd" "$bindir/nest" "$stage/bin/"
   install -m 0755 tools/drop-page-cache/sparknest-drop-page-cache "$stage/bin/"
+  install -m 0755 tools/allow-restart/sparknest-allow-restart "$stage/bin/"
   install -m 0644 tools/drop-page-cache/drop-page-cache.c "$stage/libexec/sparknest/"
   cp -r packaging/config packaging/systemd "$stage/share/sparknest/"
   cp README.md docs/INSTALL.md LICENSE-MIT LICENSE-APACHE "$stage/share/doc/sparknest/"
