@@ -387,10 +387,11 @@ enum HfCmd {
     },
     /// Download a repo from the Hub to a host
     ///
-    /// What the cluster already has of it is copied to the host first; hf
-    /// then fetches the rest into sparknest's hub through that host's mount
-    /// (with the token from ~/.cache/huggingface/token, if any). Also
-    /// finishes a repo no host holds completely.
+    /// hf fetches the files no host has into sparknest's hub through that
+    /// host's mount, so they land there (with the token from
+    /// ~/.cache/huggingface/token, if any). Files the cluster already holds
+    /// stay where they are. Without --revision, a repo the hub already has is
+    /// finished at its cached revision; a new one is fetched at the latest.
     Download {
         /// org/name (or a huggingface.co URL).
         repo: String,
@@ -400,6 +401,7 @@ enum HfCmd {
         /// It is a dataset.
         #[arg(long)]
         dataset: bool,
+        /// A commit, branch or tag (default: what the hub has, else latest).
         #[arg(long)]
         revision: Option<String>,
         /// Follow the job until it finishes.
