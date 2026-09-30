@@ -143,6 +143,13 @@ Other root-level performance levers, measured or suspected on the Sparks
   single-stream daemon-mediated I/O is latency-bound (~0.5 ms/request).
   `sudo cpupower idle-set -D 100` (disable states slower than 100 µs) is the
   obvious experiment; it costs idle power.
+- **NVMe interrupt coalescing (moa, rhea).** An NVIDIA tuning script had
+  enabled interrupt coalescing on these hosts' drives by default. It
+  delayed completions, so small scattered reads there (the engram rows)
+  lagged the other hosts. TJ disabled it permanently on 2026-09-30. Treat
+  moa/rhea read-latency numbers from before then with care; if a Spark's
+  small reads lag again, check `nvme get-feature -f 8` (Interrupt
+  Coalescing) first.
 - **FUSE over io_uring.** Enabled on all hosts on 2026-09-27 with
   `fuse.enable_uring=1` on the kernel command line (FUSE is built in, so
   `/etc/modprobe.d` options are ignored). sparknest uses it automatically
