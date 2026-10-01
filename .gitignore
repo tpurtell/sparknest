@@ -6,3 +6,4 @@ web/dist/
 *.sqlite-shm
 .DS_Store
 dist/
+__pycache__/
