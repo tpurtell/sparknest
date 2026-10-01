@@ -53,18 +53,23 @@
     const m = missing[key(r)];
     const held = (h: Readiness) => h.bytes - h.missing_bytes;
     const free = (h: string) => app.status?.nodes.find((n) => n.name === h)?.info?.free_bytes ?? 0;
-    const opts = (r.hosts ?? [])
-      .filter((h) => !app.stores.some((s) => s.name === h.host))
-      .sort((a, b) => free(b.host) - free(a.host))
-      .map((h) => ({ name: h.host, kind: "host", note: `${human(free(h.host))} free${held(h) ? ` · holds ${human(held(h))}` : ""}` }));
+    const ALL = "every host";
+    const opts = [
+      { name: ALL, kind: "spread", note: "each file on one host, evenly" },
+      ...(r.hosts ?? [])
+        .filter((h) => !app.stores.some((s) => s.name === h.host))
+        .sort((a, b) => free(b.host) - free(a.host))
+        .map((h) => ({ name: h.host, kind: "host", note: `${human(free(h.host))} free${held(h) ? ` · holds ${human(held(h))}` : ""}` })),
+    ];
     const got = await pick(
       `Finish ${r.repo} on…`,
       opts,
       false,
-      `hf downloads the ${m?.missing_files ?? ""} files (${human(m?.missing_bytes ?? 0)}) no host has, onto the host you pick. Nothing already in the cluster moves.`,
+      `hf downloads the ${m?.missing_files ?? ""} files (${human(m?.missing_bytes ?? 0)}) no host has, spread over every host or onto the one you pick. Nothing already in the cluster moves.`,
     );
     if (!got?.[0]) return;
-    await startJob("/v1/hf/download", { repo: r.repo, kind: r.kind, host: got[0] }, `Finishing ${r.repo} on ${got[0]}`);
+    if (got[0] === ALL) await startJob("/v1/hf/download", { repo: r.repo, kind: r.kind, hosts: [] }, `Finishing ${r.repo} over every host`);
+    else await startJob("/v1/hf/download", { repo: r.repo, kind: r.kind, host: got[0] }, `Finishing ${r.repo} on ${got[0]}`);
   }
 
   let repos = $state<Repo[]>([]);

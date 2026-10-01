@@ -819,16 +819,26 @@ struct HfDownloadReq {
     repo: String,
     #[serde(default)]
     kind: String,
-    /// The host to download to (default: this one).
+    /// One host to download everything to.
     #[serde(default)]
     host: String,
+    /// Hosts or @groups to spread the files over (default: every serving
+    /// host, unless `host` is given).
+    #[serde(default)]
+    hosts: Vec<String>,
     revision: Option<String>,
+    /// Files downloading at once across the cluster (default 1: hf_xet
+    /// fills a gigabit link with one).
+    in_flight: Option<usize>,
+    /// Unused (the daemon finds hf itself); kept for older CLIs.
+    #[allow(dead_code)]
     hf: Option<String>,
 }
 
-/// Download a repo to a host: hf fetches the files the cluster lacks (at
-/// the revision the cache holds, if any) and writes them there; nothing the
-/// cluster holds moves. Returns the job (on that host).
+/// Download a repo: the files no host has, spread over the hosts (or on
+/// one), each written through the mount of the host it is assigned to, so
+/// its first copy lands there; nothing the cluster holds moves. Returns the
+/// job (on this node), with byte progress per host.
 async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<serde_json::Value> {
     let repo = r
         .repo
@@ -840,9 +850,21 @@ async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<
     if repo.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "no repo given".into()));
     }
+    let hosts = if r.host.is_empty() {
+        r.hosts
+    } else {
+        vec![r.host]
+    };
     let job = api
         .placer
-        .hf_download_on(&r.host, r.hf, api.hub.clone(), repo, r.kind, r.revision)
+        .hf_download_spread(
+            api.hub.clone(),
+            repo,
+            r.kind,
+            r.revision,
+            hosts,
+            r.in_flight.unwrap_or(1).clamp(1, 16),
+        )
         .await?;
     Ok(Json(json!({ "job": job })))
 }

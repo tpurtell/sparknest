@@ -878,12 +878,17 @@ pub struct DownloadSize {
 
 /// The revision the hub cache holds of `repo` (its `refs/main`), so that
 /// finishing a download fetches the files of that snapshot, not a newer one.
-fn cached_revision(mount_hub: &Path, repo: &str, kind: &str) -> Option<String> {
-    let dir = format!(
+/// The hub directory of a repo: `models--org--name` or `datasets--org--name`.
+pub fn repo_dir(kind: &str, repo: &str) -> String {
+    format!(
         "{}s--{}",
         repo_type(kind),
         repo.split('@').next().unwrap_or(repo).replace('/', "--")
-    );
+    )
+}
+
+pub fn cached_revision(mount_hub: &Path, repo: &str, kind: &str) -> Option<String> {
+    let dir = repo_dir(kind, repo);
     let r = std::fs::read_to_string(mount_hub.join(dir).join("refs/main")).ok()?;
     let r = r.trim();
     (r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())).then(|| r.to_string())
@@ -1083,5 +1088,348 @@ mod rm_tests {
         assert_eq!(rm_target("dataset/cais/mmlu"), "dataset/cais/mmlu");
         assert_eq!(rm_target("hf-dataset:cais/mmlu"), "dataset/cais/mmlu");
         assert_eq!(rm_target("hf:org/m@main"), "model/org/m");
+    }
+}
+
+// ------------------------------------------------------------ fetch driver
+//
+// Downloads go through `sparknest-hf-fetch` (tools/hf-fetch), a small
+// Python program run with the interpreter of the `hf` command, so it uses
+// the same huggingface_hub and hf_xet. It plans a repo (its files and sizes
+// at one commit) and fetches a list of files one after another, reporting
+// bytes as they arrive. The host that runs it writes the files through its
+// mount, so that is where their first copy lands.
+
+/// The Python interpreter of the `hf` command (from its `#!` line).
+pub fn hf_python(hf: &Path) -> Option<PathBuf> {
+    let head = std::fs::read(hf).ok()?;
+    let line = head.split(|b| *b == b'\n').next()?;
+    let line = std::str::from_utf8(line).ok()?.strip_prefix("#!")?.trim();
+    // `#!/usr/bin/env python3` names the interpreter after env.
+    let mut words = line.split_whitespace();
+    let first = words.next()?;
+    let py = if first.ends_with("/env") {
+        words.next()?
+    } else {
+        first
+    };
+    let p = PathBuf::from(py);
+    if p.is_absolute() {
+        p.is_file().then_some(p)
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join(py))
+                .find(|c| c.is_file())
+        })
+    }
+}
+
+/// The driver: `$SPARKNEST_HF_FETCH`, beside this executable, or in
+/// `../libexec/sparknest/` (the Homebrew layout).
+pub fn fetch_driver() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("SPARKNEST_HF_FETCH") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join("sparknest-hf-fetch"),
+        dir.join("../libexec/sparknest/sparknest-hf-fetch"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+/// The interpreter and driver to run, or why there are none.
+pub fn driver(hf: Option<&Path>) -> NestResult<(PathBuf, PathBuf)> {
+    let hf = hf
+        .map(Path::to_path_buf)
+        .filter(|p| p.is_file())
+        .or_else(find_hf)
+        .ok_or_else(|| NestError::Invalid("hf is not installed on this host".into()))?;
+    let py = hf_python(&hf).ok_or_else(|| {
+        NestError::Invalid(format!("cannot tell which Python runs {}", hf.display()))
+    })?;
+    let drv = fetch_driver().ok_or_else(|| {
+        NestError::Invalid("sparknest-hf-fetch is not installed beside sparknestd".into())
+    })?;
+    Ok((py, drv))
+}
+
+/// A repo at one commit: its files and their sizes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepoPlan {
+    pub sha: String,
+    pub files: Vec<PlanFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanFile {
+    pub name: String,
+    pub size: u64,
+}
+
+/// List `repo` at `revision` (default: its main branch) on the Hub.
+pub async fn repo_plan(
+    hf: Option<&Path>,
+    mount_hub: &Path,
+    repo: &str,
+    kind: &str,
+    revision: Option<&str>,
+) -> NestResult<RepoPlan> {
+    let (py, drv) = driver(hf)?;
+    let mut cmd = tokio::process::Command::new(py);
+    cmd.arg(drv)
+        .args(["plan", repo, "--repo-type", repo_type(kind)]);
+    if let Some(r) = revision {
+        cmd.args(["--revision", r]);
+    }
+    hf_env(&mut cmd, mount_hub);
+    let v = hf_json(cmd, "sparknest-hf-fetch plan").await?;
+    serde_json::from_value(v).map_err(|e| NestError::Io(format!("unexpected plan: {e}")))
+}
+
+/// One host's share of a download, as it goes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FetchProgress {
+    pub files: Vec<FetchFile>,
+    pub finished: bool,
+    pub cancelled: bool,
+    /// The driver itself failed (not one file).
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FetchFile {
+    pub name: String,
+    pub size: u64,
+    pub done: u64,
+    pub state: FetchState,
+    pub error: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FetchState {
+    #[default]
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+impl FetchProgress {
+    pub fn new(files: &[(String, u64)]) -> FetchProgress {
+        FetchProgress {
+            files: files
+                .iter()
+                .map(|(name, size)| FetchFile {
+                    name: name.clone(),
+                    size: *size,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Apply one line the driver printed; false if it was not one of its
+    /// reports.
+    pub fn apply(&mut self, line: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        let Some(name) = v["file"].as_str() else {
+            return false;
+        };
+        let Some(f) = self.files.iter_mut().find(|f| f.name == name) else {
+            return false;
+        };
+        if let Some(e) = v["error"].as_str() {
+            f.state = FetchState::Failed;
+            f.error = e.to_string();
+        } else if v["ok"].as_bool() == Some(true) {
+            f.state = FetchState::Done;
+            f.done = f.size.max(f.done);
+        } else if let Some(d) = v["done"].as_u64() {
+            f.state = FetchState::Running;
+            f.done = d;
+            if let Some(t) = v["total"].as_u64().filter(|t| *t > 0) {
+                f.size = t;
+            }
+        }
+        true
+    }
+
+    pub fn done_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.done.min(f.size)).sum()
+    }
+}
+
+/// Fetch `progress`'s files of `repo` at commit `sha` into the hub through
+/// this host's mount, one after another, until done or cancelled.
+pub async fn fetch_files(
+    hf: Option<&Path>,
+    mount_hub: &Path,
+    repo: &str,
+    kind: &str,
+    sha: &str,
+    progress: Arc<Mutex<FetchProgress>>,
+) -> NestResult<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (py, drv) = driver(hf)?;
+    let mut cmd = tokio::process::Command::new(py);
+    cmd.arg(drv)
+        .args([
+            "fetch",
+            repo,
+            "--repo-type",
+            repo_type(kind),
+            "--revision",
+            sha,
+        ])
+        .arg("--cache-dir")
+        .arg(mount_hub)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    hf_env(&mut cmd, mount_hub);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| NestError::Io(format!("running sparknest-hf-fetch: {e}")))?;
+    let names: String = progress
+        .lock()
+        .files
+        .iter()
+        .map(|f| format!("{}\n", f.name))
+        .collect();
+    let mut stdin = child.stdin.take().expect("piped");
+    stdin
+        .write_all(names.as_bytes())
+        .await
+        .map_err(|e| NestError::Io(e.to_string()))?;
+    drop(stdin);
+    let mut stderr = child.stderr.take().expect("piped");
+    let tail = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("piped")).lines();
+    loop {
+        tokio::select! {
+            l = lines.next_line() => match l {
+                Ok(Some(l)) => { progress.lock().apply(&l); }
+                _ => break,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        }
+        if progress.lock().cancelled {
+            let _ = child.kill().await;
+            return Err(NestError::Io("cancelled".into()));
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| NestError::Io(e.to_string()))?;
+    if !status.success() {
+        let err = tail.await.unwrap_or_default();
+        let err = String::from_utf8_lossy(&err);
+        let msg = err
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .unwrap_or("failed")
+            .to_string();
+        return Err(NestError::Io(format!("sparknest-hf-fetch: {msg}")));
+    }
+    Ok(())
+}
+
+/// Hosts to fetch files on, each with room to fill (free space above its
+/// margin) and what it was given so far.
+#[derive(Clone, Debug)]
+pub struct FetchHost {
+    pub name: String,
+    pub room: u64,
+}
+
+/// Assign files to hosts: largest first, each to the host with the least
+/// assigned so far that has room for it. Returns host indexes per file (in
+/// the order given), or None for a file no host has room for.
+pub fn assign_files(files: &[(String, u64)], hosts: &[FetchHost]) -> Vec<Option<usize>> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| {
+        files[b]
+            .1
+            .cmp(&files[a].1)
+            .then(files[a].0.cmp(&files[b].0))
+    });
+    let mut given = vec![0u64; hosts.len()];
+    let mut out = vec![None; files.len()];
+    for i in order {
+        let size = files[i].1;
+        let best = (0..hosts.len())
+            .filter(|&h| hosts[h].room.saturating_sub(given[h]) >= size)
+            .min_by_key(|&h| (given[h], h));
+        if let Some(h) = best {
+            given[h] += size;
+            out[i] = Some(h);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    #[test]
+    fn files_are_spread_evenly_largest_first_within_room() {
+        let gb = 1u64 << 30;
+        let files: Vec<(String, u64)> = (0..6)
+            .map(|i| (format!("model-{i}.safetensors"), 5 * gb))
+            .chain([("config.json".to_string(), 1000)])
+            .collect();
+        let hosts = vec![
+            FetchHost {
+                name: "a".into(),
+                room: 100 * gb,
+            },
+            FetchHost {
+                name: "b".into(),
+                room: 100 * gb,
+            },
+            FetchHost {
+                name: "c".into(),
+                room: 7 * gb,
+            },
+        ];
+        let got = assign_files(&files, &hosts);
+        let per = |h| got.iter().filter(|g| **g == Some(h)).count();
+        // c has room for one shard; a and b share the rest evenly.
+        assert_eq!(per(2), 2, "{got:?}"); // one shard and the config
+        assert_eq!(per(0) + per(1), 5);
+        assert!(per(0).abs_diff(per(1)) <= 1);
+        // Nobody has room: unplaced.
+        let none = assign_files(&[("huge".into(), 500 * gb)], &hosts);
+        assert_eq!(none, vec![None]);
+    }
+
+    #[test]
+    fn driver_lines_update_progress() {
+        let mut p = FetchProgress::new(&[("a".into(), 100), ("b".into(), 50)]);
+        assert!(p.apply(r#"{"file": "a", "done": 40, "total": 100}"#));
+        assert_eq!(p.files[0].state, FetchState::Running);
+        assert!(p.apply(r#"{"file": "a", "ok": true}"#));
+        assert!(p.apply(r#"{"file": "b", "error": "HTTPError: 404"}"#));
+        assert!(!p.apply("warning: something"));
+        assert!(!p.apply(r#"{"file": "zzz", "ok": true}"#));
+        assert_eq!(p.done_bytes(), 100);
+        assert_eq!(p.files[1].state, FetchState::Failed);
+        assert_eq!(p.files[1].error, "HTTPError: 404");
     }
 }

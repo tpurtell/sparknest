@@ -26,6 +26,9 @@ what is next. Keep entries short; link to benchmarks and ADRs.
   and added it to tpurtell/local-ai-tap with Linux ARM64/AMD64 bottles
   (bottles-20260928-2). All seven hosts now install the published bottle
   (`brew install tpurtell/local-ai/sparknest`) instead of the local tap.
+- Hugging Face downloads (ADR-045): planned, spread over the hosts by
+  default (each file fetched by the host it is assigned to), one file in
+  flight across the cluster, byte progress per host, cancel and resume.
 - Next: measure the scratch disk idle; daily fstrim (root checklist).
 
 ## 2026-09-27 — Reads from other hosts made fast (ADR-030…035)

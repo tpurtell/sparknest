@@ -385,25 +385,34 @@ enum HfCmd {
         #[arg(long)]
         wait: bool,
     },
-    /// Download a repo from the Hub to a host
+    /// Download a repo from the Hub, spread over the hosts or onto one
     ///
-    /// hf fetches the files no host has into sparknest's hub through that
-    /// host's mount, so they land there (with the token from
-    /// ~/.cache/huggingface/token, if any). Files the cluster already holds
-    /// stay where they are. Without --revision, a repo the hub already has is
-    /// finished at its cached revision; a new one is fetched at the latest.
+    /// The files no host has are assigned to hosts (largest first, evenly,
+    /// within each host's free space) and each is downloaded through the
+    /// mount of its host, so its first copy lands there. One file downloads
+    /// at a time across the cluster by default (hf_xet fills a gigabit link
+    /// with one). Files the cluster already holds stay where they are.
+    /// Without --revision, a repo the hub already has is finished at its
+    /// cached revision; a new one is fetched at its main branch.
     Download {
         /// org/name (or a huggingface.co URL).
         repo: String,
-        /// The host to download to (default: this one).
-        #[arg(long)]
+        /// Put every file on this host instead of spreading them.
+        #[arg(long, conflicts_with = "hosts")]
         host: Option<String>,
+        /// Spread over these hosts or @groups only (comma-separated or
+        /// repeated; default: every serving host).
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
         /// It is a dataset.
         #[arg(long)]
         dataset: bool,
         /// A commit, branch or tag (default: what the hub has, else latest).
         #[arg(long)]
         revision: Option<String>,
+        /// Files downloading at once across the cluster.
+        #[arg(long, default_value_t = 1)]
+        in_flight: usize,
         /// Follow the job until it finishes.
         #[arg(long)]
         wait: bool,
@@ -1672,8 +1681,10 @@ async fn main() -> Result<()> {
                 HfCmd::Download {
                     repo,
                     host,
+                    hosts,
                     dataset,
                     revision,
+                    in_flight,
                     wait,
                 },
         } => {
@@ -1683,9 +1694,10 @@ async fn main() -> Result<()> {
                     json!({
                         "repo": repo,
                         "host": host.clone().unwrap_or_default(),
+                        "hosts": hosts,
                         "kind": if *dataset { "dataset" } else { "model" },
                         "revision": revision,
-                        "hf": which("hf"),
+                        "in_flight": in_flight,
                     }),
                 )
                 .await?;

@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Download a repo from the Hub to a host: search (hf's model/dataset
-  // listing, most downloaded first) or paste org/name, see its size (hf's
-  // dry run), pick the host (most free space first).
+  // Download a repo from the Hub: search (hf's model/dataset listing, most
+  // downloaded first) or paste org/name, see its size (hf's dry run), then
+  // spread it over hosts (each file lands on one, evenly) or put it on one.
   import { get } from "../lib/api";
   import { app, startJob } from "../lib/state.svelte";
   import { human } from "../lib/format";
@@ -18,16 +18,23 @@
   let size = $state<{ files: number; missing_files: number; missing_bytes: number } | null>(null);
   let sizeErr = $state("");
   let host = $state("");
+  let spread = $state(true);
+  let chosen = $state<string[]>([]);
 
+  // In the cluster's order.
   const hosts = $derived(
     (app.status?.nodes ?? [])
       .filter((n) => n.info?.serving)
-      .map((n) => ({ name: n.name, free: n.info?.free_bytes ?? 0 }))
-      .sort((a, b) => b.free - a.free),
+      .map((n) => ({ name: n.name, free: n.info?.free_bytes ?? 0 })),
   );
+  const roomiest = $derived([...hosts].sort((a, b) => b.free - a.free)[0]?.name ?? "");
   $effect(() => {
-    if (open && !hosts.some((h) => h.name === host) && hosts.length) host = hosts[0].name;
+    if (open && !hosts.some((h) => h.name === host) && hosts.length) host = roomiest;
   });
+  $effect(() => {
+    if (open && !chosen.length && hosts.length) chosen = hosts.map((h) => h.name);
+  });
+  const toggle = (h: string) => (chosen = chosen.includes(h) ? chosen.filter((x) => x !== h) : hosts.map((x) => x.name).filter((x) => x === h || chosen.includes(x)));
 
   // A pasted repo id or huggingface.co URL is offered as is.
   const pasted = $derived.by(() => {
@@ -70,7 +77,9 @@
       });
   }
 
-  const free = $derived(hosts.find((h) => h.name === host)?.free ?? 0);
+  const free = $derived(
+    spread ? hosts.filter((h) => chosen.includes(h.name)).reduce((a, h) => a + h.free, 0) : (hosts.find((h) => h.name === host)?.free ?? 0),
+  );
   const fits = $derived(!size || free > size.missing_bytes);
 
   function close() {
@@ -80,10 +89,14 @@
     results = [];
     size = null;
     sizeErr = "";
+    chosen = [];
   }
 
   async function download() {
-    await startJob("/v1/hf/download", { repo, kind, host }, `Downloading ${repo} to ${host}`);
+    const everyone = chosen.length === hosts.length;
+    if (spread)
+      await startJob("/v1/hf/download", { repo, kind, hosts: everyone ? [] : chosen }, `Downloading ${repo} over ${everyone ? "every host" : chosen.join(", ")}`);
+    else await startJob("/v1/hf/download", { repo, kind, host }, `Downloading ${repo} to ${host}`);
     close();
   }
 </script>
@@ -122,19 +135,34 @@
             <b>{repo}</b>:
             {#if size}{size.missing_files === size.files ? `${size.files} files, ${human(size.missing_bytes)}` : size.missing_files ? `${size.missing_files} of ${size.files} files missing, ${human(size.missing_bytes)}` : "already complete in the cluster"}{:else if sizeErr}<span style="color:var(--bad)">{sizeErr}</span>{:else}<span class="muted">sizing…</span>{/if}
           </div>
-          <div class="row small">
-            <span class="muted">to</span>
-            <select bind:value={host}>
-              {#each hosts as h}<option value={h.name}>{h.name} ({human(h.free)} free)</option>{/each}
-            </select>
-            {#if !fits}<span class="tiny" style="color:var(--bad)">does not fit there</span>{/if}
+          <div class="chips">
+            <button class="chip" class:on={spread} onclick={() => (spread = true)}>Spread over hosts</button>
+            <button class="chip" class:on={!spread} onclick={() => (spread = false)}>One host</button>
           </div>
-          <div class="tiny muted">hf fetches only what no host has, onto this host; what the cluster already holds stays where it is</div>
+          {#if spread}
+            <div class="chips">
+              {#each hosts as h (h.name)}
+                <button class="chip" class:on={chosen.includes(h.name)} onclick={() => toggle(h.name)} title="{human(h.free)} free">{h.name}</button>
+              {/each}
+            </div>
+          {:else}
+            <div class="row small">
+              <span class="muted">to</span>
+              <select bind:value={host}>
+                {#each hosts as h}<option value={h.name}>{h.name} ({human(h.free)} free)</option>{/each}
+              </select>
+            </div>
+          {/if}
+          {#if !fits}<span class="tiny" style="color:var(--bad)">does not fit there</span>{/if}
+          <div class="tiny muted">
+            {spread ? "Each file goes to one of these hosts, evenly by size; one file downloads at a time." : "Every file goes to this host."}
+            Only what no host has is fetched; what the cluster already holds stays where it is.
+          </div>
         </div>
       {/if}
       <div class="row end">
         <button class="btn ghost" onclick={close}>Cancel</button>
-        <button class="btn primary" disabled={!repo || !host || !fits || !!sizeErr || size?.missing_files === 0} onclick={download}>Download</button>
+        <button class="btn primary" disabled={!repo || (spread ? !chosen.length : !host) || !fits || !!sizeErr || size?.missing_files === 0} onclick={download}>Download</button>
       </div>
     </div>
   </div>

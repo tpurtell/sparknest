@@ -63,6 +63,38 @@ pub struct ClusterJob {
     host_jobs: Vec<(NodeId, u64)>,
 }
 
+/// Put a failed file back in the queue: on the same host for its first
+/// retry, then on the least loaded other host with room; after three tries
+/// it stays failed.
+fn requeue(
+    queue: &mut std::collections::VecDeque<(usize, Vec<(String, u64)>)>,
+    given: &mut [u64],
+    hosts: &[crate::hfimport::FetchHost],
+    from: usize,
+    file: (String, u64),
+    failed: &mut Vec<String>,
+    attempts: &HashMap<String, u32>,
+) {
+    let n = attempts.get(&file.0).copied().unwrap_or(0);
+    if n >= 3 {
+        return;
+    }
+    let to = if n <= 1 {
+        Some(from)
+    } else {
+        (0..hosts.len())
+            .filter(|&h| h != from && hosts[h].room.saturating_sub(given[h]) >= file.1)
+            .min_by_key(|&h| given[h])
+    };
+    let Some(to) = to else { return };
+    if to != from {
+        given[from] = given[from].saturating_sub(file.1);
+        given[to] += file.1;
+    }
+    failed.retain(|x| x != &file.0);
+    queue.push_back((to, vec![file]));
+}
+
 fn cancelled(job: &Mutex<ClusterJob>) -> NestResult<()> {
     if job.lock().cancelled {
         return Err(NestError::Io(
@@ -110,6 +142,8 @@ pub struct Placer {
     admin: Arc<admin::Admin>,
     jobs: Mutex<HashMap<u64, Arc<Mutex<ClusterJob>>>>,
     imports: Mutex<HashMap<u64, Arc<Mutex<crate::import::ImportProgress>>>>,
+    /// This host's shares of Hugging Face downloads (`hf_fetch_here`).
+    fetches: Mutex<HashMap<u64, Arc<Mutex<crate::hfimport::FetchProgress>>>>,
     /// Recent answers the web UI asks for every few seconds.
     usage_cache: Mutex<Option<(u64, std::time::Instant, UsageMap)>>,
     stores_cache: Mutex<Option<(std::time::Instant, Vec<StoreStatus>)>>,
@@ -220,6 +254,7 @@ impl Placer {
             admin,
             jobs: Mutex::new(HashMap::new()),
             imports: Mutex::new(HashMap::new()),
+            fetches: Mutex::new(HashMap::new()),
             usage_cache: Mutex::new(None),
             stores_cache: Mutex::new(None),
             info_cache: Mutex::new(HashMap::new()),
@@ -1224,6 +1259,455 @@ impl Placer {
             AdminResp::Err(e) => Err(NestError::Invalid(e)),
             other => Err(NestError::Io(format!("unexpected {other:?}"))),
         }
+    }
+
+    /// The hub directory through this host's mount.
+    fn mount_hub(&self, hub: &str) -> NestResult<std::path::PathBuf> {
+        self.admin
+            .mountpoint
+            .as_ref()
+            .map(|m| std::path::Path::new(m).join(hub.trim_start_matches('/')))
+            .ok_or_else(|| NestError::Invalid("this host has no mount".into()))
+    }
+
+    /// Fetch these files of `repo` at commit `sha` here (one host's share of
+    /// a download); returns an id for `hf_fetch_status_here`.
+    pub fn hf_fetch_here(
+        self: &Arc<Self>,
+        hub: &str,
+        repo: String,
+        kind: String,
+        sha: String,
+        files: Vec<(String, u64)>,
+    ) -> NestResult<u64> {
+        let mount_hub = self.mount_hub(hub)?;
+        crate::hfimport::driver(None)?;
+        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let p = Arc::new(Mutex::new(crate::hfimport::FetchProgress::new(&files)));
+        {
+            let mut f = self.fetches.lock();
+            if f.len() > 256 {
+                f.retain(|_, p| !p.lock().finished);
+            }
+            f.insert(id, p.clone());
+        }
+        tracing::info!(%repo, files = files.len(), "hf fetch started");
+        tokio::spawn(async move {
+            let r =
+                crate::hfimport::fetch_files(None, &mount_hub, &repo, &kind, &sha, p.clone()).await;
+            let mut g = p.lock();
+            if let Err(e) = r {
+                g.error = Some(e.to_string());
+            }
+            g.finished = true;
+        });
+        Ok(id)
+    }
+
+    /// A fetch started here; `cancel` stops it.
+    pub fn hf_fetch_status_here(
+        &self,
+        id: u64,
+        cancel: bool,
+    ) -> NestResult<crate::hfimport::FetchProgress> {
+        let p = self
+            .fetches
+            .lock()
+            .get(&id)
+            .cloned()
+            .ok_or(NestError::NotFound)?;
+        let mut g = p.lock();
+        if cancel {
+            g.cancelled = true;
+        }
+        Ok(g.clone())
+    }
+
+    async fn hf_fetch_on(
+        self: &Arc<Self>,
+        node: NodeId,
+        hub: &str,
+        repo: &str,
+        kind: &str,
+        sha: &str,
+        files: Vec<(String, u64)>,
+    ) -> NestResult<u64> {
+        if node == self.vfs.data().id() {
+            return self.hf_fetch_here(hub, repo.into(), kind.into(), sha.into(), files);
+        }
+        match admin::call(
+            self.rpc(),
+            node,
+            &AdminReq::HfFetch {
+                repo: repo.into(),
+                kind: kind.into(),
+                sha: sha.into(),
+                files,
+                hub: hub.into(),
+            },
+            Duration::from_secs(10),
+        )
+        .await?
+        {
+            AdminResp::JobStarted(id) => Ok(id),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
+    }
+
+    async fn hf_fetch_status(
+        &self,
+        node: NodeId,
+        id: u64,
+        cancel: bool,
+    ) -> NestResult<crate::hfimport::FetchProgress> {
+        if node == self.vfs.data().id() {
+            return self.hf_fetch_status_here(id, cancel);
+        }
+        match admin::call(
+            self.rpc(),
+            node,
+            &AdminReq::HfFetchStatus { id, cancel },
+            Duration::from_secs(5),
+        )
+        .await?
+        {
+            AdminResp::HfFetch(p) => Ok(p),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
+    }
+
+    /// Download a Hugging Face repo spread over `hosts` (every serving host
+    /// when empty; one host for a single-host download): the files no host
+    /// has, each on the host assigned to it, so its first copy lands there.
+    /// At most `in_flight` files download at once across the cluster (hf_xet
+    /// already fills a link with one). Without `revision`, a repo the hub
+    /// has is finished at its cached revision; a new one at its main branch,
+    /// whose ref is then written. Returns the job id.
+    pub async fn hf_download_spread(
+        self: &Arc<Self>,
+        hub: String,
+        repo: String,
+        kind: String,
+        revision: Option<String>,
+        hosts: Vec<String>,
+        in_flight: usize,
+    ) -> NestResult<u64> {
+        use crate::hfimport::{FetchHost, FetchState};
+        let mount_hub = self.mount_hub(&hub)?;
+        let cached = crate::hfimport::cached_revision(&mount_hub, &repo, &kind);
+        let rev = revision.clone().or(cached.clone());
+        // Planned before the job starts, so a wrong name fails the request.
+        let plan =
+            crate::hfimport::repo_plan(None, &mount_hub, &repo, &kind, rev.as_deref()).await?;
+        let is_sha = |r: &str| r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit());
+        let branch = match (&revision, &cached) {
+            (None, None) => Some("main".to_string()),
+            (Some(r), _) if !is_sha(r) => Some(r.clone()),
+            _ => None,
+        };
+        // Where: the hosts named, else every serving one; room is free space
+        // above the margin spread imports keep.
+        let status = self.status().await?;
+        let wanted: Vec<NodeId> = if hosts.is_empty() {
+            status
+                .iter()
+                .filter(|s| s.info.as_ref().is_some_and(|i| i.serving))
+                .map(|s| s.node)
+                .collect()
+        } else {
+            self.resolve_hosts(&hosts)?
+                .into_iter()
+                .map(|h| h.node)
+                .collect()
+        };
+        // A host named alone gets what fits in its free space; hosts the
+        // planner chooses among keep the margin.
+        let named_one = hosts.len() == 1 && wanted.len() == 1;
+        let mut nodes = Vec::new();
+        let mut fhosts = Vec::new();
+        for s in status.iter().filter(|s| wanted.contains(&s.node)) {
+            let (free, total) = s
+                .info
+                .as_ref()
+                .map_or((0, 0), |i| (i.free_bytes, i.total_bytes));
+            nodes.push(s.node);
+            fhosts.push(FetchHost {
+                name: s.name.clone(),
+                room: if named_one {
+                    free
+                } else {
+                    free.saturating_sub(SPREAD_MARGIN.max(total / 20))
+                },
+            });
+        }
+        if fhosts.is_empty() {
+            return Err(NestError::Invalid("no host to download to".into()));
+        }
+        // What the hub lacks at that commit.
+        let snap = mount_hub
+            .join(crate::hfimport::repo_dir(&kind, &repo))
+            .join("snapshots")
+            .join(&plan.sha);
+        let all: Vec<(String, u64)> = plan
+            .files
+            .iter()
+            .map(|f| (f.name.clone(), f.size))
+            .collect();
+        let (missing, present): (Vec<_>, Vec<_>) = {
+            let snap = snap.clone();
+            let all = all.clone();
+            tokio::task::spawn_blocking(move || {
+                all.into_iter()
+                    .partition::<Vec<_>, _>(|(n, _)| std::fs::metadata(snap.join(n)).is_err())
+            })
+            .await
+            .map_err(|e| NestError::Io(e.to_string()))?
+        };
+        let assigned = crate::hfimport::assign_files(&missing, &fhosts);
+
+        let id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let job = Arc::new(Mutex::new(ClusterJob {
+            id,
+            what: format!("hf download {repo}"),
+            started_ms: now_ms(),
+            ..Default::default()
+        }));
+        {
+            let mut j = job.lock();
+            if !present.is_empty() {
+                j.notes.push(format!(
+                    "{} of {} files already in the cluster",
+                    present.len(),
+                    all.len()
+                ));
+            }
+            for (i, h) in fhosts.iter().enumerate() {
+                let mine: Vec<&(String, u64)> = missing
+                    .iter()
+                    .zip(&assigned)
+                    .filter(|(_, a)| **a == Some(i))
+                    .map(|(f, _)| f)
+                    .collect();
+                if !mine.is_empty() {
+                    j.hosts.insert(
+                        h.name.clone(),
+                        admin::JobProgress {
+                            total_files: mine.len() as u64,
+                            total_bytes: mine.iter().map(|f| f.1).sum(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            let unplaced: Vec<&str> = missing
+                .iter()
+                .zip(&assigned)
+                .filter(|(_, a)| a.is_none())
+                .map(|(f, _)| f.0.as_str())
+                .collect();
+            if !unplaced.is_empty() {
+                j.error = Some(format!(
+                    "no host has room for {} files (e.g. {})",
+                    unplaced.len(),
+                    unplaced[0]
+                ));
+            }
+        }
+        self.jobs.lock().insert(id, job.clone());
+        tracing::info!(job = id, %repo, sha = %plan.sha, files = missing.len(), hosts = fhosts.len(), in_flight, "hf download started");
+
+        // Batches: a big file alone; a host's small files together.
+        const SMALL: u64 = 64 << 20;
+        let mut queue: std::collections::VecDeque<(usize, Vec<(String, u64)>)> = Default::default();
+        {
+            let mut small: BTreeMap<usize, Vec<(String, u64)>> = BTreeMap::new();
+            let mut big: Vec<(usize, (String, u64))> = Vec::new();
+            for (f, a) in missing.iter().zip(&assigned) {
+                let Some(h) = *a else { continue };
+                if f.1 >= SMALL {
+                    big.push((h, f.clone()));
+                } else {
+                    small.entry(h).or_default().push(f.clone());
+                }
+            }
+            for (h, fs) in small {
+                queue.push_back((h, fs));
+            }
+            big.sort_by_key(|b| std::cmp::Reverse(b.1.1));
+            queue.extend(big.into_iter().map(|(h, f)| (h, vec![f])));
+        }
+
+        let me = self.clone();
+        tokio::spawn(async move {
+            let ref_path = branch.map(|b| {
+                mount_hub
+                    .join(crate::hfimport::repo_dir(&kind, &repo))
+                    .join("refs")
+                    .join(b)
+            });
+            if let Some(r) = ref_path.clone() {
+                let sha = plan.sha.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(d) = r.parent() {
+                        let _ = std::fs::create_dir_all(d);
+                    }
+                    std::fs::write(&r, &sha)
+                })
+                .await;
+            }
+            struct Running {
+                host: usize,
+                id: u64,
+                last: crate::hfimport::FetchProgress,
+                /// Status polls that failed in a row (the host is gone).
+                misses: u32,
+            }
+            let mut running: Vec<Running> = Vec::new();
+            let mut attempts: HashMap<String, u32> = HashMap::new();
+            let mut done_bytes = vec![0u64; fhosts.len()];
+            let mut done_files = vec![0u64; fhosts.len()];
+            let mut given: Vec<u64> = (0..fhosts.len())
+                .map(|i| {
+                    missing
+                        .iter()
+                        .zip(&assigned)
+                        .filter(|(_, a)| **a == Some(i))
+                        .map(|(f, _)| f.1)
+                        .sum()
+                })
+                .collect();
+            let mut failed: Vec<String> = Vec::new();
+            let in_flight = in_flight.max(1);
+            loop {
+                let cancel = job.lock().cancelled;
+                if cancel {
+                    for r in &running {
+                        let _ = me.hf_fetch_status(nodes[r.host], r.id, true).await;
+                    }
+                    break;
+                }
+                while running.len() < in_flight
+                    && let Some((h, files)) = queue.pop_front()
+                {
+                    match me
+                        .hf_fetch_on(nodes[h], &hub, &repo, &kind, &plan.sha, files.clone())
+                        .await
+                    {
+                        Ok(fid) => running.push(Running {
+                            host: h,
+                            id: fid,
+                            last: crate::hfimport::FetchProgress::new(&files),
+                            misses: 0,
+                        }),
+                        Err(e) => {
+                            // The host cannot fetch: its files go elsewhere.
+                            job.lock().notes.push(format!("{}: {e}", fhosts[h].name));
+                            for f in files {
+                                *attempts.entry(f.0.clone()).or_default() += 2;
+                                failed.push(f.0.clone());
+                                requeue(
+                                    &mut queue,
+                                    &mut given,
+                                    &fhosts,
+                                    h,
+                                    f,
+                                    &mut failed,
+                                    &attempts,
+                                );
+                            }
+                        }
+                    }
+                }
+                if running.is_empty() && queue.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut still = Vec::new();
+                for mut r in running.drain(..) {
+                    match me.hf_fetch_status(nodes[r.host], r.id, false).await {
+                        Ok(p) => {
+                            r.last = p;
+                            r.misses = 0;
+                        }
+                        Err(e) => {
+                            r.misses += 1;
+                            tracing::warn!(error = %e, host = %fhosts[r.host].name, "hf fetch status");
+                            // A minute without an answer: its files go again.
+                            if r.misses >= 60 {
+                                r.last.finished = true;
+                                r.last.error =
+                                    Some(format!("no answer from {}", fhosts[r.host].name));
+                            }
+                        }
+                    }
+                    if !r.last.finished {
+                        still.push(r);
+                        continue;
+                    }
+                    for f in &r.last.files {
+                        if f.state == FetchState::Done {
+                            done_bytes[r.host] += f.size;
+                            done_files[r.host] += 1;
+                            failed.retain(|x| x != &f.name);
+                        } else {
+                            let n = attempts.entry(f.name.clone()).or_default();
+                            *n += 1;
+                            let why = if f.error.is_empty() {
+                                r.last.error.clone().unwrap_or_else(|| "not fetched".into())
+                            } else {
+                                f.error.clone()
+                            };
+                            tracing::warn!(file = %f.name, host = %fhosts[r.host].name, error = %why, "hf fetch failed");
+                            if !failed.contains(&f.name) {
+                                failed.push(f.name.clone());
+                            }
+                            requeue(
+                                &mut queue,
+                                &mut given,
+                                &fhosts,
+                                r.host,
+                                (f.name.clone(), f.size),
+                                &mut failed,
+                                &attempts,
+                            );
+                        }
+                    }
+                }
+                running = still;
+                // Progress per host: finished files plus what is arriving.
+                let mut j = job.lock();
+                for (i, h) in fhosts.iter().enumerate() {
+                    let arriving: u64 = running
+                        .iter()
+                        .filter(|r| r.host == i)
+                        .map(|r| r.last.done_bytes())
+                        .sum();
+                    let total = given[i];
+                    if total == 0 && done_bytes[i] == 0 {
+                        continue;
+                    }
+                    let p = j.hosts.entry(h.name.clone()).or_default();
+                    p.total_bytes = total.max(done_bytes[i] + arriving);
+                    p.done_bytes = done_bytes[i] + arriving;
+                    p.done_files = done_files[i];
+                }
+            }
+            let mut j = job.lock();
+            for p in j.hosts.values_mut() {
+                p.finished = true;
+            }
+            if !failed.is_empty() && j.error.is_none() {
+                j.error = Some(format!(
+                    "{} files failed (e.g. {}); run it again to fetch them",
+                    failed.len(),
+                    failed[0]
+                ));
+            }
+            j.finished = true;
+            j.finished_ms = Some(now_ms());
+            tracing::info!(job = id, %repo, failed = failed.len(), cancelled = j.cancelled, "hf download finished");
+        });
+        Ok(id)
     }
 
     /// Delete Hugging Face repos from the hub through `hf cache rm` (see

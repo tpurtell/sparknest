@@ -1139,3 +1139,42 @@ rules against the kernel's mask.
 **Verified.** rhea, with io_uring: one open, four concurrent opens (same
 bytes), mmap and a reopen of a sealed 8 MiB file; all 521 of rhea's sole
 copies open (477 failed before).
+
+## ADR-045 — Hugging Face downloads are planned, spread over hosts and fetched one file at a time (2026-10-01)
+
+**Context.** `nest hf download` ran the `hf` command on one host. Progress
+counted only finished files (a 5 GB shard showed nothing until done), every
+file landed on that host, and hf fetched 8 files at once, which floods the
+uplink (hf_xet already uses several connections per file).
+
+**Decision.**
+- A small Python driver, `sparknest-hf-fetch` (tools/hf-fetch, installed
+  in libexec/sparknest), runs with the `hf` command's own interpreter, so
+  it uses the same huggingface_hub and hf_xet. `plan` resolves the
+  revision to a commit and lists the files with sizes; `fetch` downloads
+  given files at that commit one after another and reports bytes as JSON
+  lines (a tqdm subclass handed to `hf_hub_download`).
+- The coordinator (the node taking the request) plans once, skips files
+  the hub already has at that commit, and assigns the rest largest first
+  to the least loaded chosen host with room (free space above max(64 GiB,
+  5%); a host named alone needs only the space the files take). A file is
+  fetched by the host it is assigned to, through that host's mount, so its
+  first copy lands there: placement needs no hint in the filesystem.
+- At most `in_flight` files download at once across the cluster (default
+  1; benchmarks/M9-HF-DOWNLOAD.md). A host's small files (< 64 MiB) go as
+  one batch. A failed file is retried on its host, then on another; a host
+  that stops answering for a minute loses its files to others.
+- One job with byte progress per host; per-host fetches are not jobs
+  (`HfFetch` / `HfFetchStatus` admin requests, appended). Cancelling kills
+  the drivers; files already fetched stay, and running it again fetches
+  only what is missing. The branch ref (`refs/main`) is written to the
+  planned commit; without `--revision` a repo the hub has is finished at
+  its cached commit.
+- Default: spread over every serving host. `--host H` puts every file on
+  H; `--hosts a,b` limits the spread. The web UI's Download dialog and
+  Finish offer the same.
+
+**Verified.** Several hosts fetching different files of one repo at once
+through the running cluster: each file on the host that fetched it,
+contents matching their SHA-256 on other hosts. A one-node trial: byte
+progress, cancel, resume fetching only the missing files, `refs/main`.

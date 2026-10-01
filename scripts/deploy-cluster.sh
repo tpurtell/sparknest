@@ -76,7 +76,7 @@ CFG
   # The page-cache helper's wrapper and source (installed per host with
   # `sparknest-drop-page-cache --install`, which asks for sudo).
   rsync -a tools/drop-page-cache/sparknest-drop-page-cache tools/drop-page-cache/drop-page-cache.c "$name:$bin/"
-  rsync -a tools/allow-restart/sparknest-allow-restart "$name:$bin/"
+  rsync -a tools/allow-restart/sparknest-allow-restart tools/hf-fetch/sparknest-hf-fetch "$name:$bin/"
   rsync -a "$cfg" "$name:$state/node.toml"
   rsync -a --chmod=F600 "$secret_local" "$name:$state/cluster.secret"
   rm -f "$cfg"

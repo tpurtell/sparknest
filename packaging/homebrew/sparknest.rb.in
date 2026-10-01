@@ -26,6 +26,8 @@ class Sparknest < Formula
     (libexec/"sparknest").install "tools/drop-page-cache/drop-page-cache.c"
     # Installs a sudoers rule for exactly `systemctl restart sparknestd@CLUSTER`.
     bin.install "tools/allow-restart/sparknest-allow-restart"
+    # Hugging Face downloads: sparknestd runs it with the `hf` command's Python.
+    (libexec/"sparknest").install "tools/hf-fetch/sparknest-hf-fetch"
     inreplace pkgshare.glob("systemd/*.service"), "@BIN_DIR@", opt_bin
     doc.install "README.md", "docs/INSTALL.md"
   end
@@ -49,6 +51,7 @@ class Sparknest < Formula
     assert_match version.to_s, shell_output("#{bin}/sparknestd --version")
     assert_match "Usage: sparknest-drop-page-cache", shell_output("#{bin}/sparknest-drop-page-cache --help")
     assert_match "restart sparknestd@", shell_output("#{bin}/sparknest-allow-restart --help")
+    assert_path_exists libexec/"sparknest/sparknest-hf-fetch"
 
     # A one-node cluster over TCP without a mount: import, offload to an
     # archive store, snapshot the metadata, then rebuild the tree offline.

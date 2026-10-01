@@ -180,6 +180,21 @@ pub(crate) enum AdminReq {
         hub: String,
         hf: Option<String>,
     },
+    /// Fetch these files (name, size) of a Hugging Face repo at commit
+    /// `sha` into this node's hub: its share of a download
+    /// (`Placer::hf_fetch_here`). Answers `JobStarted` with a fetch id.
+    HfFetch {
+        repo: String,
+        kind: String,
+        sha: String,
+        files: Vec<(String, u64)>,
+        hub: String,
+    },
+    /// Progress of an `HfFetch`; `cancel` stops it.
+    HfFetchStatus {
+        id: u64,
+        cancel: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,6 +227,7 @@ pub(crate) enum AdminResp {
     Dropped(Result<String, String>),
     Jobs(Vec<crate::placer::ClusterJob>),
     JobStarted(u64),
+    HfFetch(crate::hfimport::FetchProgress),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -551,6 +567,28 @@ impl Handler for AdminService {
                         (_, None, _) => AdminResp::Err("this host has no mount".into()),
                         (_, _, None) => AdminResp::Err("hf is not installed on this host".into()),
                         _ => AdminResp::Err("no placer on this node".into()),
+                    }
+                }
+                AdminReq::HfFetch {
+                    repo,
+                    kind,
+                    sha,
+                    files,
+                    hub,
+                } => match a.placer.get().and_then(|p| p.upgrade()) {
+                    Some(p) => match p.hf_fetch_here(&hub, repo, kind, sha, files) {
+                        Ok(id) => AdminResp::JobStarted(id),
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    },
+                    None => AdminResp::Err("no placer on this node".into()),
+                },
+                AdminReq::HfFetchStatus { id, cancel } => {
+                    match a.placer.get().and_then(|p| p.upgrade()) {
+                        Some(p) => match p.hf_fetch_status_here(id, cancel) {
+                            Ok(f) => AdminResp::HfFetch(f),
+                            Err(e) => AdminResp::Err(e.to_string()),
+                        },
+                        None => AdminResp::Err("no placer on this node".into()),
                     }
                 }
                 AdminReq::CancelOwnJob { job } => match a.placer.get().and_then(|p| p.upgrade()) {
