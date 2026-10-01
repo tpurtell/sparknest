@@ -17,8 +17,9 @@ build runs natively on `SPARKNEST_ARM_BUILDER` (`scripts/cluster.env`).
    for Homebrew to download the source. Then `scripts/release.sh --draft`
    tags `v<version>` and uploads a draft release; review it and publish
    with `gh release edit v<version> --draft=false`.
-   When ostrich is busy, build arm64 elsewhere:
-   `SPARKNEST_ARM_BUILDER=rhea scripts/release.sh --draft`.
+   When ostrich is busy, build arm64 elsewhere, and beside running jobs
+   at low priority: `SPARKNEST_ARM_BUILDER=rhea SPARKNEST_ARM_NICE=19
+   SPARKNEST_ARM_JOBS=4 scripts/release.sh --draft`.
 5. Copy `sparknest.rb` to `Formula/` in `tpurtell/local-ai-tap` and follow
    that tap's `RELEASING.md`: native bottles on raptor and a Spark, a
    bottles release, `brew bottle --merge`, and install tests on the fleet.

@@ -86,7 +86,8 @@ ssh "$SPARKNEST_ARM_BUILDER" "set -e
   [ -x /home/linuxbrew/.linuxbrew/bin/brew ] && eval \"\$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)\"
   export PATH=\$HOME/.cargo/bin:\$PATH
   cd $rdir && tar -xzf $name.tar.gz && cd $name
-  CARGO_TARGET_DIR=$rdir/target cargo build --release --locked -p sparknestd -p nest-cli
+  CARGO_TARGET_DIR=$rdir/target nice -n ${SPARKNEST_ARM_NICE:-0} cargo build --release --locked \
+    -j ${SPARKNEST_ARM_JOBS:-\$(nproc)} -p sparknestd -p nest-cli
   $rdir/target/release/nest --version | grep -q '$version'"
 mkdir -p "$out/stage/bin-aarch64"
 for b in sparknestd nest; do
