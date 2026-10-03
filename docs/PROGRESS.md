@@ -29,6 +29,8 @@ what is next. Keep entries short; link to benchmarks and ADRs.
 - Hugging Face downloads (ADR-045): planned, spread over the hosts by
   default (each file fetched by the host it is assigned to), one file in
   flight across the cluster, byte progress per host, cancel and resume.
+- 0.2.1 (ADR-046): four files in flight; stalled fetches are given up on
+  and a host that keeps failing (emu without IPv4) hands its files on.
 - Next: measure the scratch disk idle; daily fstrim (root checklist).
 
 ## 2026-09-27 — Reads from other hosts made fast (ADR-030…035)

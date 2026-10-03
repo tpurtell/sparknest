@@ -1178,3 +1178,22 @@ uplink (hf_xet already uses several connections per file).
 through the running cluster: each file on the host that fetched it,
 contents matching their SHA-256 on other hosts. A one-node trial: byte
 progress, cancel, resume fetching only the missing files, `refs/main`.
+
+## ADR-046 — Downloads: four files in flight; stalled fetches and failing hosts hand their files on (2026-10-03)
+
+**Context.** ADR-045 kept one file in flight across the cluster. In real
+use that left the uplink underused (the one-file test was on raptor; four
+in flight downloads faster in practice). And when emu lost its IPv4
+address, each of its fetches hung about six minutes in DNS and then failed:
+with one file in flight the whole download stalled behind it (the first
+attempt sat at 0 until cancelled), and each of emu's files was tried twice
+there before moving.
+
+**Decision.** Four files in flight by default (`--in-flight`). A fetch
+with no new bytes for 90 s before its first byte, or 120 s after, is
+cancelled and counts as a failure. A host whose fetches fail twice in a
+row is dropped for the rest of the download: it gets no new files and its
+queued ones move at once to the least loaded good host with room; the job
+says so. A file is retried once on its host, then on another, and given up
+after three tries. The scheduling (`hfimport::Schedule`) is plain code
+with unit tests.

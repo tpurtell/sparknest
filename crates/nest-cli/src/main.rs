@@ -389,9 +389,10 @@ enum HfCmd {
     ///
     /// The files no host has are assigned to hosts (largest first, evenly,
     /// within each host's free space) and each is downloaded through the
-    /// mount of its host, so its first copy lands there. One file downloads
-    /// at a time across the cluster by default (hf_xet fills a gigabit link
-    /// with one). Files the cluster already holds stay where they are.
+    /// mount of its host, so its first copy lands there. Four files download
+    /// at once across the cluster by default (--in-flight); a host that
+    /// cannot fetch (it fails twice in a row, or stalls) hands its files to
+    /// the others. Files the cluster already holds stay where they are.
     /// Without --revision, a repo the hub already has is finished at its
     /// cached revision; a new one is fetched at its main branch.
     Download {
@@ -411,7 +412,7 @@ enum HfCmd {
         #[arg(long)]
         revision: Option<String>,
         /// Files downloading at once across the cluster.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 4)]
         in_flight: usize,
         /// Follow the job until it finishes.
         #[arg(long)]

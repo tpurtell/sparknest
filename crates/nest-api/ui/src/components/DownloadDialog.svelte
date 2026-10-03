@@ -155,7 +155,7 @@
           {/if}
           {#if !fits}<span class="tiny" style="color:var(--bad)">does not fit there</span>{/if}
           <div class="tiny muted">
-            {spread ? "Each file goes to one of these hosts, evenly by size; one file downloads at a time." : "Every file goes to this host."}
+            {spread ? "Each file goes to one of these hosts, evenly by size; four download at a time." : "Every file goes to this host."}
             Only what no host has is fetched; what the cluster already holds stays where it is.
           </div>
         </div>

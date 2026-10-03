@@ -18,3 +18,6 @@ itself defaults to 8 files at once, which floods the uplink.
 
 Through a one-node trial's FUSE mount (no passthrough, TCP fabric) the same
 download ran at ~80 MB/s with byte-level progress per file.
+
+Update (2026-10-03, ADR-046): in real use four files in flight downloaded
+faster than one, so the default is now four.

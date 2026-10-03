@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "nest-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "nest-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1030,14 +1030,14 @@ dependencies = [
 
 [[package]]
 name = "nest-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "nest-types",
 ]
 
 [[package]]
 name = "nest-data"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "nest-fabric"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "cc",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "nest-fuse"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fuser",
  "io-uring",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "nest-meta"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "nest-types",
  "postcard",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "nest-place"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "futures",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "nest-raft"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "nest-rpc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "futures",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "nest-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "io-uring",
  "libc",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "nest-testkit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "futures",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "nest-types"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "serde",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "sparknestd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytes",

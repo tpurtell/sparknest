@@ -1383,6 +1383,146 @@ pub fn assign_files(files: &[(String, u64)], hosts: &[FetchHost]) -> Vec<Option<
     out
 }
 
+/// Which host fetches which file next: batches per host (a big file
+/// alone, a host's small files together), retries, and hosts that keep
+/// failing. A failed file is retried once on its host, then on another; a
+/// host that fails twice in a row (it cannot reach the Hub, say) gets no
+/// more files and its queued ones move to the others at once.
+pub struct Schedule {
+    pub hosts: Vec<FetchHost>,
+    /// Bytes and files each host is to hold (assigned, plus moved in,
+    /// minus moved out).
+    pub given: Vec<u64>,
+    pub given_files: Vec<u64>,
+    pub bad: Vec<bool>,
+    strikes: Vec<u32>,
+    queue: std::collections::VecDeque<(usize, Vec<(String, u64)>)>,
+    attempts: std::collections::HashMap<String, u32>,
+    /// Files given up on.
+    pub failed: Vec<String>,
+    /// What people should know (hosts dropped).
+    pub notes: Vec<String>,
+}
+
+/// Files below this go in one batch per host.
+const SMALL_FILE: u64 = 64 << 20;
+/// Failures in a row that drop a host.
+const STRIKES: u32 = 2;
+
+impl Schedule {
+    pub fn new(
+        hosts: Vec<FetchHost>,
+        files: &[(String, u64)],
+        assigned: &[Option<usize>],
+    ) -> Schedule {
+        let n = hosts.len();
+        let mut given = vec![0u64; n];
+        let mut given_files = vec![0u64; n];
+        let mut small: std::collections::BTreeMap<usize, Vec<(String, u64)>> = Default::default();
+        let mut big: Vec<(usize, (String, u64))> = Vec::new();
+        for (f, a) in files.iter().zip(assigned) {
+            let Some(h) = *a else { continue };
+            given[h] += f.1;
+            given_files[h] += 1;
+            if f.1 >= SMALL_FILE {
+                big.push((h, f.clone()));
+            } else {
+                small.entry(h).or_default().push(f.clone());
+            }
+        }
+        big.sort_by_key(|b| std::cmp::Reverse(b.1.1));
+        let mut queue: std::collections::VecDeque<_> = small.into_iter().collect();
+        queue.extend(big.into_iter().map(|(h, f)| (h, vec![f])));
+        Schedule {
+            hosts,
+            given,
+            given_files,
+            bad: vec![false; n],
+            strikes: vec![0; n],
+            queue,
+            attempts: Default::default(),
+            failed: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The next batch to start, never on a dropped host.
+    pub fn next_batch(&mut self) -> Option<(usize, Vec<(String, u64)>)> {
+        while let Some((h, files)) = self.queue.pop_front() {
+            if !self.bad[h] {
+                return Some((h, files));
+            }
+            for f in files {
+                self.move_away(h, f);
+            }
+        }
+        None
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn done(&mut self, host: usize) {
+        self.strikes[host] = 0;
+    }
+
+    /// `file` failed on `host` (or the host could not be asked).
+    pub fn failed(&mut self, host: usize, file: (String, u64), why: &str) {
+        let n = {
+            let a = self.attempts.entry(file.0.clone()).or_default();
+            *a += 1;
+            *a
+        };
+        self.strikes[host] += 1;
+        if self.strikes[host] >= STRIKES && !self.bad[host] {
+            self.bad[host] = true;
+            self.notes.push(format!(
+                "{}: {} fetches failed in a row ({why}); its files go to other hosts",
+                self.hosts[host].name, self.strikes[host]
+            ));
+            // Its queued files move now, not when their turn comes.
+            let mine: Vec<_> = self
+                .queue
+                .iter()
+                .filter(|(h, _)| *h == host)
+                .cloned()
+                .collect();
+            self.queue.retain(|(h, _)| *h != host);
+            for (_, fs) in mine {
+                for f in fs {
+                    self.move_away(host, f);
+                }
+            }
+        }
+        if n >= 3 {
+            self.failed.push(file.0);
+        } else if n == 1 && !self.bad[host] {
+            self.queue.push_back((host, vec![file]));
+        } else {
+            self.move_away(host, file);
+        }
+    }
+
+    /// Give `file` to the least loaded other good host with room.
+    fn move_away(&mut self, from: usize, file: (String, u64)) {
+        let to = (0..self.hosts.len())
+            .filter(|&h| h != from && !self.bad[h])
+            .filter(|&h| self.hosts[h].room.saturating_sub(self.given[h]) >= file.1)
+            .min_by_key(|&h| self.given[h]);
+        match to {
+            Some(to) => {
+                self.given[from] = self.given[from].saturating_sub(file.1);
+                self.given[to] += file.1;
+                self.given_files[from] = self.given_files[from].saturating_sub(1);
+                self.given_files[to] += 1;
+                self.queue.push_back((to, vec![file]));
+            }
+            None => self.failed.push(file.0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod fetch_tests {
     use super::*;
@@ -1431,5 +1571,65 @@ mod fetch_tests {
         assert_eq!(p.done_bytes(), 100);
         assert_eq!(p.files[1].state, FetchState::Failed);
         assert_eq!(p.files[1].error, "HTTPError: 404");
+    }
+
+    fn hosts(n: usize) -> Vec<FetchHost> {
+        (0..n)
+            .map(|i| FetchHost {
+                name: format!("h{i}"),
+                room: 1 << 40,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_host_that_keeps_failing_is_dropped_and_its_files_move() {
+        let gb = 1u64 << 30;
+        let files: Vec<(String, u64)> = (0..6).map(|i| (format!("f{i}"), gb)).collect();
+        let assigned: Vec<Option<usize>> = (0..6).map(|i| Some(i % 2)).collect();
+        let mut s = Schedule::new(hosts(2), &files, &assigned);
+        // Host 1 cannot reach the Hub: its first file fails twice.
+        let mut on = std::collections::HashMap::new();
+        while let Some((h, fs)) = s.next_batch() {
+            for f in fs {
+                *on.entry(h).or_insert(0) += 1;
+                if h == 1 {
+                    s.failed(h, f, "LocalEntryNotFoundError");
+                } else {
+                    s.done(h);
+                }
+            }
+        }
+        assert!(s.bad[1] && !s.bad[0]);
+        assert!(
+            s.failed.is_empty(),
+            "everything ended up on host 0: {:?}",
+            s.failed
+        );
+        assert_eq!(on[&0], 6, "{on:?}");
+        assert_eq!(on[&1], 2, "host 1 was tried twice, then dropped");
+        assert_eq!(s.given, vec![6 * gb, 0]);
+        assert_eq!(s.given_files, vec![6, 0]);
+        assert!(s.notes[0].starts_with("h1: 2 fetches failed"));
+    }
+
+    #[test]
+    fn one_failure_retries_on_the_same_host_and_all_bad_gives_up() {
+        let mut s = Schedule::new(hosts(2), &[("a".into(), 100 << 20)], &[Some(0)]);
+        let (h, fs) = s.next_batch().unwrap();
+        s.failed(h, fs[0].clone(), "timeout");
+        assert_eq!(
+            s.next_batch().unwrap().0,
+            0,
+            "a single failure stays on its host"
+        );
+        // Both hosts fail: given up after three tries, not lost silently.
+        let mut s = Schedule::new(hosts(2), &[("a".into(), 100 << 20)], &[Some(0)]);
+        while let Some((h, fs)) = s.next_batch() {
+            for f in fs {
+                s.failed(h, f, "down");
+            }
+        }
+        assert_eq!(s.failed, vec!["a".to_string()]);
     }
 }

@@ -63,38 +63,6 @@ pub struct ClusterJob {
     host_jobs: Vec<(NodeId, u64)>,
 }
 
-/// Put a failed file back in the queue: on the same host for its first
-/// retry, then on the least loaded other host with room; after three tries
-/// it stays failed.
-fn requeue(
-    queue: &mut std::collections::VecDeque<(usize, Vec<(String, u64)>)>,
-    given: &mut [u64],
-    hosts: &[crate::hfimport::FetchHost],
-    from: usize,
-    file: (String, u64),
-    failed: &mut Vec<String>,
-    attempts: &HashMap<String, u32>,
-) {
-    let n = attempts.get(&file.0).copied().unwrap_or(0);
-    if n >= 3 {
-        return;
-    }
-    let to = if n <= 1 {
-        Some(from)
-    } else {
-        (0..hosts.len())
-            .filter(|&h| h != from && hosts[h].room.saturating_sub(given[h]) >= file.1)
-            .min_by_key(|&h| given[h])
-    };
-    let Some(to) = to else { return };
-    if to != from {
-        given[from] = given[from].saturating_sub(file.1);
-        given[to] += file.1;
-    }
-    failed.retain(|x| x != &file.0);
-    queue.push_back((to, vec![file]));
-}
-
 fn cancelled(job: &Mutex<ClusterJob>) -> NestResult<()> {
     if job.lock().cancelled {
         return Err(NestError::Io(
@@ -1379,8 +1347,10 @@ impl Placer {
     /// Download a Hugging Face repo spread over `hosts` (every serving host
     /// when empty; one host for a single-host download): the files no host
     /// has, each on the host assigned to it, so its first copy lands there.
-    /// At most `in_flight` files download at once across the cluster (hf_xet
-    /// already fills a link with one). Without `revision`, a repo the hub
+    /// At most `in_flight` files download at once across the cluster; a
+    /// fetch that stalls is given up on, and a host that fails twice in a
+    /// row hands its files to the others (`hfimport::Schedule`). Without
+    /// `revision`, a repo the hub
     /// has is finished at its cached revision; a new one at its main branch,
     /// whose ref is then written. Returns the job id.
     pub async fn hf_download_spread(
@@ -1516,26 +1486,7 @@ impl Placer {
         self.jobs.lock().insert(id, job.clone());
         tracing::info!(job = id, %repo, sha = %plan.sha, files = missing.len(), hosts = fhosts.len(), in_flight, "hf download started");
 
-        // Batches: a big file alone; a host's small files together.
-        const SMALL: u64 = 64 << 20;
-        let mut queue: std::collections::VecDeque<(usize, Vec<(String, u64)>)> = Default::default();
-        {
-            let mut small: BTreeMap<usize, Vec<(String, u64)>> = BTreeMap::new();
-            let mut big: Vec<(usize, (String, u64))> = Vec::new();
-            for (f, a) in missing.iter().zip(&assigned) {
-                let Some(h) = *a else { continue };
-                if f.1 >= SMALL {
-                    big.push((h, f.clone()));
-                } else {
-                    small.entry(h).or_default().push(f.clone());
-                }
-            }
-            for (h, fs) in small {
-                queue.push_back((h, fs));
-            }
-            big.sort_by_key(|b| std::cmp::Reverse(b.1.1));
-            queue.extend(big.into_iter().map(|(h, f)| (h, vec![f])));
-        }
+        let mut sched = crate::hfimport::Schedule::new(fhosts, &missing, &assigned);
 
         let me = self.clone();
         tokio::spawn(async move {
@@ -1555,39 +1506,34 @@ impl Placer {
                 })
                 .await;
             }
+            /// A fetch with no new bytes for this long is given up on
+            /// (before its first byte, a shorter wait: the host may not
+            /// reach the Hub at all).
+            const STALL: Duration = Duration::from_secs(120);
+            const FIRST_BYTE: Duration = Duration::from_secs(90);
             struct Running {
                 host: usize,
                 id: u64,
                 last: crate::hfimport::FetchProgress,
                 /// Status polls that failed in a row (the host is gone).
                 misses: u32,
+                bytes: u64,
+                moved: std::time::Instant,
             }
             let mut running: Vec<Running> = Vec::new();
-            let mut attempts: HashMap<String, u32> = HashMap::new();
-            let mut done_bytes = vec![0u64; fhosts.len()];
-            let mut done_files = vec![0u64; fhosts.len()];
-            let mut given: Vec<u64> = (0..fhosts.len())
-                .map(|i| {
-                    missing
-                        .iter()
-                        .zip(&assigned)
-                        .filter(|(_, a)| **a == Some(i))
-                        .map(|(f, _)| f.1)
-                        .sum()
-                })
-                .collect();
-            let mut failed: Vec<String> = Vec::new();
+            let n = sched.hosts.len();
+            let mut done_bytes = vec![0u64; n];
+            let mut done_files = vec![0u64; n];
             let in_flight = in_flight.max(1);
             loop {
-                let cancel = job.lock().cancelled;
-                if cancel {
+                if job.lock().cancelled {
                     for r in &running {
                         let _ = me.hf_fetch_status(nodes[r.host], r.id, true).await;
                     }
                     break;
                 }
                 while running.len() < in_flight
-                    && let Some((h, files)) = queue.pop_front()
+                    && let Some((h, files)) = sched.next_batch()
                 {
                     match me
                         .hf_fetch_on(nodes[h], &hub, &repo, &kind, &plan.sha, files.clone())
@@ -1598,32 +1544,24 @@ impl Placer {
                             id: fid,
                             last: crate::hfimport::FetchProgress::new(&files),
                             misses: 0,
+                            bytes: 0,
+                            moved: std::time::Instant::now(),
                         }),
                         Err(e) => {
-                            // The host cannot fetch: its files go elsewhere.
-                            job.lock().notes.push(format!("{}: {e}", fhosts[h].name));
+                            let why = e.to_string();
                             for f in files {
-                                *attempts.entry(f.0.clone()).or_default() += 2;
-                                failed.push(f.0.clone());
-                                requeue(
-                                    &mut queue,
-                                    &mut given,
-                                    &fhosts,
-                                    h,
-                                    f,
-                                    &mut failed,
-                                    &attempts,
-                                );
+                                sched.failed(h, f, &why);
                             }
                         }
                     }
                 }
-                if running.is_empty() && queue.is_empty() {
+                if running.is_empty() && sched.is_empty() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let mut still = Vec::new();
                 for mut r in running.drain(..) {
+                    let name = sched.hosts[r.host].name.clone();
                     match me.hf_fetch_status(nodes[r.host], r.id, false).await {
                         Ok(p) => {
                             r.last = p;
@@ -1631,14 +1569,25 @@ impl Placer {
                         }
                         Err(e) => {
                             r.misses += 1;
-                            tracing::warn!(error = %e, host = %fhosts[r.host].name, "hf fetch status");
+                            tracing::warn!(error = %e, host = %name, "hf fetch status");
                             // A minute without an answer: its files go again.
                             if r.misses >= 60 {
                                 r.last.finished = true;
-                                r.last.error =
-                                    Some(format!("no answer from {}", fhosts[r.host].name));
+                                r.last.error = Some(format!("no answer from {name}"));
                             }
                         }
+                    }
+                    let b = r.last.done_bytes();
+                    if b != r.bytes {
+                        r.bytes = b;
+                        r.moved = std::time::Instant::now();
+                    }
+                    let limit = if r.bytes == 0 { FIRST_BYTE } else { STALL };
+                    if !r.last.finished && r.moved.elapsed() > limit {
+                        tracing::warn!(host = %name, secs = limit.as_secs(), "hf fetch stalled");
+                        let _ = me.hf_fetch_status(nodes[r.host], r.id, true).await;
+                        r.last.finished = true;
+                        r.last.error = Some(format!("no progress for {} s", limit.as_secs()));
                     }
                     if !r.last.finished {
                         still.push(r);
@@ -1648,54 +1597,51 @@ impl Placer {
                         if f.state == FetchState::Done {
                             done_bytes[r.host] += f.size;
                             done_files[r.host] += 1;
-                            failed.retain(|x| x != &f.name);
+                            sched.done(r.host);
                         } else {
-                            let n = attempts.entry(f.name.clone()).or_default();
-                            *n += 1;
                             let why = if f.error.is_empty() {
                                 r.last.error.clone().unwrap_or_else(|| "not fetched".into())
                             } else {
                                 f.error.clone()
                             };
-                            tracing::warn!(file = %f.name, host = %fhosts[r.host].name, error = %why, "hf fetch failed");
-                            if !failed.contains(&f.name) {
-                                failed.push(f.name.clone());
-                            }
-                            requeue(
-                                &mut queue,
-                                &mut given,
-                                &fhosts,
-                                r.host,
-                                (f.name.clone(), f.size),
-                                &mut failed,
-                                &attempts,
-                            );
+                            tracing::warn!(file = %f.name, host = %name, error = %why, "hf fetch failed");
+                            sched.failed(r.host, (f.name.clone(), f.size), &why);
                         }
                     }
                 }
                 running = still;
                 // Progress per host: finished files plus what is arriving.
                 let mut j = job.lock();
-                for (i, h) in fhosts.iter().enumerate() {
+                for note in sched.notes.drain(..) {
+                    tracing::warn!(%repo, "{note}");
+                    j.notes.push(note);
+                }
+                for i in 0..n {
                     let arriving: u64 = running
                         .iter()
                         .filter(|r| r.host == i)
                         .map(|r| r.last.done_bytes())
                         .sum();
-                    let total = given[i];
-                    if total == 0 && done_bytes[i] == 0 {
+                    let total = sched.given[i];
+                    if total == 0
+                        && done_bytes[i] == 0
+                        && !j.hosts.contains_key(&sched.hosts[i].name)
+                    {
                         continue;
                     }
-                    let p = j.hosts.entry(h.name.clone()).or_default();
+                    let p = j.hosts.entry(sched.hosts[i].name.clone()).or_default();
                     p.total_bytes = total.max(done_bytes[i] + arriving);
                     p.done_bytes = done_bytes[i] + arriving;
                     p.done_files = done_files[i];
+                    p.total_files = sched.given_files[i].max(done_files[i]);
                 }
             }
             let mut j = job.lock();
+            j.notes.append(&mut sched.notes);
             for p in j.hosts.values_mut() {
                 p.finished = true;
             }
+            let failed = &sched.failed;
             if !failed.is_empty() && j.error.is_none() {
                 j.error = Some(format!(
                     "{} files failed (e.g. {}); run it again to fetch them",

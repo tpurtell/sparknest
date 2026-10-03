@@ -827,8 +827,7 @@ struct HfDownloadReq {
     #[serde(default)]
     hosts: Vec<String>,
     revision: Option<String>,
-    /// Files downloading at once across the cluster (default 1: hf_xet
-    /// fills a gigabit link with one).
+    /// Files downloading at once across the cluster (default 4).
     in_flight: Option<usize>,
     /// Unused (the daemon finds hf itself); kept for older CLIs.
     #[allow(dead_code)]
@@ -863,7 +862,7 @@ async fn hf_download(State(api): State<Api>, Json(r): Json<HfDownloadReq>) -> R<
             r.kind,
             r.revision,
             hosts,
-            r.in_flight.unwrap_or(1).clamp(1, 16),
+            r.in_flight.unwrap_or(4).clamp(1, 16),
         )
         .await?;
     Ok(Json(json!({ "job": job })))
