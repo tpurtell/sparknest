@@ -33,7 +33,7 @@ All nine hosts (2026-10-12): `/etc/sysctl.d/90-sparknest-tcp.conf` sets
 |---|---|---|---|---|---|
 | kakapo | arm64 | Ubuntu 24.04.5 | 7.0.0-1019-nvidia | 172.22.2.7, RTL8127 (r8127), 10GbE | Spark without the fabric cable; `fuse.enable_uring` still N (set at runtime when it joins, kernel command line at next reboot) |
 | cassowary | arm64 | Ubuntu 24.04.5 | 7.0.0-1019-nvidia | 172.22.2.8 (`cassowary.birds.vimoin.com`), `enP7s7`, 10GbE | Spark without the fabric cable (node 10, 4 lanes; added 2026-10-21); 20 cores, 119 GiB, 3.4 TiB free; `fuse.enable_uring` N |
-| oliver | amd64 | Ubuntu 24.04.5 on WSL2 (NAT) | 6.18.40.1-microsoft-standard-WSL2 | Windows RTL8127, 10GbE; WSL eth0 172.25.172.80 behind NAT | 24 cores, 62 GiB, ext4 VHD 3.6T |
+| oliver (retired 2026-10-26; disk lost, rebuilt as maxq) | amd64 | Ubuntu 24.04.5 on WSL2 (NAT) | 6.18.40.1-microsoft-standard-WSL2 | Windows RTL8127, 10GbE; WSL eth0 172.25.172.80 behind NAT | 24 cores, 62 GiB, ext4 VHD 3.6T |
 
 oliver: never use WSL mirrored networking (it drops inbound connections
 there); stays on NAT and dials out. Tuned 2026-10-12 (benchmarks/M10-LAN-TCP.md):
