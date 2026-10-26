@@ -3036,6 +3036,60 @@ impl Placer {
         )
     }
 
+    /// Drop every copy recorded on a host that is gone for good (its disk
+    /// lost, the host rebuilt): evicting asks the holder, which cannot
+    /// answer, so the records go from here. Refused while the host answers,
+    /// and per file for its last live copy (those files are lost: remove
+    /// them). Returns (retired, kept as the last copy).
+    pub async fn forget_copies(&self, host: &HostRef) -> NestResult<(u64, Vec<FileId>)> {
+        if host.node == self.vfs.data().id() {
+            return Err(NestError::Invalid(
+                "refusing to forget this node's own copies".into(),
+            ));
+        }
+        if admin::call(
+            self.rpc(),
+            host.node,
+            &AdminReq::Info,
+            Duration::from_secs(5),
+        )
+        .await
+        .is_ok()
+        {
+            return Err(NestError::Invalid(format!(
+                "{} answers; evict its copies instead",
+                host.name
+            )));
+        }
+        let store = host.node.live_store();
+        let copies = query::store_inventory(&self.conn()?, store).map_err(sql)?;
+        tracing::warn!(host = %host.name, copies = copies.len(), "forgetting a lost host's copies");
+        let (mut retired, mut kept) = (0, Vec::new());
+        for chunk in copies.chunks(1024) {
+            let cmds = chunk
+                .iter()
+                .map(|&(file, generation)| Command::RetireReplica {
+                    file,
+                    generation,
+                    store,
+                    allow_last: false,
+                })
+                .collect();
+            match self.vfs.data().meta().propose(Command::Batch(cmds)).await? {
+                nest_meta::Reply::Batch(rs) => {
+                    for (r, &(file, _)) in rs.into_iter().zip(chunk) {
+                        match r {
+                            Ok(_) | Err(NestError::NotFound) => retired += 1,
+                            Err(_) => kept.push(file),
+                        }
+                    }
+                }
+                other => return Err(NestError::Io(format!("unexpected {other:?}"))),
+            }
+        }
+        Ok((retired, kept))
+    }
+
     /// Apply a membership change on the leader.
     pub async fn change_membership(&self, change: admin::MembershipChange) -> NestResult<()> {
         let leader = self.vfs.data().meta().leader().ok_or(NestError::NoQuorum)?;

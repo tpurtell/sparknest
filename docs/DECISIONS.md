@@ -2394,3 +2394,28 @@ load it through the mount. Two more gaps sat behind that one:
 stream: the gateway's fast disk would wait on the slow one. A per-source
 cap on grants: a fixed number is wrong for one source and for eight;
 fewest-held adapts to however many there are.
+
+## ADR-070 — Forgetting a lost host's copies (2026-10-26)
+
+**Context.** oliver's disk failed (NTFS ran out of room for the VHDX's
+extents) and the host is being rebuilt, its sparknest state not
+recovered. The metadata still records 599 copies on it. Evicting a copy
+asks its holder, which cannot answer, so the records stayed: reads and
+plans treated oliver as a holder, and the last-copy check counted its
+copy, so a later eviction elsewhere could have dropped the one real
+copy (GLM-5.3-BF16 was left with only the `models` archive). `nest
+cluster remove` changes only the Raft membership.
+
+**Decision.** `nest cluster remove HOST --forget-copies` first retires
+every copy recorded in HOST's store from the leader side, through the
+ordinary `RetireReplica` (no new command), in batches. It is refused
+while HOST answers (evict instead), and `RetireReplica` without
+`allow_last` keeps any file's last live copy: the removal is then
+refused, naming the count, so those files are removed (`nest rm`) or
+restored first, a deliberate step. The host is removed only once
+nothing was kept.
+
+**Alternatives.** Dropping the records on `cluster remove` itself: a
+host removed to be re-imaged with its disk intact would lose copies it
+still holds. Retiring with `allow_last`: lost files would sit in the
+namespace with no copy, failing every read instead of being absent.

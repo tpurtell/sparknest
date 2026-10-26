@@ -1970,7 +1970,17 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/HostRequest"
+              type: object
+              required: [host]
+              properties:
+                host:
+                  type: string
+                forget_copies:
+                  type: boolean
+                  description: >-
+                    The host is gone for good: first drop the copies the
+                    cluster records on it. Refused while the host answers;
+                    the removal is refused if it held any file's last copy.
       responses:
         "200":
           description: Removed.
@@ -1982,6 +1992,10 @@ paths:
                 properties:
                   removed:
                     type: string
+                  forgot_copies:
+                    type: integer
+                    nullable: true
+                    description: Copy records dropped, when `forget_copies` was asked.
         default:
           $ref: "#/components/responses/Error"
 

@@ -750,7 +750,14 @@ enum ClusterCmd {
     /// Show members, voters and the leader.
     Ls,
     /// Remove a node from the cluster (e.g. before re-imaging it).
-    Remove { host: String },
+    Remove {
+        host: String,
+        /// The host is gone for good (its disk lost): drop the copies the
+        /// cluster records on it. Refused while it answers, and for any
+        /// file it held the last copy of (remove those first).
+        #[arg(long)]
+        forget_copies: bool,
+    },
     /// Move a host off the RDMA fabric or onto it (ADR-047). Stop it, run
     /// this, switch its cable and node.toml (role, listen, members), start it.
     Role {
@@ -1929,9 +1936,15 @@ async fn main() -> Result<()> {
                 }
                 v
             }
-            ClusterCmd::Remove { host } => {
-                c.post("/v1/cluster/remove", json!({ "host": host }))
-                    .await?
+            ClusterCmd::Remove {
+                host,
+                forget_copies,
+            } => {
+                c.post(
+                    "/v1/cluster/remove",
+                    json!({ "host": host, "forget_copies": forget_copies }),
+                )
+                .await?
             }
             ClusterCmd::Role { host, role, addr } => {
                 c.post(

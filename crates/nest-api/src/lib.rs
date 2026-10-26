@@ -1244,6 +1244,9 @@ async fn net(State(api): State<Api>) -> R<Vec<nest_place::placer::NetStatus>> {
 #[derive(Deserialize)]
 struct RemoveReq {
     host: String,
+    /// The host is gone for good: drop the copies recorded on it first.
+    #[serde(default)]
+    forget_copies: bool,
 }
 
 #[derive(Deserialize)]
@@ -1287,10 +1290,23 @@ async fn cluster_remove(State(api): State<Api>, Json(r): Json<RemoveReq>) -> R<s
             "refusing to remove the node serving this request; ask another node",
         ));
     }
+    let mut forgot = json!(null);
+    if r.forget_copies {
+        let (retired, kept) = api.placer.forget_copies(&h).await?;
+        if !kept.is_empty() {
+            return Err(bad(format!(
+                "{} held the last copy of {} files (first: file {}); remove them, then retry",
+                h.name,
+                kept.len(),
+                kept[0].0
+            )));
+        }
+        forgot = json!(retired);
+    }
     api.placer
         .change_membership(nest_place::admin::MembershipChange::Remove { node: h.node })
         .await?;
-    Ok(Json(json!({ "removed": h.name })))
+    Ok(Json(json!({ "removed": h.name, "forgot_copies": forgot })))
 }
 
 #[derive(Deserialize)]

@@ -426,3 +426,82 @@ async fn run_import(
     .await;
     p.import_progress(id).unwrap()
 }
+
+/// A host lost for good: the copies recorded on it are dropped from the
+/// leader (it cannot evict them itself), never a file's last live copy,
+/// and only once the host stops answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn forgetting_a_lost_hosts_copies_keeps_last_copies() {
+    let mut c = ready(3).await;
+    let n1 = c.node(1);
+    let dir = n1.vfs.mkdir(FileId::ROOT, b"data", 0o755).await.unwrap().id;
+    let write = |name: &'static [u8]| {
+        let v = c.node(1).vfs.clone();
+        async move {
+            let (a, fh, _) = v.create(dir, name, 0o644, oflags::WRONLY).await.unwrap();
+            v.write(fh, 0, vec![5u8; 1 << 20]).await.unwrap();
+            v.release(fh, None).await;
+            a.id
+        }
+    };
+    let shared = write(b"shared.bin").await;
+    let only = write(b"only-on-n3.bin").await;
+    let copies = |c: &TestCluster, f| {
+        let r = c.node(1).meta.open_reader().unwrap();
+        nest_meta::query::replicas(&r, f).unwrap().len()
+    };
+    c.eventually("written", Duration::from_secs(10), |c| {
+        copies(c, shared) == 1 && copies(c, only) == 1
+    })
+    .await;
+    let sel = |p: &str| Selector::parse(p, "/hub").unwrap();
+    let job = n1
+        .placer
+        .replicate(sel("/data/shared.bin"), vec!["n3".into()], 4)
+        .await
+        .unwrap();
+    let job2 = n1
+        .placer
+        .replicate(sel("/data/only-on-n3.bin"), vec!["n3".into()], 4)
+        .await
+        .unwrap();
+    c.eventually("replicated", Duration::from_secs(20), |c| {
+        [job, job2]
+            .iter()
+            .all(|j| c.node(1).placer.job(*j).is_some_and(|j| j.finished))
+    })
+    .await;
+    c.converge().await;
+    assert_eq!((copies(&c, shared), copies(&c, only)), (2, 2));
+    let report = c
+        .node(1)
+        .placer
+        .evict(&sel("/data/only-on-n3.bin"), &["n1".into()])
+        .await
+        .unwrap();
+    assert_eq!(report[0].removed, 1, "{report:?}");
+    let n3 = c
+        .node(1)
+        .placer
+        .resolve_hosts(&["n3".into()])
+        .unwrap()
+        .pop()
+        .unwrap();
+    // While n3 answers, its copies are evicted the ordinary way.
+    assert!(c.node(1).placer.forget_copies(&n3).await.is_err());
+
+    c.stop(3).await;
+    let (retired, kept) = c.node(1).placer.forget_copies(&n3).await.unwrap();
+    assert_eq!((retired, kept), (1, vec![only]));
+    c.converge().await;
+    let r = c.node(1).meta.open_reader().unwrap();
+    let stores = |f| -> Vec<StoreId> {
+        nest_meta::query::replicas(&r, f)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.store)
+            .collect()
+    };
+    assert_eq!(stores(shared), vec![NodeId(1).live_store()]);
+    assert_eq!(stores(only), vec![NodeId(3).live_store()]);
+}
