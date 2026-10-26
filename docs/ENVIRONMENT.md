@@ -24,8 +24,10 @@ User account: `tj`, uid 1000 on raptor, uid 1001 on Sparks. `sudo` needs a
 password on every host, so the agent cannot perform root steps; see the
 one-time root checklist below.
 
-All nine hosts (2026-10-12): `/etc/sysctl.d/90-sparknest-tcp.conf` sets
-`net.ipv4.tcp_slow_start_after_idle = 0` (benchmarks/M10-LAN-TCP.md).
+Every host: `/etc/sysctl.d/90-sparknest-tcp.conf` sets
+`net.ipv4.tcp_slow_start_after_idle = 0` (benchmarks/M10-LAN-TCP.md);
+the original nine on 2026-10-12, cassowary and maxq on 2026-10-26 (cassowary
+had been missed). `scripts/add-offgrid.sh check` now requires it.
 
 ### Off-grid hosts (LAN only, ADR-047)
 

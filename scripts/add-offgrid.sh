@@ -55,12 +55,14 @@ test -d $MOUNT || { echo "missing: $MOUNT"; ok=0; }
 grep -q '^user_allow_other' /etc/fuse.conf || { echo "missing: user_allow_other in /etc/fuse.conf"; ok=0; }
 test -f /etc/systemd/system/sparknestd@$CLUSTER.service || { echo "missing: system unit (stage it with configure)"; ok=0; }
 [ "\$(cat /sys/module/fuse/parameters/enable_uring 2>/dev/null)" = Y ] || echo "note: fuse.enable_uring is N (falls back to /dev/fuse)"
+[ "\$(sysctl -n net.ipv4.tcp_slow_start_after_idle)" = 0 ] || { echo "missing: tcp_slow_start_after_idle=0 (benchmarks/M10-LAN-TCP.md)"; ok=0; }
 test -x $BIN/sparknestd || { echo "missing: brew install tpurtell/local-ai/sparknest"; ok=0; }
 if [ \$ok = 1 ]; then echo "\$(hostname -s): ready"; else
   echo "Root steps on \$(hostname -s):"
   echo "  sudo install -d -o \$(id -un) -g \$(id -gn) $STATE $MOUNT"
   echo "  grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf"
   echo "  sudo cp ~/.config/sparknest/sparknestd@$CLUSTER.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable sparknestd@$CLUSTER"
+  echo "  printf '%s\\n' '# sparknest (benchmarks/M10-LAN-TCP.md): keep the TCP window after idle' 'net.ipv4.tcp_slow_start_after_idle = 0' | sudo tee /etc/sysctl.d/90-sparknest-tcp.conf && sudo sysctl -q --system"
   echo "  sparknest-allow-restart $CLUSTER"
 fi
 CHECK
