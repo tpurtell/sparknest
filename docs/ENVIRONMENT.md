@@ -33,6 +33,7 @@ All nine hosts (2026-10-12): `/etc/sysctl.d/90-sparknest-tcp.conf` sets
 |---|---|---|---|---|---|
 | kakapo | arm64 | Ubuntu 24.04.5 | 7.0.0-1019-nvidia | 172.22.2.7, RTL8127 (r8127), 10GbE | Spark without the fabric cable; `fuse.enable_uring` still N (set at runtime when it joins, kernel command line at next reboot) |
 | cassowary | arm64 | Ubuntu 24.04.5 | 7.0.0-1019-nvidia | 172.22.2.8 (`cassowary.birds.vimoin.com`), `enP7s7`, 10GbE | Spark without the fabric cable (node 10, 4 lanes; added 2026-10-21); 20 cores, 119 GiB, 3.4 TiB free; `fuse.enable_uring` N |
+| maxq | amd64 | Ubuntu 24.04 on WSL2 (bridged) | 6.18.54.1-microsoft-standard-WSL2 | 172.22.2.11 (`maxq.birds.vimoin.com`; bare `maxq` resolves to Tailscale), WSL eth0 bridged, 10GbE | oliver's PC rebuilt (node 11, 8 lanes; added 2026-10-26). A learner with its LAN address in the membership, so the others dial it. 24 cores, 94 GiB; `/srv` on btrfs `/dev/sdc1` (3.8 TB); `fuse.enable_uring` Y. TCP from ostrich 6.8 Gbit/s; cold 5 GB reads through the mount 550–590 MB/s |
 | oliver (retired 2026-10-26; disk lost, rebuilt as maxq) | amd64 | Ubuntu 24.04.5 on WSL2 (NAT) | 6.18.40.1-microsoft-standard-WSL2 | Windows RTL8127, 10GbE; WSL eth0 172.25.172.80 behind NAT | 24 cores, 62 GiB, ext4 VHD 3.6T |
 
 oliver: never use WSL mirrored networking (it drops inbound connections
