@@ -197,7 +197,14 @@ paths:
                 deep:
                   type: boolean
                   default: false
-                  description: Also hash Hugging Face blobs against their names.
+                  description: >-
+                    Also hash Hugging Face blobs against their SHA-256 (a repo's blobs/<sha256>,
+                    or a shared-store blob through the repo link naming its SHA-256, ADR-072).
+                    Copies verified before are skipped.
+                recheck:
+                  type: boolean
+                  default: false
+                  description: With `deep`, hash copies already verified again.
       responses:
         "200":
           description: Report.
@@ -211,6 +218,12 @@ paths:
                     type: string
                   objects:
                     type: integer
+                  hashed:
+                    type: integer
+                    description: "Deep: copies hashed this run."
+                  already_verified:
+                    type: integer
+                    description: "Deep: copies skipped as verified by an earlier run."
                   lost:
                     type: integer
                     description: Files whose data no longer exists anywhere.

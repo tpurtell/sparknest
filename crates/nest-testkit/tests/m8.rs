@@ -438,6 +438,7 @@ async fn crashed_minority_host_recovers_against_the_quorum() {
             repair: true,
             orphans: nest_data::fsck::Orphans::Quarantine,
             deep: false,
+            recheck: false,
             settle_owned: false,
             min_age: Duration::ZERO,
             host: "n3".into(),
@@ -498,4 +499,118 @@ async fn offline_fsck_reports_without_changing_anything() {
     assert_eq!(r.unknown, vec!["0000000000001092.2".to_string()]);
     assert!(r.damaged.is_empty());
     assert!(store.exists(stray), "report only");
+}
+
+/// Deep fsck checks Hugging Face blobs against their SHA-256 (ADR-072): a
+/// repo's own `blobs/<sha256>` by its name, a shared-store
+/// `blobs/xx/<xet hash>` through the repo link naming its SHA-256, and a
+/// shared blob no link names not at all. Each copy is hashed once; later
+/// runs skip what they verified unless asked to recheck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn deep_fsck_hashes_each_blob_once_against_its_sha256() {
+    use sha2::{Digest, Sha256};
+    let c = ready(3).await;
+    let v = c.node(1).vfs.clone();
+    let sha = |b: &[u8]| -> String {
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    };
+    let xet = |n: u8| format!("{n:02x}{}", "e".repeat(62));
+    let mkdir = |p: FileId, n: &'static str| {
+        let v = v.clone();
+        async move { v.mkdir(p, n.as_bytes(), 0o755).await.unwrap().id }
+    };
+    let put = |dir: FileId, name: String, data: Vec<u8>| {
+        let v = v.clone();
+        async move {
+            let (a, fh, _) = v
+                .create(dir, name.as_bytes(), 0o644, oflags::WRONLY | oflags::EXCL)
+                .await
+                .unwrap();
+            v.write(fh, 0, data).await.unwrap();
+            v.release(fh, None).await;
+            a.id
+        }
+    };
+    let hub = mkdir(FileId::ROOT, "hub").await;
+    let blobs = mkdir(hub, "blobs").await;
+    let shard = mkdir(blobs, "aa").await;
+    let repo = mkdir(hub, "models--org--m").await;
+    let repo_blobs = mkdir(repo, "blobs").await;
+
+    // A shared-store blob, intact, and one whose bytes went bad, each
+    // linked from the repo under its SHA-256.
+    let good = b"intact weights".to_vec();
+    let bad = b"weights as downloaded".to_vec();
+    let good_x = put(shard, xet(0xaa), good.clone()).await;
+    let bad_x = put(
+        shard,
+        format!("aa{}", "f".repeat(62)),
+        b"weights as storXd".to_vec(),
+    )
+    .await;
+    for (data, target) in [(&good, xet(0xaa)), (&bad, format!("aa{}", "f".repeat(62)))] {
+        v.symlink(
+            repo_blobs,
+            sha(data).as_bytes(),
+            format!("../../blobs/aa/{target}").as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    // A shared blob no repo links (its SHA-256 unknown), and a repo's own
+    // blob named by its SHA-256.
+    let unlinked = put(shard, format!("aa{}", "0".repeat(62)), b"anything".to_vec()).await;
+    let local = b"config bytes".to_vec();
+    let local_f = put(repo_blobs, sha(&local), local.clone()).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        [good_x, bad_x, unlinked, local_f].iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|a| a.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    c.converge().await;
+
+    let run = |recheck: bool| {
+        let v = v.clone();
+        async move {
+            v.fsck(&nest_data::fsck::FsckOptions {
+                repair: false,
+                orphans: nest_data::fsck::Orphans::Report,
+                deep: true,
+                recheck,
+                settle_owned: false,
+                min_age: Duration::ZERO,
+                host: "n1".into(),
+                stamp: "deep".into(),
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let corrupt = |r: &nest_data::fsck::FsckReport| -> Vec<u64> {
+        r.findings
+            .iter()
+            .filter_map(|f| match f.issue {
+                nest_data::fsck::Issue::Corrupt { file, .. } => Some(file),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = run(false).await;
+    assert_eq!(corrupt(&first), [bad_x.0], "{first:?}");
+    assert_eq!((first.hashed, first.already_verified), (3, 0), "{first:?}");
+    // The good ones are not hashed again; the bad one is, until it is fixed.
+    let second = run(false).await;
+    assert_eq!(corrupt(&second), [bad_x.0], "{second:?}");
+    assert_eq!(
+        (second.hashed, second.already_verified),
+        (1, 2),
+        "{second:?}"
+    );
+    let third = run(true).await;
+    assert_eq!((third.hashed, third.already_verified), (3, 0), "{third:?}");
 }

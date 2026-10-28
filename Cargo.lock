@@ -1239,6 +1239,7 @@ dependencies = [
  "postcard",
  "rusqlite",
  "serde_json",
+ "sha2",
  "sparknestd",
  "tempfile",
  "tokio",

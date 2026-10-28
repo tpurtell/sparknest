@@ -87,9 +87,13 @@ enum Cmd {
         /// the only copy: such objects go to /.lost+found/<host>/).
         #[arg(short = 'y', long = "yes")]
         yes: bool,
-        /// Also verify Hugging Face blobs against the SHA-256 in their names.
+        /// Also verify Hugging Face blobs against their SHA-256; copies
+        /// verified by an earlier run are skipped.
         #[arg(long)]
         deep: bool,
+        /// With --deep: hash copies already verified again.
+        #[arg(long, requires = "deep")]
+        recheck: bool,
     },
     /// Set a directory's automatic sealing policy.
     Policy {
@@ -1402,9 +1406,12 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Cmd::Fsck { yes, deep } => {
+        Cmd::Fsck { yes, deep, recheck } => {
             let v = c
-                .post("/v1/fsck", json!({ "repair": yes, "deep": deep }))
+                .post(
+                    "/v1/fsck",
+                    json!({ "repair": yes, "deep": deep, "recheck": recheck }),
+                )
                 .await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&v)?);
@@ -1417,6 +1424,12 @@ async fn main() -> Result<()> {
                     findings.len(),
                     v["lost"]
                 );
+                if *deep {
+                    println!(
+                        "  hashed {}, {} verified by an earlier run",
+                        v["hashed"], v["already_verified"]
+                    );
+                }
                 for f in &findings {
                     let what = f["issue"].as_str().unwrap_or("?");
                     let path = f["path"]

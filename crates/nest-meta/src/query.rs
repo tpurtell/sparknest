@@ -529,6 +529,33 @@ pub fn path_of(c: &Connection, file: FileId) -> rusqlite::Result<Option<Vec<u8>>
     Ok(None)
 }
 
+/// Symlinks whose name is 64 hex characters and whose target ends in a
+/// name of 64 hex characters: in a Hugging Face hub, a repo's
+/// `blobs/<sha256>` linking to the shared store's `blobs/xx/<xet hash>`.
+/// Returns (link name, target name), lowercase.
+pub fn hex64_links(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut st = c.prepare(
+        "SELECT d.name, f.target FROM files f JOIN dentries d ON d.child = f.id \
+         WHERE f.kind = 3 AND length(d.name) = 64 AND length(f.target) >= 64",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let hex = |b: &[u8]| b.len() == 64 && b.iter().all(u8::is_ascii_hexdigit);
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, target) = row?;
+        let base = target.rsplit(|b| *b == b'/').next().unwrap_or(&[]);
+        if hex(&name) && hex(base) {
+            out.push((
+                String::from_utf8_lossy(&name).to_ascii_lowercase(),
+                String::from_utf8_lossy(base).to_ascii_lowercase(),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct BackupRow {
     pub id: u64,

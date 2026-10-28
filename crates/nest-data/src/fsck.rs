@@ -12,7 +12,7 @@
 //!   from earlier metadata the host set aside, if any knows it;
 //! - a copy the metadata lists but the disk lacks is retired; a file left
 //!   with no copy anywhere is reported lost;
-//! - a stable copy whose size (or, deep, HF blob hash) is wrong is retired
+//! - a stable copy whose size (or, deep, HF blob SHA-256) is wrong is retired
 //!   when another copy exists; if it was the only one its bytes go to
 //!   lost+found and the file is reported lost;
 //! - a file this host was writing when the previous run ended is finalized
@@ -25,6 +25,7 @@ use nest_types::{
     FileId, FileKind, GenState, Generation, NestError, NestResult, ReplicaState, Timestamp,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -41,8 +42,13 @@ pub struct FsckOptions {
     /// Apply resolutions (otherwise only report).
     pub repair: bool,
     pub orphans: Orphans,
-    /// Verify Hugging Face blobs against the SHA-256 in their names.
+    /// Verify Hugging Face blobs against their SHA-256 (ADR-072): a repo's
+    /// own `blobs/<sha256>`, or a shared-store `blobs/xx/<xet>` through the
+    /// repo link naming its SHA-256. Each copy is hashed once: one already
+    /// verified is skipped unless `recheck`.
     pub deep: bool,
+    /// With `deep`: hash copies already verified again (bit rot).
+    pub recheck: bool,
     /// Settle files this host owned when the previous run ended. Startup
     /// only: while running, owned files have live writers.
     pub settle_owned: bool,
@@ -185,6 +191,11 @@ pub struct Finding {
 pub struct FsckReport {
     pub objects: usize,
     pub findings: Vec<Finding>,
+    /// Deep: copies hashed this run, and those skipped as verified before.
+    #[serde(default)]
+    pub hashed: usize,
+    #[serde(default)]
+    pub already_verified: usize,
 }
 
 impl FsckReport {
@@ -201,11 +212,76 @@ fn io(e: std::io::Error) -> NestError {
     NestError::from_io(&e)
 }
 
-/// A Hugging Face blob name: 64 lowercase hex characters (SHA-256).
-fn hf_sha256_name(path: &str) -> Option<&str> {
-    let name = path.rsplit('/').next()?;
-    (path.contains("/blobs/") && name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then_some(name)
+/// The SHA-256 a Hugging Face blob at `path` must have (ADR-072). A repo's
+/// own `models--…/blobs/<sha256>` is named by it. A shared-store
+/// `blobs/xx/<xet hash>` is named by its Xet hash, not a SHA-256: its
+/// SHA-256 is the name of the repo link pointing at it (`sha_of_xet`), and
+/// with no such link it has none to check.
+fn hf_sha256<'a>(path: &str, sha_of_xet: &'a HashMap<String, String>) -> Option<Cow<'a, str>> {
+    let mut parts = path.rsplit('/');
+    let name = parts.next()?;
+    if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    match (parts.next()?, parts.next()?) {
+        ("blobs", repo) if repo.starts_with("models--") || repo.starts_with("datasets--") => {
+            Some(Cow::Owned(name.to_ascii_lowercase()))
+        }
+        (shard, "blobs") if shard.len() == 2 => sha_of_xet
+            .get(&name.to_ascii_lowercase())
+            .map(|s| Cow::Borrowed(s.as_str())),
+        _ => None,
+    }
+}
+
+/// Copies this host has verified (deep), one `file.generation` per line in
+/// `<state>/fsck-verified`. An object never changes once committed (a write
+/// makes a new generation), so a verified copy stays verified until it is
+/// retired; entries for copies gone from the store are dropped on save.
+struct Verified {
+    path: std::path::PathBuf,
+    keys: HashSet<(u64, u64)>,
+}
+
+impl Verified {
+    fn load(root: &std::path::Path) -> Verified {
+        let path = root.join("fsck-verified");
+        let keys = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (f, g) = l.split_once('.')?;
+                Some((f.parse().ok()?, g.parse().ok()?))
+            })
+            .collect();
+        Verified { path, keys }
+    }
+
+    fn contains(&self, k: ObjectKey) -> bool {
+        self.keys.contains(&(k.file.0, k.generation.0))
+    }
+
+    fn insert(&mut self, k: ObjectKey) {
+        self.keys.insert((k.file.0, k.generation.0));
+    }
+
+    fn remove(&mut self, k: ObjectKey) {
+        self.keys.remove(&(k.file.0, k.generation.0));
+    }
+
+    /// Keep only copies still on disk; write atomically.
+    fn save(&mut self, disk: &HashMap<ObjectKey, u64>) {
+        self.keys
+            .retain(|(f, g)| disk.contains_key(&ObjectKey::new(FileId(*f), Generation(*g))));
+        let mut keys: Vec<_> = self.keys.iter().collect();
+        keys.sort();
+        let body: String = keys.iter().map(|(f, g)| format!("{f}.{g}\n")).collect();
+        let tmp = self.path.with_extension("tmp");
+        let r = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &self.path));
+        if let Err(e) = r {
+            tracing::warn!(error = %e, "fsck: could not record verified copies");
+        }
+    }
 }
 
 impl Vfs {
@@ -235,6 +311,17 @@ impl Vfs {
             ..Default::default()
         };
         let previous = previous_metadata(store.root());
+        // Deep: each shared-store blob's SHA-256, from the repo links, and
+        // the copies verified before.
+        let sha_of_xet: HashMap<String, String> = if opts.deep {
+            self.q(query::hex64_links)?
+                .into_iter()
+                .map(|(sha, xet)| (xet, sha))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let mut verified = opts.deep.then(|| Verified::load(store.root()));
         let path_of = |f: FileId| -> String {
             self.q(|c| query::path_of(c, f))
                 .ok()
@@ -388,16 +475,32 @@ impl Vfs {
                     found,
                     other_copies: others(key.file, key.generation),
                 })
-            } else if opts.deep
-                && let Some(want) = hf_sha256_name(&path)
-                && !self.sha256_matches(key, want).await
+            } else if let Some(v) = verified.as_mut()
+                && let Some(want) = hf_sha256(&path, &sha_of_xet)
             {
-                Some(Issue::Corrupt {
-                    file: key.file.0,
-                    generation: key.generation.0,
-                    path: path.clone(),
-                    other_copies: others(key.file, key.generation),
-                })
+                if !opts.recheck && v.contains(key) {
+                    report.already_verified += 1;
+                    None
+                } else {
+                    report.hashed += 1;
+                    match self.sha256_matches(key, &want).await {
+                        Some(true) => {
+                            v.insert(key);
+                            None
+                        }
+                        Some(false) => {
+                            v.remove(key);
+                            Some(Issue::Corrupt {
+                                file: key.file.0,
+                                generation: key.generation.0,
+                                path: path.clone(),
+                                other_copies: others(key.file, key.generation),
+                            })
+                        }
+                        // Unreadable: checked again next run.
+                        None => None,
+                    }
+                }
             } else {
                 None
             };
@@ -440,6 +543,9 @@ impl Vfs {
                 }
             };
             report.findings.push(Finding { issue, action });
+        }
+        if let Some(v) = verified.as_mut() {
+            v.save(&disk);
         }
         for f in &report.findings {
             match &f.action {
@@ -576,7 +682,8 @@ impl Vfs {
         Ok(dir)
     }
 
-    async fn sha256_matches(&self, key: ObjectKey, want: &str) -> bool {
+    /// Whether the copy's SHA-256 is `want`; `None` if it cannot be read.
+    async fn sha256_matches(&self, key: ObjectKey, want: &str) -> Option<bool> {
         let store = self.data().store().clone();
         let want = want.to_ascii_lowercase();
         tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
@@ -592,12 +699,13 @@ impl Vfs {
                 }
                 h.update(&buf[..n]);
             }
+            // Read once: keep it out of the page cache loaders rely on.
+            nest_store::drop_cached(&f);
             let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
             Ok(got == want)
         })
         .await
         .ok()
         .and_then(|r| r.ok())
-        .unwrap_or(true)
     }
 }

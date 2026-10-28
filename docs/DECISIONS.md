@@ -2461,3 +2461,32 @@ can be reached.
 **Alternatives.** Listing the other off-grid hosts in each `node.toml`:
 works without a release, but every new host means editing every other
 host's config and restarting it.
+
+## ADR-072 — Deep fsck: shared-store blobs checked through their SHA-256 link, once (2026-10-28)
+
+**Context.** `nest fsck --deep` hashed every object under a `/blobs/`
+path whose name is 64 hex characters against that name. The shared
+blob store (ADR-010) names a blob by its Xet hash, also 64 hex
+characters, not by a SHA-256: every Xet-stored model file failed. A run
+on maxq on 2026-10-26 reported all 184 GLM-5.3-BF16 copies there
+corrupt; the two hashed by hand matched the SHA-256 their repo links
+name. Only reported, nothing was retired, but `--deep -y` would have
+dropped good copies wherever another copy existed. Each run also hashed
+every blob again (about 1.5 TB for that model alone).
+
+**Decision.**
+1. **The right SHA-256.** A repo's own `models--…/blobs/<sha256>` is
+   checked against its name. A shared-store `blobs/xx/<xet>` is checked
+   against the name of the repo link pointing at it (one metadata query
+   per run for all such links). A shared blob no repo links has no
+   SHA-256 to check and is skipped. Xet hashes are not computed: Xet
+   chunks and hashes them in a tree of its own, and the SHA-256 the repo
+   names is the same guarantee, from the hub's own metadata.
+2. **Each copy hashed once.** Objects never change once committed (a
+   write makes a new generation), so a host records the copies it has
+   verified in `<state>/fsck-verified` (`file.generation` per line,
+   pruned to what is on disk). Later deep runs skip them; `--recheck`
+   hashes everything again, for bit rot. A copy found bad is checked
+   again every run until it is repaired; one that cannot be read is not
+   recorded. The report gives `hashed` and `already_verified`.
+3. Hashing drops the object's pages afterwards, as copies do.

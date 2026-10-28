@@ -427,6 +427,9 @@ struct FsckReq {
     repair: bool,
     #[serde(default)]
     deep: bool,
+    /// With `deep`: hash copies already verified again.
+    #[serde(default)]
+    recheck: bool,
 }
 
 /// Check this host's objects against the metadata (ADR-026).
@@ -444,6 +447,7 @@ async fn fsck(State(api): State<Api>, Json(r): Json<FsckReq>) -> R<serde_json::V
                 Orphans::Report
             },
             deep: r.deep,
+            recheck: r.recheck,
             settle_owned: false,
             min_age: std::time::Duration::from_secs(600),
             host: api.host.clone(),
@@ -453,6 +457,8 @@ async fn fsck(State(api): State<Api>, Json(r): Json<FsckReq>) -> R<serde_json::V
     Ok(Json(serde_json::json!({
         "host": api.host,
         "objects": rep.objects,
+        "hashed": rep.hashed,
+        "already_verified": rep.already_verified,
         "lost": rep.lost(),
         "findings": rep.findings,
     })))

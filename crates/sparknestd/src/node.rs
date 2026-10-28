@@ -646,6 +646,7 @@ impl Node {
                 repair: true,
                 orphans,
                 deep: false,
+                recheck: false,
                 settle_owned: true,
                 min_age: Duration::ZERO,
                 host: cfg.node.name.clone(),
