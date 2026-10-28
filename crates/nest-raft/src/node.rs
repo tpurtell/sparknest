@@ -268,21 +268,29 @@ impl MetaNode {
                 lease_ms: cfg.election_max_ms,
             }),
         );
-        // A member whose address is cleared went off-grid (ADR-047): stop
-        // dialling where it was; it reaches us over the connections it opens.
+        // Every member with an address is dialled there, off-grid hosts
+        // included (ADR-071): a learner never gets Raft appends, so this is
+        // how the others learn where it is. A member whose address is
+        // cleared dials in (ADR-047): stop dialling where it was; it
+        // reaches us over the connections it opens. Pinned addresses (an
+        // off-grid host's own config) are kept either way.
         {
-            let (mut m, rpc) = (raft.metrics(), rpc.clone());
+            let (mut m, rpc, me) = (raft.metrics(), rpc.clone(), cfg.node.0);
             tokio::spawn(async move {
                 loop {
-                    let gone: Vec<NodeId> = m
+                    let nodes: Vec<(NodeId, String)> = m
                         .borrow_and_update()
                         .membership_config
                         .nodes()
-                        .filter(|(_, n)| n.addr.is_empty())
-                        .map(|(id, _)| NodeId(*id))
+                        .filter(|(id, _)| **id != me)
+                        .map(|(id, n)| (NodeId(*id), n.addr.clone()))
                         .collect();
-                    for id in gone {
-                        rpc.forget_peer(id);
+                    for (id, addr) in nodes {
+                        match addr.parse() {
+                            Ok(a) => rpc.set_peer(id, a),
+                            Err(_) if addr.is_empty() => rpc.forget_peer(id),
+                            Err(_) => {}
+                        }
                     }
                     if m.changed().await.is_err() {
                         return;
@@ -674,6 +682,30 @@ impl MetaNode {
                 .change_membership(ChangeMembers::AddVoterIds(one), false)
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Keep `id` off the vote and give it `addr`, where the others dial it
+    /// (ADR-071): an off-grid host on the LAN, reached like any member. A
+    /// voter stops voting first (as `set_role` to off-grid).
+    pub async fn set_offgrid_addr(&self, id: NodeId, addr: String) -> anyhow::Result<()> {
+        let a: std::net::SocketAddr = addr
+            .parse()
+            .with_context(|| format!("{addr} is not ip:port"))?;
+        let voter = self
+            .metrics()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|v| v == id.0);
+        if voter {
+            self.set_role(id, String::new()).await?;
+        }
+        self.rpc.set_peer(id, a);
+        let node = BTreeMap::from([(id.0, BasicNode { addr })]);
+        self.raft
+            .change_membership(ChangeMembers::SetNodes(node), false)
+            .await?;
         Ok(())
     }
 

@@ -2019,7 +2019,10 @@ paths:
                   enum: [offgrid, fabric]
                 addr:
                   type: [string, "null"]
-                  description: Control address `ip:port` on the fabric; required for `fabric`.
+                  description: >-
+                    Control address `ip:port`: on the fabric, required for `fabric`;
+                    for `offgrid`, its LAN address, where every host dials it (ADR-071).
+                    Omitted for `offgrid`, it dials in (behind NAT).
       responses:
         "200":
           description: Changed.

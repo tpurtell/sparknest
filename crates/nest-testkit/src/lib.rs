@@ -334,6 +334,22 @@ impl TestCluster {
         add.await.unwrap().unwrap();
     }
 
+    /// Add an off-grid node `id` on the LAN (ADR-071): a learner with its
+    /// address in membership, which every host dials, other off-grid hosts
+    /// included.
+    pub async fn add_offgrid_at(&mut self, id: u64) {
+        self.offgrid.insert(id);
+        let (l, p) = port_pair();
+        let addr = SocketAddr::from(([127, 0, 0, 1], l));
+        self.lanes.insert(id, SocketAddr::from(([127, 0, 0, 1], p)));
+        let leader = self.wait_leader().await;
+        let meta = self.nodes[&leader].meta.clone();
+        let add =
+            tokio::spawn(async move { meta.add_node(NodeId(id), addr.to_string(), false).await });
+        self.boot(id, addr).await;
+        add.await.unwrap().unwrap();
+    }
+
     /// Configure stopped node `id` as off-grid or fabric for its next start
     /// (its role in membership is changed separately).
     pub fn set_offgrid(&mut self, id: u64, offgrid: bool) {

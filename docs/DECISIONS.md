@@ -2419,3 +2419,45 @@ nothing was kept.
 host removed to be re-imaged with its disk intact would lose copies it
 still holds. Retiring with `allow_last`: lost files would sit in the
 namespace with no copy, failing every read instead of being absent.
+
+## ADR-071 — Off-grid hosts on the LAN are dialled like any member (2026-10-28)
+
+**Context.** ADR-047 had every off-grid host dial in, which only oliver
+(WSL behind NAT) needed. kakapo and cassowary were registered the same
+way, with no address in membership, and an off-grid host dials only
+the fabric hosts in its `node.toml`. So two off-grid hosts had no
+connection at all: a plan copying GLM-5.3-Flash-BF16 (held only on
+kakapo and cassowary) to maxq failed every file with "no address, and
+it has not connected here", after the two-minute copy wait for each. The
+job counted each failed file's bytes as done, so its progress moved in
+batches of files that had failed, and the plan ended with nothing on
+maxq. Every host, fabric or not, is on the 10G LAN. Off-grid is about
+how a host is shown and how copies pick sources, not about whether it
+can be reached.
+
+**Decision.**
+1. **Registered at the LAN address.** An off-grid host on the LAN is a
+   learner whose membership address is its LAN control address.
+   `add-offgrid.sh join` registers it there; an empty address remains
+   for a host behind NAT. `nest cluster role HOST offgrid --addr IP:PORT`
+   sets it on a running host, without a restart (a voter stops voting
+   first).
+2. **Every host learns every address from membership.** A learner gets
+   no Raft appends, so the leader's network factory never told the
+   others where it is: each node now follows membership and sets every
+   member's address (pinned `node.toml` addresses still win). Clearing
+   an address still stops dialling it.
+3. **Lanes between off-grid hosts.** An off-grid host also keeps lanes
+   to the other off-grid hosts that have an address; of each pair the
+   lower id dials, unless only one end has an address. Copy sources keep
+   their order: fabric holders, then off-grid ones, then archives.
+4. **Progress counts what landed.** A file that fails is listed in
+   `failed` and not counted in `done_files` or `done_bytes` (replicate
+   and backup jobs).
+5. **No staging leftovers.** `commit_staging` removes its staging file
+   when the rename fails (the object exists), as on every other error.
+   The 10-26 GLM-5.3-BF16 copy to maxq had left 400 GB there.
+
+**Alternatives.** Listing the other off-grid hosts in each `node.toml`:
+works without a release, but every new host means editing every other
+host's config and restarting it.

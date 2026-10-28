@@ -225,6 +225,9 @@ pub enum MembershipChange {
     /// Move a node off the fabric (`addr` empty: a learner that dials in)
     /// or onto it (a voter at `addr`), ADR-047.
     SetRole { node: NodeId, addr: String },
+    /// Keep a node off the vote at `addr`, where the others dial it: an
+    /// off-grid host on the LAN (ADR-071).
+    OffgridAt { node: NodeId, addr: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -546,9 +549,13 @@ impl Admin {
                     let Some(r) = r else {
                         return futures::future::ready(());
                     };
+                    // A file that failed is listed in `failed`, not counted
+                    // as done: its bytes never landed.
                     let mut p = progress.lock();
-                    p.done_files += 1;
-                    p.done_bytes += size;
+                    if r.is_ok() {
+                        p.done_files += 1;
+                        p.done_bytes += size;
+                    }
                     if let Err(e) = r {
                         let path = vfs
                             .data()
@@ -841,6 +848,9 @@ impl Handler for AdminService {
                         }
                         MembershipChange::Remove { node } => meta.remove_node(node).await,
                         MembershipChange::SetRole { node, addr } => meta.set_role(node, addr).await,
+                        MembershipChange::OffgridAt { node, addr } => {
+                            meta.set_offgrid_addr(node, addr).await
+                        }
                     };
                     match r {
                         Ok(()) => AdminResp::Started,

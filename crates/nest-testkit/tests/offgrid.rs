@@ -666,3 +666,120 @@ async fn offgrid_spread_puts_one_copy_over_the_hosts_picked() {
     }
     assert_eq!(per, [3, 3]);
 }
+
+/// Off-grid hosts on the LAN (ADR-071): each has its address in
+/// membership, so every host dials it, and two off-grid hosts copy and
+/// read between them directly over lanes, with no fabric host holding
+/// a copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn offgrid_hosts_on_the_lan_reach_each_other() {
+    let mut c = ready(3).await;
+    for id in [4, 5] {
+        c.add_offgrid_at(id).await;
+    }
+    c.eventually("off-grid hosts serving", Duration::from_secs(10), |c| {
+        [4, 5]
+            .iter()
+            .all(|&i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
+    })
+    .await;
+    for i in 1..=5 {
+        assert_eq!(c.node(i).vfs.offgrid_hosts(), [NodeId(4), NodeId(5)].into());
+    }
+    c.eventually(
+        "every host has both addresses",
+        Duration::from_secs(5),
+        |c| {
+            (1..=5).all(|i| {
+                [4, 5]
+                    .iter()
+                    .all(|&o| o == i || c.node(i).rpc.peer_addr(NodeId(o)).is_some())
+            })
+        },
+    )
+    .await;
+    c.eventually(
+        "lanes between the off-grid hosts",
+        Duration::from_secs(10),
+        |c| {
+            c.node(4).vfs.lanes().unwrap().connected(NodeId(5)) >= 2
+                && c.node(5).vfs.lanes().unwrap().connected(NodeId(4)) >= 2
+        },
+    )
+    .await;
+
+    // Written on 4, held only there; 5 copies it from 4.
+    let big: Vec<u8> = (0..(5 << 20) + 13).map(|i| (i % 241) as u8).collect();
+    let f = file(&c, 4, "on-4", &big).await;
+    assert_eq!(holders(&c, f), [4]);
+    let before = lane_read(&c, 5);
+    c.node(5).vfs.replicate_here(f).await.unwrap();
+    c.converge().await;
+    assert_eq!(holders(&c, f), [4, 5]);
+    assert!(
+        lane_read(&c, 5) - before >= big.len() as u64,
+        "copy not over lanes"
+    );
+    let local = c.node(5).vfs.local_read_bytes();
+    assert_eq!(read_all(&c, 5, f).await, big);
+    assert_eq!(c.node(5).vfs.local_read_bytes() - local, big.len() as u64);
+
+    // Written on 5, read from 4 without a copy.
+    let g = file(&c, 5, "on-5", &big[..2 << 20]).await;
+    assert_eq!(read_all(&c, 4, g).await, &big[..2 << 20]);
+}
+
+/// A dial-in off-grid host (behind NAT) is given its LAN address while it
+/// runs: the others start dialling it there, and an off-grid peer copies
+/// from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_dial_in_offgrid_host_is_given_its_lan_address() {
+    let mut c = with_offgrid(3, 4).await;
+    c.add_offgrid_at(5).await;
+    c.eventually("5 serving", Duration::from_secs(10), |c| {
+        c.node(5).data.caught_up() && c.node(5).data.session().is_some()
+    })
+    .await;
+    let f = file(&c, 4, "on-4", b"held only by the dial-in host").await;
+    assert_eq!(holders(&c, f), [4]);
+    assert_eq!(c.node(1).rpc.peer_addr(NodeId(4)), None);
+
+    let addr = c.node_config(4).node.listen.to_string();
+    c.node(1)
+        .meta
+        .set_offgrid_addr(NodeId(4), addr)
+        .await
+        .unwrap();
+    c.eventually("every host dials 4", Duration::from_secs(5), |c| {
+        (1..=5).all(|i| i == 4 || c.node(i).rpc.peer_addr(NodeId(4)).is_some())
+    })
+    .await;
+    assert_eq!(c.node(1).vfs.offgrid_hosts(), [NodeId(4), NodeId(5)].into());
+    c.node(5).vfs.replicate_here(f).await.unwrap();
+    c.converge().await;
+    assert_eq!(holders(&c, f), [4, 5]);
+    assert_eq!(read_all(&c, 5, f).await, b"held only by the dial-in host");
+}
+
+/// A file that cannot be copied is listed as failed and not counted as
+/// done: a job's progress shows only bytes that landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_copy_that_fails_is_not_counted_as_done() {
+    let c = ready(3).await;
+    let f = file(&c, 1, "m", &[7u8; 1 << 20]).await;
+    // n2 has no room for it.
+    c.node(2).data.store().set_reserve(u64::MAX / 4);
+    let sel = nest_place::Selector::parse("/m", "/hub").unwrap();
+    let id = c
+        .node(1)
+        .placer
+        .replicate(sel, vec!["n2".into()], 2)
+        .await
+        .unwrap();
+    let job = wait_job(&c, id).await;
+    let h = &job.hosts["n2"];
+    assert_eq!(h.failed.len(), 1, "{job:?}");
+    assert_eq!((h.done_files, h.done_bytes), (0, 0), "{job:?}");
+    assert_eq!((h.total_files, h.total_bytes), (1, 1 << 20), "{job:?}");
+    assert_eq!(holders(&c, f), [1]);
+}

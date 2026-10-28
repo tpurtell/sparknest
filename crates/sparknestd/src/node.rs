@@ -344,6 +344,45 @@ impl Node {
             for m in cfg.cluster.members.iter().filter(|m| m.id != id) {
                 lanes.dial(m.id, m.lanes());
             }
+            // Other off-grid hosts with an address in membership (ADR-071):
+            // lanes to them too, so two off-grid hosts copy between them
+            // directly. Of each pair the lower id dials, unless the other
+            // has no address to be dialled at.
+            let (l, m, known) = (
+                Arc::downgrade(&lanes),
+                meta.clone(),
+                cfg.cluster
+                    .members
+                    .iter()
+                    .map(|m| m.id)
+                    .collect::<std::collections::HashSet<_>>(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let Some(lanes) = l.upgrade() else { return };
+                    let nodes: BTreeMap<u64, BasicNode> = m
+                        .metrics()
+                        .membership_config
+                        .nodes()
+                        .map(|(i, n)| (*i, n.clone()))
+                        .collect();
+                    let mine = nodes.get(&id.0).is_some_and(|n| !n.addr.is_empty());
+                    for (peer, n) in &nodes {
+                        let peer = nest_types::NodeId(*peer);
+                        if peer == id || known.contains(&peer) {
+                            continue;
+                        }
+                        match n.addr.parse::<std::net::SocketAddr>() {
+                            Ok(a) if !mine || id < peer => {
+                                lanes.dial(peer, crate::config::port_plus_2(a))
+                            }
+                            _ => lanes.dial_n(peer, "0.0.0.0:0".parse().unwrap(), 0),
+                        }
+                    }
+                    drop(lanes);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
         } else {
             // Standby data lanes between fabric hosts on the LAN, for when
             // the RDMA link fails (ADR-057): the lower id dials.

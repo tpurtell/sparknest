@@ -254,10 +254,14 @@ impl ObjectStore {
     pub fn commit_staging(&self, mut s: Staging) -> io::Result<ObjectKey> {
         // Every direct write lands before the sync that makes it durable.
         s.flushed_blocking()?;
-        let f = s.file.take().expect("staging file present until commit");
-        f.sync_all()?;
-        drop(f);
+        s.file
+            .as_ref()
+            .expect("staging file present until commit")
+            .sync_all()?;
+        // Dropping `s` removes the staging file if the rename fails (the
+        // object already exists): nothing is left behind in staging.
         rename_noreplace(&s.path, &self.path(s.key))?;
+        drop(s.file.take());
         sync_dir(&self.path(s.key))?;
         Ok(s.key)
     }
@@ -705,6 +709,19 @@ mod tests {
         assert_eq!(s.adopt(&src, k(11, 1)).unwrap(), 11);
         assert!(!src.exists());
         assert!(s.capacity().unwrap().total > 0);
+    }
+
+    #[test]
+    fn a_commit_onto_an_existing_object_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ObjectStore::open(dir.path()).unwrap();
+        for _ in 0..2 {
+            let st = s.begin_staging(k(5, 1)).unwrap();
+            st.file().write_all_at(b"copied", 0).unwrap();
+            let r = s.commit_staging(st);
+            assert!(r.is_ok() || r.unwrap_err().kind() == io::ErrorKind::AlreadyExists);
+        }
+        assert_eq!(fs::read_dir(dir.path().join("staging")).unwrap().count(), 0);
     }
 
     #[test]

@@ -1267,15 +1267,27 @@ async fn cluster_role(State(api): State<Api>, Json(r): Json<RoleReq>) -> R<serde
         .resolve_hosts(std::slice::from_ref(&r.host))?
         .pop()
         .ok_or(bad("unknown host"))?;
-    let addr = match (r.role.as_str(), r.addr) {
-        ("offgrid", _) => String::new(),
-        ("fabric", Some(a)) if a.parse::<std::net::SocketAddr>().is_ok() => a,
+    use nest_place::admin::MembershipChange;
+    let ok = |a: &str| a.parse::<std::net::SocketAddr>().is_ok();
+    let change = match (r.role.as_str(), r.addr) {
+        ("offgrid", None) => MembershipChange::SetRole {
+            node: h.node,
+            addr: String::new(),
+        },
+        // On the LAN: every host dials it there (ADR-071).
+        ("offgrid", Some(a)) if ok(&a) => MembershipChange::OffgridAt {
+            node: h.node,
+            addr: a,
+        },
+        ("offgrid", Some(_)) => return Err(bad("addr is its LAN control address (ip:port)")),
+        ("fabric", Some(a)) if ok(&a) => MembershipChange::SetRole {
+            node: h.node,
+            addr: a,
+        },
         ("fabric", _) => return Err(bad("role fabric needs addr, its control address (ip:port)")),
         _ => return Err(bad("role is offgrid or fabric")),
     };
-    api.placer
-        .change_membership(nest_place::admin::MembershipChange::SetRole { node: h.node, addr })
-        .await?;
+    api.placer.change_membership(change).await?;
     Ok(Json(json!({ "host": h.name, "role": r.role })))
 }
 

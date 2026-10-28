@@ -6,7 +6,8 @@
 #                                          7402); takes effect at their restart
 #   scripts/add-offgrid.sh check HOST      root prerequisites on HOST
 #   scripts/add-offgrid.sh configure HOST  node.toml, secret and staged unit
-#   scripts/add-offgrid.sh join HOST       add it as a learner (from raptor)
+#   scripts/add-offgrid.sh join HOST       add it as a learner at its LAN
+#                                          address (from raptor)
 #
 # HOST is in SPARKNEST_OFFGRID (scripts/cluster.env). Root, once per host
 # (printed by `check`): state and mount directories, user_allow_other, the
@@ -120,10 +121,13 @@ CFG
   fi
 }
 
+# At its LAN address, so every host dials it, off-grid hosts included
+# (ADR-071). A host behind NAT has no entry in SPARKNEST_LAN and dials in.
 join() {
-  local host=$1 id
+  local host=$1 id ip
   read -r id _ < <(offgrid_of "$host")
-  "${SSH[@]}" raptor "$BIN/nest cluster add $id --offgrid"
+  ip=$(printf '%s\n' "${SPARKNEST_LAN[@]}" | sed -n "s/^$host://p")
+  "${SSH[@]}" raptor "$BIN/nest cluster add $id ${ip:+$ip:$PORT} --offgrid"
   echo "Now start it on $host: sudo systemctl start sparknestd@$CLUSTER"
 }
 

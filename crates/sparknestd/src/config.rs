@@ -135,7 +135,7 @@ impl NodeSection {
     }
 }
 
-fn port_plus_2(a: SocketAddr) -> SocketAddr {
+pub(crate) fn port_plus_2(a: SocketAddr) -> SocketAddr {
     SocketAddr::new(a.ip(), a.port().wrapping_add(2))
 }
 

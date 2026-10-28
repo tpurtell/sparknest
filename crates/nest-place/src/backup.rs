@@ -220,8 +220,10 @@ pub async fn create(
         .buffer_unordered(8)
         .for_each(|(e, r)| {
             let mut p = progress.lock();
-            p.done_files += 1;
-            p.done_bytes += e.size;
+            if r.is_ok() {
+                p.done_files += 1;
+                p.done_bytes += e.size;
+            }
             if let Err(err) = r {
                 p.failed.push((e.file, format!("{}: {err}", e.path)));
             }
@@ -483,8 +485,10 @@ pub async fn restore(
                     Err(err) => Err(io(err)),
                 };
                 let mut p = progress.lock();
-                p.done_files += 1;
-                p.done_bytes += e.size;
+                if r.is_ok() {
+                    p.done_files += 1;
+                    p.done_bytes += e.size;
+                }
                 if let Err(err) = r {
                     let _ = vfs.data().store().delete(to);
                     p.failed.push((e.file, format!("{}: {err}", e.path)));

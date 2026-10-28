@@ -760,26 +760,31 @@ enum ClusterCmd {
     },
     /// Move a host off the RDMA fabric or onto it (ADR-047). Stop it, run
     /// this, switch its cable and node.toml (role, listen, members), start it.
+    /// `offgrid --addr` gives an off-grid host its LAN address, where every
+    /// host then dials it (ADR-071); it may stay running.
     Role {
         host: String,
         #[arg(value_parser = ["offgrid", "fabric"])]
         role: String,
-        /// Its control address on the fabric (ip:port), for `fabric`.
+        /// Its control address (ip:port): on the fabric for `fabric`, on the
+        /// LAN for `offgrid` (omitted: it dials in, as behind NAT).
         #[arg(long, required_if_eq("role", "fabric"))]
         addr: Option<String>,
     },
     /// Add (or re-add) a node by id and control address (ip:port).
     Add {
         id: u64,
-        /// Control address; omitted for an off-grid host (it dials in).
+        /// Control address (an off-grid host's LAN address); omitted for an
+        /// off-grid host that dials in (behind NAT).
         #[arg(required_unless_present = "offgrid")]
         addr: Option<String>,
         /// Join as a non-voting learner.
         #[arg(long)]
         learner: bool,
-        /// An off-grid host (ADR-047): a learner on the LAN that the others
-        /// never dial; start it after adding it.
-        #[arg(long, conflicts_with_all = ["addr", "learner"])]
+        /// An off-grid host (ADR-047): a learner, dialled at ADDR when given
+        /// (ADR-071), else only over the connections it opens; start it
+        /// after adding it.
+        #[arg(long, conflicts_with = "learner")]
         offgrid: bool,
     },
 }
