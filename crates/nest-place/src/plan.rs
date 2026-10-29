@@ -74,10 +74,6 @@ pub struct Copy {
     pub group: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// Which of the host's stores: one of its disks (ADR-073); `None` for
-    /// its live store, or for an added copy the host places itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub store: Option<StoreId>,
 }
 
 impl Copy {
@@ -101,7 +97,6 @@ impl Copy {
             skip: false,
             group: String::new(),
             name: String::new(),
-            store: None,
         }
     }
 }
@@ -319,7 +314,7 @@ pub async fn requirements(placer: &Placer) -> NestResult<HashMap<(FileId, NodeId
             .cloned()
             .collect();
         let m = placer.manifest(&spec.selector).await?;
-        for h in placer.resolve_hosts(&hosts)? {
+        for h in placer.resolve_places(&hosts)? {
             for e in &m.entries {
                 required_by
                     .entry((e.file, h.node))
@@ -359,11 +354,11 @@ impl World {
         let now_ms = nest_data::usage::now_ms();
         let status = placer.status().await?;
         let nodes = placer.nodes()?;
-        let free_now: HashMap<NodeId, u64> = status
+        let mut free_now: HashMap<NodeId, u64> = status
             .iter()
             .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.free_bytes)))
             .collect();
-        let total: HashMap<NodeId, u64> = status
+        let mut total: HashMap<NodeId, u64> = status
             .iter()
             .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.total_bytes)))
             .collect();
@@ -371,35 +366,31 @@ impl World {
             .iter()
             .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.disk_read_bps)))
             .collect();
-        // A host with several disks (ADR-073) reads at their rates together,
-        // as far as its link carries it (its info already sums their space).
-        let link: HashMap<NodeId, u64> = status
-            .iter()
-            .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.link_bps)))
-            .collect();
+        // Each extra disk is a place of its own (ADR-073), keyed by its
+        // store id: a host's live store id is its node id, so the host's
+        // own entries stand for its primary disk.
+        let mut name_of: HashMap<NodeId, String> =
+            nodes.iter().map(|h| (h.node, h.name.clone())).collect();
+        let mut offgrid: HashSet<NodeId> =
+            nodes.iter().filter(|h| h.offgrid).map(|h| h.node).collect();
         for (h, r) in placer.disks().await.unwrap_or_default() {
-            let Ok(ds) = r else { continue };
-            if ds.len() < 2 {
-                continue;
-            }
-            let usable: Vec<_> = ds.iter().filter(|d| d.healthy).collect();
-            let known: Vec<u64> = usable
-                .iter()
-                .map(|d| d.read_bps)
-                .filter(|b| *b > 0)
-                .collect();
-            if !known.is_empty() {
-                let each = known.iter().sum::<u64>() / known.len() as u64;
-                let sum: u64 = usable
-                    .iter()
-                    .map(|d| if d.read_bps > 0 { d.read_bps } else { each })
-                    .sum();
-                let cap = link
-                    .get(&h.node)
-                    .copied()
-                    .filter(|l| *l > 0)
-                    .unwrap_or(u64::MAX);
-                disk.insert(h.node, sum.min(cap));
+            for d in r.unwrap_or_default() {
+                if d.primary {
+                    // The host's numbers are its primary disk's alone.
+                    free_now.insert(h.node, d.free_bytes);
+                    total.insert(h.node, d.total_bytes);
+                    continue;
+                }
+                let slot = NodeId(d.store.0);
+                name_of.insert(slot, d.name.clone());
+                if h.offgrid {
+                    offgrid.insert(slot);
+                }
+                if d.healthy {
+                    free_now.insert(slot, d.free_bytes);
+                    total.insert(slot, d.total_bytes);
+                }
+                disk.insert(slot, d.read_bps);
             }
         }
         let required_by = requirements(placer).await?;
@@ -413,7 +404,7 @@ impl World {
         };
         let mut w = World {
             now_ms,
-            name_of: nodes.iter().map(|h| (h.node, h.name.clone())).collect(),
+            name_of,
             projected: free_now.clone(),
             free_now,
             total,
@@ -426,7 +417,7 @@ impl World {
             dest: Vec::new(),
             blocked: Vec::new(),
             notes: Vec::new(),
-            offgrid: nodes.iter().filter(|h| h.offgrid).map(|h| h.node).collect(),
+            offgrid,
         };
         w.archives(placer, archives).await?;
         Ok(w)
@@ -480,7 +471,7 @@ impl World {
 
     fn last_open(&self, n: NodeId, f: FileId) -> u64 {
         self.usage
-            .get(&n)
+            .get(&host_of(n))
             .and_then(|u| u.get(&f))
             .map_or(0, |u| u.last_open_ms)
     }
@@ -572,6 +563,16 @@ impl World {
     }
 }
 
+/// The host a place belongs to: itself, or a disk's host (ADR-073).
+pub fn host_of(slot: NodeId) -> NodeId {
+    StoreId(slot.0).host().unwrap_or(slot)
+}
+
+/// The store a place's copies are in: a host's live store, or the disk.
+pub fn store_of(slot: NodeId) -> StoreId {
+    StoreId(slot.0)
+}
+
 fn ago(ms: u64) -> String {
     let h = ms / 3_600_000;
     match h {
@@ -593,7 +594,7 @@ fn scope(placer: &Placer, names: &[String]) -> NestResult<Vec<NodeId>> {
             .collect()
     } else {
         placer
-            .resolve_hosts(names)?
+            .resolve_places(names)?
             .into_iter()
             .map(|h| h.node)
             .collect()
@@ -673,7 +674,7 @@ pub async fn make(placer: &Placer, goal: Goal) -> NestResult<Plan> {
                 Vec::new()
             } else {
                 placer
-                    .resolve_hosts(hosts)?
+                    .resolve_places(hosts)?
                     .into_iter()
                     .map(|h| h.node)
                     .collect()
@@ -700,7 +701,7 @@ fn make_free(
     let mut want: BTreeMap<NodeId, u64> = BTreeMap::new();
     let (groups, hosts): (Vec<_>, Vec<_>) = free.iter().partition(|(n, _)| n.starts_with('@'));
     for (name, bytes) in groups.into_iter().chain(hosts) {
-        for h in placer.resolve_hosts(std::slice::from_ref(name))? {
+        for h in placer.resolve_places(std::slice::from_ref(name))? {
             want.insert(h.node, *bytes);
         }
     }
@@ -1054,7 +1055,7 @@ fn make_consolidate(
     // already held.
     let target = match host {
         Some(h) => placer
-            .resolve_hosts(&[h.to_string()])?
+            .resolve_places(&[h.to_string()])?
             .first()
             .map(|x| x.node)
             .ok_or_else(|| NestError::Invalid(format!("unknown host {h}")))?,
@@ -1251,7 +1252,7 @@ fn make_place(
     }
     let read = |w: &World, n: NodeId, f: FileId| -> u64 {
         w.usage
-            .get(&n)
+            .get(&host_of(n))
             .and_then(|u| u.get(&f))
             .map_or(0, |u| u.local_bytes + u.remote_bytes + u.archive_bytes)
     };
@@ -1705,18 +1706,20 @@ fn collect_copies(placer: &Placer) -> NestResult<CopyMaps> {
         let (file, generation) = (FileId(f), Generation(g));
         *count.entry((file, generation)).or_default() += 1;
         created.insert(file, (mtime_ns.max(0) as u64) / 1_000_000);
-        // A host's copy, on whichever of its stores (ADR-073); the store is
-        // kept so a removal retires that one.
-        if let Some(host) = StoreId(store).host() {
+        // A host's live store or one of its disks: each a place of its own
+        // (ADR-073), keyed by the store id.
+        if StoreId(store).host().is_some() {
             let path = query::path_of(&c, file)
                 .map_err(sql)?
                 .map(|p| String::from_utf8_lossy(&p).into_owned())
                 .unwrap_or_else(|| format!("<file {f}>"));
-            let mut cp = Copy::new(file, generation, size, path, String::new());
-            if StoreId(store).is_disk() {
-                cp.store = Some(StoreId(store));
-            }
-            copies_on.entry(host).or_default().push(cp);
+            copies_on.entry(NodeId(store)).or_default().push(Copy::new(
+                file,
+                generation,
+                size,
+                path,
+                String::new(),
+            ));
         }
     }
     Ok((copies_on, count, created))

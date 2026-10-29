@@ -3,12 +3,14 @@
   import JobStrip from "../components/JobStrip.svelte";
   import Icon from "../components/Icon.svelte";
   import { app, go, extraDisks } from "../lib/state.svelte";
+  import type { DiskInfo } from "../lib/api";
   import { human, pct, rate } from "../lib/format";
 
   const hosts = $derived(app.status?.nodes ?? []);
-  const held = $derived(hosts.reduce((a, h) => a + (h.info?.object_bytes ?? 0), 0));
-  const free = $derived(hosts.reduce((a, h) => a + (h.info?.free_bytes ?? 0), 0));
-  const cap = $derived(hosts.reduce((a, h) => a + (h.info?.total_bytes ?? 0), 0));
+  const disks = $derived(hosts.flatMap((h) => extraDisks(h.name)).filter((d) => d.healthy));
+  const held = $derived(hosts.reduce((a, h) => a + (h.info?.object_bytes ?? 0), 0) + disks.reduce((a, d) => a + d.object_bytes, 0));
+  const free = $derived(hosts.reduce((a, h) => a + (h.info?.free_bytes ?? 0), 0) + disks.reduce((a, d) => a + d.free_bytes, 0));
+  const cap = $derived(hosts.reduce((a, h) => a + (h.info?.total_bytes ?? 0), 0) + disks.reduce((a, d) => a + d.total_bytes, 0));
   const archived = $derived(app.stores.reduce((a, s) => a + (s.gateways.find(([, h]) => h.healthy)?.[1].object_bytes ?? 0), 0));
   const flow = $derived(Object.values(app.rates).reduce((a, r) => a + r.read, 0));
   const direct = $derived(Object.values(app.rates).reduce((a, r) => a + r.local, 0));
@@ -47,17 +49,6 @@
             <i class="other" style="width:{pct(i.total_bytes - i.free_bytes - i.object_bytes, i.total_bytes)}%"></i>
             <i class="ours" style="width:{pct(i.object_bytes, i.total_bytes)}%"></i>
           </div>
-          {#if extraDisks(h.name).length}
-            <div class="disks">
-              {#each app.disks[h.name] as d (d.store)}
-                <div class="disk" class:bad={!d.healthy} title="{d.name}: {d.path}{d.read_bps ? ' · ' + rate(d.read_bps) + ' read' : ''}">
-                  <span class="tiny mono dn">{d.primary ? "primary" : d.name.replace(h.name + ":", "")}</span>
-                  <div class="cap thin"><i class="other" style="width:{pct(d.total_bytes - d.free_bytes - d.object_bytes, d.total_bytes)}%"></i><i class="ours" style="width:{pct(d.object_bytes, d.total_bytes)}%"></i></div>
-                  <span class="tiny muted mono">{d.healthy ? human(d.free_bytes) : "unmounted"}</span>
-                </div>
-              {/each}
-            </div>
-          {/if}
           <div class="row tiny muted mono"><span>{human(i.object_bytes)} held · {i.objects} files</span><span class="spacer"></span>
             {#if spread(i).disk + spread(i).net > 1e6}<span class="live" title="spread reads, last 10 s">disk {rate(spread(i).disk)} · net {rate(spread(i).net)}</span>
             {:else if app.rates[h.name]?.read > 1e5}<span class="live">↓{rate(app.rates[h.name].read)}</span>{/if}
@@ -65,8 +56,24 @@
             {#if app.rates[h.name]?.served > 1e5}<span class="live">↑{rate(app.rates[h.name].served)}</span>{/if}</div>
         {/if}
       </button>
+      {#each extraDisks(h.name) as d (d.store)}
+        {@render diskCard(h.name, d)}
+      {/each}
     {/each}
   </div>
+
+  {#snippet diskCard(host: string, d: DiskInfo)}
+    <button class="host panel disk" onclick={() => go("space", "", { scope: d.name })} title={d.path}>
+      <div class="row"><span class="dot {d.healthy ? 'ok' : 'bad'}"></span><b>{d.name}</b>
+        <span class="spacer"></span><span class="tiny muted mono">{d.healthy ? human(d.free_bytes) + " free" : "unmounted"}</span></div>
+      <div class="cap">
+        <i class="other" style="width:{pct(d.total_bytes - d.free_bytes - d.object_bytes, d.total_bytes)}%"></i>
+        <i class="ours" style="width:{pct(d.object_bytes, d.total_bytes)}%"></i>
+      </div>
+      <div class="row tiny muted mono"><span>{human(d.object_bytes)} held · {d.objects} files</span><span class="spacer"></span>
+        <span>{d.read_bps ? rate(d.read_bps) + " read" : "disk of " + host}</span></div>
+    </button>
+  {/snippet}
 
   {#if app.stores.length}
     <h2 class="sec"><Icon name="archive" /> Archive stores</h2>
@@ -107,12 +114,7 @@
   .cap .other { background: #34445f; }
   .cap .ours { background: linear-gradient(90deg, var(--spark-2), var(--spark)); box-shadow: 0 0 10px rgba(56, 232, 255, 0.7); }
   .live { color: var(--spark); }
-  .disks { display: flex; flex-direction: column; gap: 4px; }
-  .disk { display: grid; grid-template-columns: 54px 1fr 64px; gap: 8px; align-items: center; }
-  .disk .dn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .disk > span:last-child { text-align: right; }
-  .disk.bad .dn { color: var(--bad); }
-  .cap.thin { height: 4px; }
+  .host.disk { border-style: dashed; }
   .sec { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
   .ell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @media (max-width: 899px) {

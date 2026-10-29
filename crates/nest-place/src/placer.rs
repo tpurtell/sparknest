@@ -77,6 +77,25 @@ pub struct ClusterJob {
     host_jobs: Vec<(NodeId, u64)>,
 }
 
+/// Whether `asked` names the disk called `name`: exactly, or
+/// `raptor:d2` for `raptor (D2)` and the reverse, case aside.
+fn disk_name_matches(name: &str, asked: &str) -> bool {
+    let canon = |s: &str| {
+        let s = s.trim().to_lowercase();
+        match s.strip_suffix(')').and_then(|x| x.split_once(" (")) {
+            Some((h, d)) => format!("{h}:{d}"),
+            None => s,
+        }
+    };
+    canon(name) == canon(asked)
+}
+
+/// The UI name of a host's disk `k` (ADR-073): `raptor (D2)` for its
+/// first extra disk, the host's own being D1.
+pub fn disk_label(host: &str, k: u64) -> String {
+    format!("{host} (D{})", k + 1)
+}
+
 /// Hosts' stores by host name (`Placer::disks_listing`).
 pub type DisksByHost = HashMap<String, Vec<admin::DiskInfo>>;
 
@@ -416,6 +435,50 @@ impl Placer {
         Ok(out)
     }
 
+    /// Every place copies can go on hosts: each host (its primary disk)
+    /// and each extra disk, a place of its own (ADR-073). A disk's `node`
+    /// is its store id (`plan::host_of` gives its host).
+    pub fn places(&self) -> NestResult<Vec<HostRef>> {
+        let hosts = self.nodes()?;
+        let mut out = hosts.clone();
+        for r in query::stores(&self.conn()?).map_err(sql)? {
+            let Some(h) = r.id.host().filter(|_| r.id.is_disk()) else {
+                continue;
+            };
+            let Some(host) = hosts.iter().find(|x| x.node == h) else {
+                continue;
+            };
+            out.push(HostRef {
+                node: NodeId(r.id.0),
+                name: r.name,
+                offgrid: host.offgrid,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `resolve_hosts`, where a disk's name is a place too. `@all` and
+    /// `@offgrid` stay whole hosts (their primary disks).
+    pub fn resolve_places(&self, names: &[String]) -> NestResult<Vec<HostRef>> {
+        let names = self.expand_names(names)?;
+        let all = self.places()?;
+        let mut hosts = Vec::new();
+        let mut out = Vec::new();
+        for n in &names {
+            match all
+                .iter()
+                .find(|x| x.node.0 >= StoreId::DISK_BASE && disk_name_matches(&x.name, n))
+            {
+                Some(d) => out.push(d.clone()),
+                None => hosts.push(n.clone()),
+            }
+        }
+        out.extend(self.resolve_hosts(&hosts)?);
+        out.sort_by_key(|h| h.node);
+        out.dedup_by_key(|h| h.node);
+        Ok(out)
+    }
+
     pub fn groups(&self) -> NestResult<Vec<(String, Vec<String>)>> {
         query::groups(&self.conn()?).map_err(sql)
     }
@@ -474,11 +537,16 @@ impl Placer {
         let names = &self.expand_names(names)?;
         let nodes = self.nodes()?;
         let stores = self.archive_stores()?;
+        let places = self.places()?;
         for n in names {
             let known = n == "@all"
+                || n == "@offgrid"
                 || nodes
                     .iter()
                     .any(|h| h.name == *n || format!("node{}", h.node) == *n)
+                || places
+                    .iter()
+                    .any(|d| d.node.0 >= StoreId::DISK_BASE && disk_name_matches(&d.name, n))
                 || stores.iter().any(|(_, s, _)| s == n);
             if !known {
                 return Err(NestError::Invalid(format!("unknown host or store {n:?}")));
@@ -499,12 +567,12 @@ impl Placer {
             .cloned()
             .collect();
         let mut out: Vec<Target> = self
-            .resolve_hosts(&node_names)?
+            .resolve_places(&node_names)?
             .into_iter()
             .map(|h| Target {
                 name: h.name,
-                store: h.node.live_store(),
-                node: h.node,
+                store: crate::plan::store_of(h.node),
+                node: crate::plan::host_of(h.node),
             })
             .collect();
         for (id, name, cfg) in stores.into_iter().filter(|(_, s, _)| names.contains(s)) {
@@ -870,12 +938,19 @@ impl Placer {
         let (id, name) = match again {
             Some(r) => (r.id, r.name.clone()),
             None => {
-                let k = existing
-                    .iter()
-                    .filter(|r| r.id.host() == Some(h.node) && r.id.is_disk())
-                    .count()
-                    + 1;
-                let name = name.map_or_else(|| format!("{}:disk{k}", h.name), str::to_string);
+                // Named for the number its id will carry (never reused).
+                let k = self
+                    .vfs
+                    .data()
+                    .with_reader(|c| {
+                        c.query_row(
+                            "SELECT v FROM kv WHERE k = ?1",
+                            [format!("next_disk:{}", h.node.0)],
+                            |r| r.get::<_, i64>(0),
+                        )
+                    })
+                    .unwrap_or(1) as u64;
+                let name = name.map_or_else(|| disk_label(&h.name, k), str::to_string);
                 let cfg = serde_json::to_string(&nest_data::DiskConfig { path: path.into() })
                     .map_err(|e| NestError::Io(e.to_string()))?;
                 let r = self
@@ -920,15 +995,38 @@ impl Placer {
         query::stores(&self.conn()?)
             .map_err(sql)?
             .into_iter()
-            .find(|r| r.id.is_disk() && (r.name == name || r.id.0.to_string() == name))
+            .find(|r| {
+                r.id.is_disk() && (disk_name_matches(&r.name, name) || r.id.0.to_string() == name)
+            })
             .and_then(|r| Some((r.id, r.name, r.id.host()?)))
             .ok_or_else(|| NestError::Invalid(format!("no disk named {name:?}")))
     }
 
-    /// Move every copy off a disk onto the host's other stores (on the
-    /// host, never over the network). Returns the job.
-    pub async fn drain_disk(self: &Arc<Self>, name: &str) -> NestResult<u64> {
+    /// Move every copy off a disk onto `to`: another of the same host's
+    /// stores (by default its primary disk), on the host, never over the
+    /// network. Returns the job.
+    pub async fn drain_disk(self: &Arc<Self>, name: &str, to: Option<&str>) -> NestResult<u64> {
         let (id, dname, host) = self.find_disk(name)?;
+        let dest = match to {
+            None => host.live_store(),
+            Some(t) => {
+                let p = self
+                    .resolve_places(&[t.to_string()])?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| NestError::Invalid(format!("unknown disk {t:?}")))?;
+                if crate::plan::host_of(p.node) != host {
+                    return Err(NestError::Invalid(format!(
+                        "{} is on another host: a drain stays on the disk's host",
+                        p.name
+                    )));
+                }
+                crate::plan::store_of(p.node)
+            }
+        };
+        if dest == id {
+            return Err(NestError::Invalid("drain it onto another disk".into()));
+        }
         let c = self.conn()?;
         let files: Vec<(FileId, u64)> = query::store_inventory(&c, id)
             .map_err(sql)?
@@ -939,23 +1037,12 @@ impl Placer {
             })
             .collect();
         drop(c);
-        let others: Vec<StoreId> = std::iter::once(host.live_store())
-            .chain(
-                self.disks()
-                    .await?
-                    .into_iter()
-                    .filter(|(h, _)| h.node == host)
-                    .flat_map(|(_, r)| r.unwrap_or_default())
-                    .filter(|d| !d.primary && d.store != id && d.healthy)
-                    .map(|d| d.store),
-            )
-            .collect();
         let hname = self
             .nodes()?
             .into_iter()
             .find(|h| h.node == host)
             .map_or_else(|| format!("node{host}"), |h| h.name);
-        self.move_local_job(format!("drain {dname}"), hname, host, files, id, others)
+        self.move_local_job(format!("drain {dname}"), hname, host, files, id, vec![dest])
             .await
     }
 
@@ -1046,14 +1133,15 @@ impl Placer {
     ) -> NestResult<(Manifest, Vec<Readiness>)> {
         let m = self.manifest(sel).await?;
         let hosts: Vec<Target> = if hosts.is_empty() {
-            // Every node, plus every archive store (without health checks).
+            // Every host and disk, plus every archive store (without
+            // health checks).
             let mut t: Vec<Target> = self
-                .nodes()?
+                .places()?
                 .into_iter()
                 .map(|h| Target {
                     name: h.name,
-                    store: h.node.live_store(),
-                    node: h.node,
+                    store: crate::plan::store_of(h.node),
+                    node: crate::plan::host_of(h.node),
                 })
                 .collect();
             t.extend(
@@ -1071,7 +1159,7 @@ impl Placer {
             self.validate_targets(hosts)?;
             let stores = self.archive_stores()?;
             let mut t: Vec<Target> = self
-                .resolve_hosts(
+                .resolve_places(
                     &hosts
                         .iter()
                         .filter(|n| !stores.iter().any(|(_, s, _)| s == *n))
@@ -1081,8 +1169,8 @@ impl Placer {
                 .into_iter()
                 .map(|h| Target {
                     name: h.name,
-                    store: h.node.live_store(),
-                    node: h.node,
+                    store: crate::plan::store_of(h.node),
+                    node: crate::plan::host_of(h.node),
                 })
                 .collect();
             t.extend(
@@ -1109,13 +1197,8 @@ impl Placer {
                 ready: false,
             };
             for e in &m.entries {
-                let held = match h.store.host() {
-                    // A host is ready if any of its stores holds it (ADR-073).
-                    Some(n) if h.store == n.live_store() => {
-                        query::host_holds(&c, e.file, e.generation, n).map_err(sql)?
-                    }
-                    _ => query::has_live_replica(&c, e.file, e.generation, h.store).map_err(sql)?,
-                };
+                let held =
+                    query::has_live_replica(&c, e.file, e.generation, h.store).map_err(sql)?;
                 if !(e.stable && held) {
                     r.missing_files += 1;
                     r.missing_bytes += e.size;
@@ -1184,13 +1267,7 @@ impl Placer {
                 .iter()
                 .filter(|e| e.stable)
                 .filter(|e| {
-                    let held = match h.store.host() {
-                        Some(n) if h.store == n.live_store() => {
-                            query::host_holds(&c, e.file, e.generation, n)
-                        }
-                        _ => query::has_live_replica(&c, e.file, e.generation, h.store),
-                    };
-                    !held.unwrap_or(false)
+                    !query::has_live_replica(&c, e.file, e.generation, h.store).unwrap_or(false)
                 })
                 .map(|e| (e.file, e.size))
                 .collect();
@@ -2938,10 +3015,11 @@ impl Placer {
                     else {
                         return None;
                     };
+                    // A place: a host's primary disk or one of its disks.
                     let target = Target {
                         name: host.clone(),
-                        store: node.live_store(),
-                        node: *node,
+                        store: crate::plan::store_of(*node),
+                        node: crate::plan::host_of(*node),
                     };
                     let m = Manifest {
                         entries: copies
@@ -3029,7 +3107,13 @@ impl Placer {
                         let c = me.conn()?;
                         let (keep, skip): (Vec<_>, Vec<_>) = copies.into_iter().partition(|x| {
                             x.keeper.or(requires).is_none_or(|k| {
-                                query::host_holds(&c, x.file, x.generation, k).unwrap_or(false)
+                                query::has_live_replica(
+                                    &c,
+                                    x.file,
+                                    x.generation,
+                                    crate::plan::store_of(k),
+                                )
+                                .unwrap_or(false)
                             })
                         });
                         if !skip.is_empty() {
@@ -3050,34 +3134,27 @@ impl Placer {
                     if copies.is_empty() {
                         continue;
                     }
-                    // One request per store of the host holding them.
-                    let mut by_store: BTreeMap<StoreId, Vec<(FileId, nest_types::Generation)>> =
-                        BTreeMap::new();
-                    for c in &copies {
-                        by_store
-                            .entry(c.store.unwrap_or(node.live_store()))
-                            .or_default()
-                            .push((c.file, c.generation));
-                    }
-                    for (store, files) in by_store {
-                        let n = files.len() as u64;
-                        match admin::call(
-                            me.rpc(),
-                            node,
-                            &AdminReq::EvictExact { files, store },
-                            Duration::from_secs(600),
-                        )
-                        .await?
-                        {
-                            AdminResp::Evicted { removed, refused } => {
-                                let mut j = job.lock();
-                                let p = j.hosts.entry(host.clone()).or_default();
-                                p.done_files += removed;
-                                p.total_files += n;
-                                p.failed.extend(refused);
-                            }
-                            other => return Err(NestError::Io(format!("unexpected {other:?}"))),
+                    // The place's store, removed by its host.
+                    let files = copies.iter().map(|c| (c.file, c.generation)).collect();
+                    match admin::call(
+                        me.rpc(),
+                        crate::plan::host_of(node),
+                        &AdminReq::EvictExact {
+                            files,
+                            store: crate::plan::store_of(node),
+                        },
+                        Duration::from_secs(600),
+                    )
+                    .await?
+                    {
+                        AdminResp::Evicted { removed, refused } => {
+                            let mut j = job.lock();
+                            let p = j.hosts.entry(host.clone()).or_default();
+                            p.done_files += removed;
+                            p.total_files += copies.len() as u64;
+                            p.failed.extend(refused);
                         }
+                        other => return Err(NestError::Io(format!("unexpected {other:?}"))),
                     }
                 }
                 Ok(())

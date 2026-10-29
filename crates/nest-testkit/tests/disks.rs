@@ -1,5 +1,5 @@
-//! Several disks per host (ADR-073): each extra disk is a store of its own,
-//! copies spread over a host's disks, a host still holds a file once.
+//! Several disks per host (ADR-073): each extra disk is a place of its own,
+//! named like a host; copies go there only when it is named.
 
 use nest_data::vfs::oflags;
 use nest_place::Selector;
@@ -84,44 +84,36 @@ fn disk_dir(c: &TestCluster, id: u64, name: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn copies_spread_over_a_hosts_disks_and_are_read_from_them() {
+async fn a_disk_is_a_place_of_its_own() {
     let mut c = ready(3).await;
     let p = c.node(1).placer.clone();
-    let d1 = disk_dir(&c, 2, "nvme1");
-    let d2 = disk_dir(&c, 2, "nvme2");
-    let s1 = p.add_disk("n2", &d1, None).await.unwrap();
-    let s2 = p.add_disk("n2", &d2, Some("n2:fast")).await.unwrap();
-    assert_eq!((s1, s2), (NodeId(2).disk_store(1), NodeId(2).disk_store(2)));
+    let d2 = disk_dir(&c, 2, "nvme1");
+    let d3 = disk_dir(&c, 2, "nvme2");
+    let s2 = p.add_disk("n2", &d2, None).await.unwrap();
+    let s3 = p.add_disk("n2", &d3, None).await.unwrap();
+    assert_eq!((s2, s3), (NodeId(2).disk_store(1), NodeId(2).disk_store(2)));
+    assert_eq!(p.find_disk("n2 (D2)").unwrap().0, s2);
+    assert_eq!(p.find_disk("n2:d3").unwrap().0, s3);
     // The same path again is the same disk.
-    assert_eq!(p.add_disk("n2", &d1, None).await.unwrap(), s1);
+    assert_eq!(p.add_disk("n2", &d2, None).await.unwrap(), s2);
     let listed = p.disks().await.unwrap();
-    let n2 = &listed.iter().find(|(h, _)| h.name == "n2").unwrap().1;
-    let n2 = n2.as_ref().unwrap();
+    let n2 = listed
+        .iter()
+        .find(|(h, _)| h.name == "n2")
+        .unwrap()
+        .1
+        .as_ref()
+        .unwrap();
     assert_eq!(n2.len(), 3, "{n2:?}");
     assert!(n2[0].primary && n2.iter().all(|d| d.healthy), "{n2:?}");
+    let names: Vec<String> = p.places().unwrap().into_iter().map(|h| h.name).collect();
+    assert_eq!(names, ["n1", "n2", "n3", "n2 (D2)", "n2 (D3)"]);
 
-    // Six files written on n1, copied to n2: they land over n2's stores.
     let mut files = Vec::new();
     for i in 0..6u8 {
         files.push(write_file(&c, 1, &format!("w{i}"), i + 1, 3 << 20).await);
     }
-    let sel = Selector::parse("/", "/hub").unwrap();
-    let job = p.replicate(sel, vec!["n2".into()], 4).await.unwrap();
-    let j = wait_job(&c, job).await;
-    assert!(j.error.is_none(), "{j:?}");
-    assert!(j.hosts["n2"].failed.is_empty(), "{j:?}");
-    let mut on_disk = 0;
-    for f in &files {
-        let st = stores_of(&c, *f);
-        let n2_copies: Vec<_> = st.iter().filter(|s| s.host() == Some(NodeId(2))).collect();
-        assert_eq!(n2_copies.len(), 1, "one copy per host: {st:?}");
-        on_disk += n2_copies.iter().filter(|s| s.is_disk()).count();
-    }
-    assert!(
-        on_disk >= 2,
-        "copies went to the extra disks too ({on_disk} of 6)"
-    );
-    // Already held (on a disk): a second copy to the host does nothing.
+    // A host's name is its primary disk: nothing goes to D2 or D3 unasked.
     let job = p
         .replicate(
             Selector::parse("/w0", "/hub").unwrap(),
@@ -130,30 +122,84 @@ async fn copies_spread_over_a_hosts_disks_and_are_read_from_them() {
         )
         .await
         .unwrap();
-    let j = wait_job(&c, job).await;
-    assert_eq!(j.hosts["n2"].total_files, 0, "{j:?}");
-
-    // n2 reads its disk copies locally; n3 reads them from n2.
-    let on_n2_disk = *files
-        .iter()
-        .find(|f| stores_of(&c, **f).iter().any(|s| s.is_disk()))
-        .unwrap();
-    let want = read_all(&c.node(1).vfs, on_n2_disk).await;
-    assert_eq!(read_all(&c.node(2).vfs, on_n2_disk).await, want);
-    p.evict(&Selector::parse("/", "/hub").unwrap(), &["n1".into()])
+    assert!(wait_job(&c, job).await.error.is_none());
+    assert!(stores_of(&c, files[0]).contains(&StoreId(2)));
+    // Named, a disk takes a copy of its own, beside the primary's.
+    let job = p
+        .replicate(
+            Selector::parse("/w0", "/hub").unwrap(),
+            vec!["n2 (D2)".into()],
+            4,
+        )
         .await
         .unwrap();
-    c.converge().await;
+    let j = wait_job(&c, job).await;
     assert!(
-        stores_of(&c, on_n2_disk)
-            .iter()
-            .all(|s| s.host() == Some(NodeId(2)))
+        j.error.is_none() && j.hosts["n2 (D2)"].failed.is_empty(),
+        "{j:?}"
     );
-    assert_eq!(read_all(&c.node(3).vfs, on_n2_disk).await, want);
-    assert_eq!(
-        c.node(3).vfs.read_order(on_n2_disk).unwrap(),
-        vec![NodeId(2)]
-    );
+    let st = stores_of(&c, files[0]);
+    assert!(st.contains(&StoreId(2)) && st.contains(&s2), "{st:?}");
+
+    // Room as on real disks (the test dirs share one, nearly full).
+    for n in 1..=3 {
+        c.node(n).data.store().set_free(Some(1 << 40));
+    }
+    for d in [s2, s3] {
+        c.node(2)
+            .data
+            .disk(d)
+            .unwrap()
+            .store
+            .set_free(Some(1 << 40));
+    }
+    // Place: one copy of each file over n2 (D2) and n2 (D3), even.
+    let plan = p
+        .plan(nest_place::plan::Goal::Place {
+            selector: "/".into(),
+            hosts: vec!["n2 (D2)".into(), "n2:d3".into()],
+            factor: 0.5,
+            by_speed: false,
+            hub: "/hub".into(),
+        })
+        .await
+        .unwrap();
+    assert!(plan.feasible, "{plan:?}");
+    let job = p.apply_plan(plan.id).await.unwrap();
+    let j = wait_job(&c, job).await;
+    assert!(j.error.is_none(), "{j:?}");
+    c.converge().await;
+    let (mut on2, mut on3) = (0, 0);
+    for f in &files {
+        let st = stores_of(&c, *f);
+        let picked: Vec<_> = st.iter().filter(|s| **s == s2 || **s == s3).collect();
+        assert_eq!(picked.len(), 1, "one of the two disks: {st:?}");
+        if st.contains(&s2) {
+            on2 += 1;
+        } else {
+            on3 += 1;
+        }
+    }
+    assert_eq!((on2, on3), (3, 3), "even");
+
+    // A disk's copy is read on its host, and from it by others.
+    let on_d = *files
+        .iter()
+        .find(|f| stores_of(&c, **f).contains(&s3))
+        .unwrap();
+    let want = read_all(&c.node(1).vfs, on_d).await;
+    assert_eq!(read_all(&c.node(2).vfs, on_d).await, want);
+    for h in ["n1", "n2"] {
+        let r = p
+            .evict(&Selector::parse("/", "/hub").unwrap(), &[h.into()])
+            .await
+            .unwrap();
+        assert!(!r.is_empty());
+    }
+    c.converge().await;
+    assert_eq!(stores_of(&c, on_d), vec![s3]);
+    assert_eq!(read_all(&c.node(3).vfs, on_d).await, want);
+    assert_eq!(c.node(3).vfs.read_order(on_d).unwrap(), vec![NodeId(2)]);
 
     // A restart keeps the disk copies (reconciled, not discarded).
     c.stop(2).await;
@@ -162,8 +208,9 @@ async fn copies_spread_over_a_hosts_disks_and_are_read_from_them() {
         c.node(2).data.caught_up()
     })
     .await;
-    assert_eq!(read_all(&c.node(2).vfs, on_n2_disk).await, want);
-    assert_eq!(read_all(&c.node(3).vfs, on_n2_disk).await, want);
+    assert_eq!(read_all(&c.node(2).vfs, on_d).await, want);
+    assert_eq!(read_all(&c.node(3).vfs, on_d).await, want);
+    let on_n2_disk = on_d;
 
     // Writing a file held only on a disk: n2 owns it, the old copy goes.
     let v2 = &c.node(2).vfs;
@@ -192,7 +239,7 @@ async fn a_disk_is_drained_and_removed_and_an_unmounted_one_is_never_used() {
     c.node(2).vfs.replicate_into(f, s1).await.unwrap();
     assert!(stores_of(&c, f).contains(&s1));
     // Not removable while it holds a copy.
-    assert!(p.remove_disk("n2:disk1", false).await.is_err());
+    assert!(p.remove_disk("n2 (D2)", false).await.is_err());
 
     // The disk goes away (unmounted): its marker is gone, so it is never
     // read; n3 reads from n1 instead.
@@ -223,7 +270,7 @@ async fn a_disk_is_drained_and_removed_and_an_unmounted_one_is_never_used() {
     assert!(c.node(2).vfs.holds_live(&c.attr(2, f).unwrap()));
 
     // Drain: the copy moves to n2's live store, on n2.
-    let job = p.drain_disk("n2:disk1").await.unwrap();
+    let job = p.drain_disk("n2 (D2)", None).await.unwrap();
     let j = wait_job(&c, job).await;
     assert!(j.error.is_none(), "{j:?}");
     c.converge().await;
@@ -240,6 +287,6 @@ async fn a_disk_is_drained_and_removed_and_an_unmounted_one_is_never_used() {
             })
     })
     .await;
-    p.remove_disk("n2:disk1", false).await.unwrap();
-    assert!(p.find_disk("n2:disk1").is_err());
+    p.remove_disk("n2 (D2)", false).await.unwrap();
+    assert!(p.find_disk("n2 (D2)").is_err());
 }

@@ -146,9 +146,10 @@ nest plan --speedup 1w         # review, then: nest plan apply ID --wait
 ```
 
 **Another disk in a host.** Mount it, then `nest disk add raptor
-/srv/sparknest-nvme1`: it becomes one of raptor's stores (ADR-073), and
-copies for raptor spread over its disks by free space. `nest disk ls`
-shows each; `nest disk drain NAME` empties one onto the host's others.
+/srv/sparknest-nvme1`: it becomes a place of its own, `raptor (D2)`
+(ADR-073, ADR-074), which plans, `nest replicate` and the UI take like a
+host. Copies go there only when it is named. `nest disk ls` shows each;
+`nest disk drain "raptor (D2)" --to "raptor (D3)"` empties one.
 
 **7. Later.** After reformatting that drive it becomes a second archive
 store (`nest store add scratch /mnt/scratch/sparknest --gateways raptor`),

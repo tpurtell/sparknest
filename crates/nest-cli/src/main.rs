@@ -759,8 +759,9 @@ enum DiskCmd {
     /// Every host's stores: its live store, then each extra disk.
     Ls,
     /// Add a disk to a host: PATH is a mounted directory on that host,
-    /// empty (or this disk's own). Copies for the host then spread over its
-    /// disks by free space.
+    /// empty (or this disk's own). It is then a place of its own, named
+    /// like `raptor (D2)` (or `raptor:d2`): copies go there only when a
+    /// command or plan names it.
     Add {
         host: String,
         path: String,
@@ -768,10 +769,13 @@ enum DiskCmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Move every copy off a disk onto its host's other stores (on that
-    /// host; nothing crosses the network).
+    /// Move every copy off a disk onto another of its host's disks (on
+    /// that host; nothing crosses the network).
     Drain {
         name: String,
+        /// Where to: another disk of the same host (default: its primary).
+        #[arg(long)]
+        to: Option<String>,
         #[arg(long)]
         wait: bool,
     },
@@ -1998,9 +2002,12 @@ async fn main() -> Result<()> {
                 )
                 .await?
             }
-            DiskCmd::Drain { name, wait } => {
+            DiskCmd::Drain { name, to, wait } => {
                 let v = c
-                    .post(&format!("/v1/disks/{}/drain", enc(name)), json!({}))
+                    .post(
+                        &format!("/v1/disks/{}/drain", enc(name)),
+                        json!({ "to": to }),
+                    )
                     .await?;
                 let id = v["job"].as_u64().unwrap_or(0);
                 if *wait { wait_job(&c, id).await? } else { v }

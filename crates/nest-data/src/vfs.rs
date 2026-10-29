@@ -339,8 +339,6 @@ pub struct Vfs {
     archive_slots: Mutex<HashMap<nest_types::StoreId, Arc<tokio::sync::Semaphore>>>,
     /// Transfers into each of this host's stores (`DISK_TRANSFERS`).
     disk_slots: Mutex<HashMap<nest_types::StoreId, Arc<tokio::sync::Semaphore>>>,
-    /// Bytes of copies recently sent to each store (`pick_store`).
-    store_pending: Mutex<HashMap<nest_types::StoreId, u64>>,
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
     fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
@@ -470,7 +468,6 @@ impl Vfs {
             serve_files: Mutex::new(HashMap::new()),
             archive_slots: Mutex::new(HashMap::new()),
             disk_slots: Mutex::new(HashMap::new()),
-            store_pending: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
             fence_hooks: Mutex::new(Vec::new()),
             fabric: Mutex::new(None),
@@ -3510,68 +3507,6 @@ impl Vfs {
         })
         .await?;
         Ok(true)
-    }
-
-    /// Which of this host's stores a new copy of `size` bytes goes into:
-    /// the one with the most free space after what copies already headed
-    /// there will take (its live store when it has no disks; ADR-073). The
-    /// live store keeps its data reserve for metadata.
-    pub fn pick_store(&self, size: u64) -> nest_types::StoreId {
-        let live = self.me().live_store();
-        let disks = self.d.disks();
-        if disks.is_empty() {
-            return live;
-        }
-        let mut pending = self.store_pending.lock();
-        let mut best = (live, i128::MIN);
-        let live_room =
-            self.d
-                .store()
-                .capacity()
-                .map_or(0, |c| c.free.saturating_sub(self.d.store().reserve())) as i128;
-        for (id, room) in std::iter::once((live, live_room)).chain(
-            disks
-                .iter()
-                .map(|d| (d.id, d.store.capacity().map_or(0, |c| c.free) as i128)),
-        ) {
-            let left = room - pending.get(&id).copied().unwrap_or(0) as i128;
-            if left > best.1 {
-                best = (id, left);
-            }
-        }
-        *pending.entry(best.0).or_default() += size;
-        // Forget the estimate once the statvfs it adjusts has caught up.
-        let w = self.weak.clone();
-        let (id, n) = (best.0, size);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(120)).await;
-            if let Some(v) = w.upgrade() {
-                let mut p = v.store_pending.lock();
-                if let Some(x) = p.get_mut(&id) {
-                    *x = x.saturating_sub(n);
-                }
-            }
-        });
-        best.0
-    }
-
-    /// This host's stores holding a live copy of `file`'s current
-    /// generation (its live store and disks).
-    pub fn stores_holding(&self, file: FileId) -> Vec<nest_types::StoreId> {
-        let Ok(a) = self.raw_attr(file) else {
-            return Vec::new();
-        };
-        let me = self.me();
-        self.q(|c| query::replicas(c, file))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| {
-                r.generation == a.generation
-                    && r.state == nest_types::ReplicaState::Live
-                    && r.store.host() == Some(me)
-            })
-            .map(|r| r.store)
-            .collect()
     }
 
     /// Make this host's live store hold `a`'s generation when only one of

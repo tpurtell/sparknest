@@ -367,7 +367,7 @@ async fn ls(State(api): State<Api>, Query(q): Query<PathQ>) -> R<serde_json::Val
     // Store ids to names: nodes' live stores and archive stores.
     let mut names: HashMap<u64, String> = api
         .placer
-        .nodes()?
+        .places()?
         .into_iter()
         .map(|h| (h.node.0, h.name))
         .collect();
@@ -383,9 +383,7 @@ async fn ls(State(api): State<Api>, Query(q): Query<PathQ>) -> R<serde_json::Val
             .map_err(|e| bad(e.to_string()))?
             .into_iter()
             .filter(|r| r.generation == a.generation)
-            .map(|r| host(r.store.host().map_or(r.store.0, |h| h.0)))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
+            .map(|r| host(r.store.0))
             .collect();
         Ok(LsEntry {
             name,
@@ -1406,8 +1404,21 @@ async fn add_disk(State(api): State<Api>, Json(r): Json<AddDiskReq>) -> R<serde_
     Ok(Json(json!({ "store": id.0, "name": name })))
 }
 
-async fn drain_disk(State(api): State<Api>, Path(name): Path<String>) -> R<serde_json::Value> {
-    Ok(Json(json!({ "job": api.placer.drain_disk(&name).await? })))
+#[derive(Deserialize, Default)]
+struct DrainReq {
+    #[serde(default)]
+    to: Option<String>,
+}
+
+async fn drain_disk(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    body: Option<Json<DrainReq>>,
+) -> R<serde_json::Value> {
+    let to = body.and_then(|Json(b)| b.to);
+    Ok(Json(
+        json!({ "job": api.placer.drain_disk(&name, to.as_deref()).await? }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1500,10 +1511,10 @@ async fn hf_detail(State(api): State<Api>, Query(q): Query<DetailQ>) -> R<serde_
     );
     let (_m, ready) = api.placer.readiness(&sel, &[]).await?;
     // Files and where they live, from the space tree's models shape.
-    let nodes = api.placer.nodes()?;
+    let nodes = api.placer.places()?;
     let mut store_names: HashMap<StoreId, String> = nodes
         .iter()
-        .map(|h| (h.node.live_store(), h.name.clone()))
+        .map(|h| (StoreId(h.node.0), h.name.clone()))
         .collect();
     store_names.extend(
         api.placer
@@ -1868,11 +1879,11 @@ struct TreeQ {
 /// A size-weighted tree of what sparknest holds, for treemaps, plus the
 /// free space of the stores in scope.
 async fn space_tree(State(api): State<Api>, Query(q): Query<TreeQ>) -> R<serde_json::Value> {
-    let nodes = api.placer.nodes()?;
+    let nodes = api.placer.places()?;
     let archives = api.placer.archive_stores()?;
     let mut names: HashMap<StoreId, String> = nodes
         .iter()
-        .map(|h| (h.node.live_store(), h.name.clone()))
+        .map(|h| (StoreId(h.node.0), h.name.clone()))
         .collect();
     names.extend(archives.iter().map(|(id, n, _)| (*id, n.clone())));
     let scope = q.scope.filter(|s| !s.is_empty() && s != "all");
@@ -1917,6 +1928,12 @@ async fn space_tree(State(api): State<Api>, Query(q): Query<TreeQ>) -> R<serde_j
             && let Some(i) = &s.info
         {
             free.push(json!({ "name": s.name, "kind": "host", "free": i.free_bytes, "total": i.total_bytes, "held": i.object_bytes }));
+        }
+    }
+    // Each host's extra disks, places of their own (ADR-073).
+    for d in api.placer.disks_listing().await.into_values().flatten() {
+        if !d.primary && d.healthy && scope.as_ref().is_none_or(|x| *x == d.name) {
+            free.push(json!({ "name": d.name, "kind": "host", "free": d.free_bytes, "total": d.total_bytes, "held": d.object_bytes }));
         }
     }
     for st in api.placer.stores().await? {

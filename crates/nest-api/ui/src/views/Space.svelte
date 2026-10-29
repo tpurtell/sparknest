@@ -1,7 +1,7 @@
 <script lang="ts">
   import Treemap from "../components/Treemap.svelte";
   import { get, type TreeNode, type SpaceStore } from "../lib/api";
-  import { app, route, go, runningJobs, singleFlight } from "../lib/state.svelte";
+  import { app, route, go, runningJobs, singleFlight, places } from "../lib/state.svelte";
   import { human, pct } from "../lib/format";
   import { nodeMenu } from "../lib/actions";
 
@@ -86,7 +86,7 @@
 
   const scopes = $derived([
     { name: "all", label: "Whole cluster", kind: "all" },
-    ...(app.status?.nodes ?? []).map((n) => ({ name: n.name, label: n.name, kind: "host" })),
+    ...places().map((p) => ({ name: p.name, label: p.name, kind: "host" })),
     ...app.stores.map((s) => ({ name: s.name, label: s.name, kind: "archive" })),
   ]);
   const held = $derived(stores.reduce((a, s) => a + s.held, 0));

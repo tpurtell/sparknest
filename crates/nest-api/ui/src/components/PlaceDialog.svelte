@@ -5,7 +5,7 @@
   // only, ADR-047), or in an archive. Placements are planned and shown as an
   // editable plan before anything moves.
   import { get, post, type Plan, type Readiness, type HostUsage } from "../lib/api";
-  import { app, startJob, singleFlight, extraDisks } from "../lib/state.svelte";
+  import { app, startJob, singleFlight, places } from "../lib/state.svelte";
   import { human } from "../lib/format";
   import { placing } from "../lib/ui.svelte";
   import { portal } from "../lib/portal";
@@ -28,28 +28,27 @@
   let busy = $state(false);
   let stats = $state<{ hosts: Readiness[]; usage: Record<string, HostUsage> } | null>(null);
 
-  // Fabric hosts and off-grid hosts, in the cluster's order.
-  const hosts = $derived((app.status?.nodes ?? []).filter((n) => n.info && !n.offgrid).map((n) => n.name));
-  const offgrid = $derived((app.status?.nodes ?? []).filter((n) => n.offgrid).map((n) => n.name));
+  // Fabric places and off-grid ones, in the cluster's order: each host,
+  // then its extra disks, each a place of its own (ADR-073).
+  const all = $derived(places());
+  const place = (h: string) => all.find((p) => p.name === h);
+  const hosts = $derived(all.filter((p) => p.up && !p.offgrid).map((p) => p.name));
+  const offgrid = $derived(all.filter((p) => p.offgrid).map((p) => p.name));
   const full = (h: string) => {
     const r = stats?.hosts.find((x) => x.host === h);
     return !!r && r.bytes > 0 && r.missing_bytes === 0;
   };
+  // Usage is a host's: a disk shows its host's reads.
   const read = (h: string) => {
-    const u = stats?.usage?.[h];
+    const u = stats?.usage?.[place(h)?.host ?? h];
     return u ? u.local_bytes + u.net_bytes : 0;
   };
   const held = (h: string) => {
     const r = stats?.hosts.find((x) => x.host === h);
     return r ? r.bytes - r.missing_bytes : 0;
   };
-  const free = (h: string) => app.status?.nodes.find((n) => n.name === h)?.info?.free_bytes ?? 0;
-  // A host's disks together (ADR-073): copies there spread over them.
-  const stores = (h: string) => (app.disks[h] ?? []).filter((d) => d.healthy);
-  const disk = (h: string) => {
-    const s = stores(h);
-    return s.length > 1 ? s.reduce((a, d) => a + d.read_bps, 0) : app.status?.nodes.find((n) => n.name === h)?.info?.disk_read_bps ?? 0;
-  };
+  const free = (h: string) => place(h)?.free ?? 0;
+  const disk = (h: string) => place(h)?.read_bps ?? 0;
   // Relative use of this selection: the most-reading host a full bar, the
   // least an empty one.
   const useBar = $derived.by(() => {
@@ -204,13 +203,12 @@
               <div class="row"><b>{h}</b>{#if mode === "single" && h === best}<span class="badge spark">best</span>{/if}</div>
               <span class="tiny muted mono">{held(h) ? `holds ${human(held(h))}` : "holds none"}</span>
               <span class="tiny muted mono">{human(free(h))} free</span>
-              {#if extraDisks(h).length}<span class="tiny muted mono" title={stores(h).map((d) => `${d.name}: ${human(d.free_bytes)} free`).join("\n")}>{stores(h).length} disks</span>{/if}
               {#if mode === "multi" && disk(h)}<span class="tiny muted mono">disk {human(disk(h))}/s</span>{/if}
               <span class="use" title="{human(read(h))} read here in 30 days"><i style="width:{useBar(h) * 100}%"></i></span>
             </button>
           {/each}
         </div>
-        <div class="tiny muted legend">bar: how much each host read it (most = full){Object.keys(app.disks).length ? " · a host with several disks spreads its copies over them by free space" : ""}</div>
+        <div class="tiny muted legend">bar: how much each host read it (most = full){Object.keys(app.disks).length ? " · a host's extra disks are places of their own" : ""}</div>
         {#if mode === "multi"}
           <div class="factor">
             <div class="row">

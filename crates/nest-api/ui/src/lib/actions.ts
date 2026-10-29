@@ -2,7 +2,7 @@
 // context menu, model details and the files list.
 
 import { get, post, api, type TreeNode } from "./api";
-import { app, startJob, targets, toast, go } from "./state.svelte";
+import { app, startJob, targets, toast, go, places } from "./state.svelte";
 import { pick, inform, confirm, openMenu, openPlace, type MenuItem } from "./ui.svelte";
 import { human, selLabel } from "./format";
 import { download, remove as deletePath } from "./files.svelte";
@@ -145,7 +145,7 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
     ]);
   }
   if (!sel) return openMenu(x, y, n.name, sub, [{ label: "Nothing to act on here", disabled: true }]);
-  const isHost = scope && app.status?.nodes.some((h) => h.name === scope);
+  const isHost = scope && places().some((h) => h.name === scope);
   const items: MenuItem[] = [];
   if (zoom && (n.children?.length || n.truncated)) items.push({ label: "Zoom in", icon: "zoom", run: zoom });
   if (n.kind === "repo") items.push({ label: "Model details", icon: "info", run: () => go("models", sel) });

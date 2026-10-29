@@ -2548,3 +2548,34 @@ ids from a lookup table: every hot path that maps a copy to its host
 would query it. Letting a host hold a file on two of its disks: twice the
 space for no protection against losing the host, and every copy count
 would need to tell hosts from disks.
+
+## ADR-074 — A host's disks are places of their own, picked by name (2026-10-29; amends ADR-073)
+
+**Context.** ADR-073 as first built kept "a host holds a file once" and
+chose a disk for each copy by free space. TJ: nothing else in sparknest
+places by itself, they want to choose which drive gets more and which is
+left room, and a Place spread with several copies over a host's disks
+gets confusing if hosts and disks count differently. 0.7.0 had not been
+released.
+
+**Decision.**
+1. **A disk is a place, like a host.** It is named `raptor (D2)`, the
+   host's own disk being D1 (`raptor:d2` is accepted too). Replicate,
+   evict, Place, Consolidate, the free-space goal, rules and readiness
+   take it wherever they take a host; the UI shows it as a host card
+   and a Place tile of its own, and the Space view can scope to it.
+2. **Nothing is automatic.** `raptor` means raptor's primary disk; a
+   copy lands on D2 only when D2 is named or a plan over places that
+   include D2 picks it. Free-space picking is gone. A drain moves a
+   disk's copies to one disk named with `--to` (the host's primary by
+   default).
+3. **Copies count per place.** A spread over raptor, D2, D3 and the six
+   Sparks puts each file on one of the nine; two copies over raptor's
+   disks are two copies, both on raptor. No rule tells hosts from disks.
+4. **Unchanged from ADR-073:** store ids naming their host, the marker,
+   writes on the primary disk, local reads and push streams per disk,
+   reconcile and the 0.7.0 gate. A host's info reports its primary disk
+   only; `GET /v1/disks` gives each disk.
+
+**Alternatives.** One copy per host with an automatic disk (ADR-073 as
+first built): see Context.

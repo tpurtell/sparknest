@@ -692,7 +692,7 @@ paths:
                   description: The disk's directory on that host.
                 name:
                   type: string
-                  description: "Defaults to `<host>:disk<k>`."
+                  description: "Defaults to `<host> (D<k>)`, the host's own disk being D1."
       responses:
         "200":
           description: The new disk.
@@ -743,7 +743,7 @@ paths:
   /v1/disks/{name}/drain:
     post:
       tags: [stores]
-      summary: Move every copy off a disk onto its host's other stores
+      summary: Move every copy off a disk onto another disk of its host
       operationId: drainDisk
       parameters:
         - name: name
@@ -751,6 +751,16 @@ paths:
           required: true
           schema:
             type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                to:
+                  type: [string, "null"]
+                  description: Another disk of the same host; its primary disk when absent.
       responses:
         "200":
           $ref: "#/components/responses/Job"

@@ -441,23 +441,15 @@ impl Admin {
 
     pub fn info(&self) -> NodeInfo {
         let d = self.vfs.data();
-        let (cap, _) = self
-            .vfs
-            .statfs()
-            .map(|(c, n)| (Some(c), n))
-            .unwrap_or((None, 0));
+        let cap = self.vfs.data().store().capacity().ok();
         // From the metadata, not a directory scan: the UI polls this.
-        // Its live store and every disk (ADR-073): statfs sums them too.
+        // Its primary disk only: each extra disk is a place of its own
+        // (`AdminReq::Disks`, ADR-073).
         let (objects, object_bytes) = d
             .meta()
             .open_reader()
             .ok()
-            .map(|c| {
-                std::iter::once(d.id().live_store())
-                    .chain(d.disk_rows().into_iter().map(|(id, _, _)| id))
-                    .filter_map(|s| nest_meta::query::store_usage(&c, s).ok())
-                    .fold((0, 0), |(a, b), (x, y)| (a + x, b + y))
-            })
+            .and_then(|c| nest_meta::query::store_usage(&c, d.id().live_store()).ok())
             .unwrap_or((0, 0));
         let fab = self.vfs.fabric();
         let (fabric_read_bytes, fabric_served_bytes) = fab
@@ -579,9 +571,9 @@ impl Admin {
         out
     }
 
-    /// Move copies between this host's stores, `to` taking turns by free
-    /// space (the emptiest first, after what this job gave each). Progress
-    /// as a replicate job's.
+    /// Move copies between this host's stores, into `to` (the caller's
+    /// choice; with several, each file to the one with the most room
+    /// left). Progress as a replicate job's.
     fn start_move(
         self: &Arc<Self>,
         job: u64,
@@ -698,15 +690,8 @@ impl Admin {
                             .entry(job)
                             .or_default()
                             .push(Arc::downgrade(&copied));
-                        // A copy for this host goes on whichever of its
-                        // disks has the most room (ADR-073).
-                        let into = if target == vfs.data().id().live_store() {
-                            vfs.pick_store(size)
-                        } else {
-                            target
-                        };
                         tokio::select! {
-                            r = vfs.replicate_counting(f, into, &copied) => (f, size, Some(r)),
+                            r = vfs.replicate_counting(f, target, &copied) => (f, size, Some(r)),
                             _ = stop => (f, size, None),
                         }
                     }
@@ -777,24 +762,14 @@ impl Admin {
         p
     }
 
-    /// Evict from `store`; naming this host's live store means this host,
-    /// whichever of its disks holds the copy (ADR-073).
     async fn evict(&self, files: Vec<FileId>, store: StoreId) -> AdminResp {
         let mut removed = 0;
         let mut refused = Vec::new();
-        let whole_host = store == self.vfs.data().id().live_store();
         for f in files {
-            let stores: Vec<StoreId> = if whole_host {
-                self.vfs.stores_holding(f)
-            } else {
-                vec![store]
-            };
-            for st in stores {
-                match self.vfs.evict_from(f, st).await {
-                    Ok(true) => removed += 1,
-                    Ok(false) => {}
-                    Err(e) => refused.push((f, e.to_string())),
-                }
+            match self.vfs.evict_from(f, store).await {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(e) => refused.push((f, e.to_string())),
             }
         }
         AdminResp::Evicted { removed, refused }

@@ -141,9 +141,6 @@ impl Ns {
             .map_err(sql)?;
         for row in rows {
             let (f, size, s) = row.map_err(sql)?;
-            // A host's disks count as the host (ADR-073): a host holds a
-            // file once, whichever of its disks it is on.
-            let s = s.host().map_or(s, |h| h.live_store());
             leaves
                 .entry(f)
                 .or_insert(Leaf {
@@ -153,10 +150,7 @@ impl Ns {
                 .stores
                 .push(s);
         }
-        for l in leaves.values_mut() {
-            l.stores.sort();
-            l.stores.dedup();
-        }
+
         if let Some(s) = store {
             leaves.retain(|_, l| l.stores.contains(&s));
         }

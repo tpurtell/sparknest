@@ -258,16 +258,43 @@ export const leaderName = () =>
   app.status?.nodes.find((n) => n.node === app.status?.leader)?.name ?? "";
 export const runningJobs = () => app.jobs.filter((j) => !j.finished);
 
-/** Every place a copy can go: hosts, then archive stores. */
+/** Every place a copy can go: hosts and their disks, then archive stores. */
 export function targets(): { name: string; kind: "host" | "store" }[] {
   return [
-    ...nodes().map((n) => ({ name: n.name, kind: "host" as const })),
+    ...places().map((p) => ({ name: p.name, kind: "host" as const })),
     ...app.stores.map((s) => ({ name: s.name, kind: "store" as const })),
   ];
 }
 
 /** A host's extra disks (not its primary store); empty for a one-disk host. */
 export const extraDisks = (host: string) => (app.disks[host] ?? []).filter((d) => !d.primary);
+
+/** Somewhere copies can be placed: a host (its primary disk) or one of its
+ * extra disks, which is a place of its own (ADR-073). */
+export interface Place {
+  name: string;
+  /** The host it is on (itself for a host). */
+  host: string;
+  disk: boolean;
+  offgrid: boolean;
+  up: boolean;
+  free: number;
+  total: number;
+  held: number;
+  read_bps: number;
+}
+
+/** Every host, each followed by its extra disks. */
+export function places(): Place[] {
+  const out: Place[] = [];
+  for (const n of nodes()) {
+    const i = n.info;
+    out.push({ name: n.name, host: n.name, disk: false, offgrid: !!n.offgrid, up: !!i, free: i?.free_bytes ?? 0, total: i?.total_bytes ?? 0, held: i?.object_bytes ?? 0, read_bps: i?.disk_read_bps ?? 0 });
+    for (const d of extraDisks(n.name))
+      out.push({ name: d.name, host: n.name, disk: true, offgrid: !!n.offgrid, up: !!i && d.healthy, free: d.free_bytes, total: d.total_bytes, held: d.object_bytes, read_bps: d.read_bps });
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------- toasts
 
