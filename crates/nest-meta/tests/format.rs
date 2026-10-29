@@ -271,6 +271,7 @@ fn format_is_pinned() {
             },
             "SetSetting",
         ),
+        (Command::DeleteStore { store: StoreId(1) }, "DeleteStore"),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");
@@ -306,6 +307,12 @@ fn format_is_pinned() {
     assert_eq!(tag(&Reply::Revision(1)), 7);
     assert_eq!(tag(&Reply::FileIds(f)), 8);
     assert_eq!(tag(&Reply::Backup(1)), 10);
+    for (i, class) in [StoreClass::Live, StoreClass::Archive, StoreClass::Disk]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(tag(class) as usize, i, "StoreClass::{class:?} moved");
+    }
     let errs = [
         NestError::NotFound,
         NestError::Exists,

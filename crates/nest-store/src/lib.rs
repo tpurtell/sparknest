@@ -332,6 +332,11 @@ impl ObjectStore {
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The bytes kept free by `set_reserve`.
+    pub fn reserve(&self) -> u64 {
+        self.reserve.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Account for a data write of `bytes`: `ENOSPC` if it would eat into
     /// the reserve. statvfs is sampled at most every 250 ms; writes in
     /// between are subtracted from the sample (overwrites count too, which

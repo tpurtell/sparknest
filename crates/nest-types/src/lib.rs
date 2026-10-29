@@ -65,6 +65,41 @@ impl NodeId {
     pub fn live_store(self) -> StoreId {
         StoreId(self.0)
     }
+
+    /// The store id of this host's extra disk number `k` (1..=255, ADR-073).
+    pub fn disk_store(self, k: u8) -> StoreId {
+        StoreId(StoreId::DISK_BASE + (self.0 << 8) + k as u64)
+    }
+}
+
+impl StoreId {
+    /// First archive store id; lower ids are hosts' live stores (ADR-019).
+    pub const ARCHIVE_BASE: u64 = 1 << 20;
+    /// Store ids from here up are hosts' extra disks: `DISK_BASE + (node <<
+    /// 8) + k` (ADR-073), so every host knows a copy's host from its id.
+    pub const DISK_BASE: u64 = 1 << 40;
+
+    /// An archive store (a folder reached through gateways).
+    pub fn is_archive(self) -> bool {
+        (Self::ARCHIVE_BASE..Self::DISK_BASE).contains(&self.0)
+    }
+
+    /// One of a host's extra disks.
+    pub fn is_disk(self) -> bool {
+        self.0 >= Self::DISK_BASE
+    }
+
+    /// The host holding this store's copies: a live store's node or a
+    /// disk's host; `None` for an archive.
+    pub fn host(self) -> Option<NodeId> {
+        if self.0 < Self::ARCHIVE_BASE {
+            Some(NodeId(self.0))
+        } else if self.is_disk() {
+            Some(NodeId((self.0 - Self::DISK_BASE) >> 8))
+        } else {
+            None
+        }
+    }
 }
 
 /// Nanoseconds since the Unix epoch. Timestamps are chosen by the proposer

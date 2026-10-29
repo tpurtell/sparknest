@@ -72,6 +72,25 @@ pub struct NodeInfo {
     pub fabric_timing: [u64; 7],
 }
 
+/// One of a host's stores as it reports it: its live store or an extra
+/// disk (ADR-073). From `AdminReq::Disks`, which older hosts refuse.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskInfo {
+    pub store: StoreId,
+    pub name: String,
+    pub path: String,
+    /// Marker present and the path usable.
+    pub healthy: bool,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub objects: u64,
+    pub object_bytes: u64,
+    /// Measured read rate, bytes/s (0 until measured).
+    pub read_bps: u64,
+    /// The host's live store (metadata, the Raft log and writes live there).
+    pub primary: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreHealth {
     pub healthy: bool,
@@ -210,6 +229,24 @@ pub(crate) enum AdminReq {
     PushLoads {
         group: Option<u64>,
     },
+    /// This host's stores: its live store and each extra disk (ADR-073).
+    /// Older hosts cannot decode it and answer with an error.
+    Disks,
+    /// Prepare one of this host's disks (writes its marker), as InitStore
+    /// does for an archive. Older hosts answer with an error.
+    InitDisk {
+        store: StoreId,
+        name: String,
+        path: String,
+    },
+    /// Move this host's copies of `files` from one of its stores to
+    /// another, on this host (drain, rebalance). Answers `JobStarted`.
+    MoveLocal {
+        job: u64,
+        files: Vec<(FileId, u64)>,
+        from: StoreId,
+        to: Vec<StoreId>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -251,6 +288,7 @@ pub(crate) enum AdminResp {
     HfFetch(crate::hfimport::FetchProgress),
     Net(Box<nest_types::NetReport>),
     PushLoads(Vec<nest_data::push_record::Record>),
+    Disks(Vec<DiskInfo>),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -409,11 +447,17 @@ impl Admin {
             .map(|(c, n)| (Some(c), n))
             .unwrap_or((None, 0));
         // From the metadata, not a directory scan: the UI polls this.
+        // Its live store and every disk (ADR-073): statfs sums them too.
         let (objects, object_bytes) = d
             .meta()
             .open_reader()
             .ok()
-            .and_then(|c| nest_meta::query::store_usage(&c, d.id().live_store()).ok())
+            .map(|c| {
+                std::iter::once(d.id().live_store())
+                    .chain(d.disk_rows().into_iter().map(|(id, _, _)| id))
+                    .filter_map(|s| nest_meta::query::store_usage(&c, s).ok())
+                    .fold((0, 0), |(a, b), (x, y)| (a + x, b + y))
+            })
             .unwrap_or((0, 0));
         let fab = self.vfs.fabric();
         let (fabric_read_bytes, fabric_served_bytes) = fab
@@ -490,6 +534,122 @@ impl Admin {
         }
     }
 
+    /// This host's stores as they are now: the live store first, then
+    /// each disk metadata records here (an unusable one marked so).
+    /// Blocking: statvfs on each.
+    pub fn disks(&self) -> Vec<DiskInfo> {
+        let d = self.vfs.data();
+        let usage = |s: StoreId| {
+            d.with_reader(|c| nest_meta::query::store_usage(c, s))
+                .unwrap_or((0, 0))
+        };
+        let live = d.id().live_store();
+        let cap = d.store().capacity().ok();
+        let (objects, object_bytes) = usage(live);
+        let mut out = vec![DiskInfo {
+            store: live,
+            name: self.name.clone(),
+            path: d.store().root().display().to_string(),
+            healthy: true,
+            total_bytes: cap.map_or(0, |c| c.total),
+            free_bytes: cap.map_or(0, |c| c.free),
+            objects,
+            object_bytes,
+            read_bps: self.vfs.disk_read_bps(),
+            primary: true,
+        }];
+        let rates: HashMap<StoreId, u64> = self.vfs.disk_store_rates().into_iter().collect();
+        for (id, name, path) in d.disk_rows() {
+            let disk = d.disk(id);
+            let cap = disk.as_ref().and_then(|x| x.store.capacity().ok());
+            let (objects, object_bytes) = usage(id);
+            out.push(DiskInfo {
+                store: id,
+                name,
+                path,
+                healthy: disk.as_ref().is_some_and(|x| x.healthy_now()),
+                total_bytes: cap.map_or(0, |c| c.total),
+                free_bytes: cap.map_or(0, |c| c.free),
+                objects,
+                object_bytes,
+                read_bps: rates.get(&id).copied().unwrap_or(0),
+                primary: false,
+            });
+        }
+        out
+    }
+
+    /// Move copies between this host's stores, `to` taking turns by free
+    /// space (the emptiest first, after what this job gave each). Progress
+    /// as a replicate job's.
+    fn start_move(
+        self: &Arc<Self>,
+        job: u64,
+        files: Vec<(FileId, u64)>,
+        from: StoreId,
+        to: Vec<StoreId>,
+    ) {
+        let progress = Arc::new(Mutex::new(JobProgress {
+            total_files: files.len() as u64,
+            total_bytes: files.iter().map(|(_, s)| s).sum(),
+            ..Default::default()
+        }));
+        self.jobs.lock().insert(job, progress.clone());
+        let vfs = self.vfs.clone();
+        tokio::spawn(async move {
+            let d = vfs.data().clone();
+            let mut room: HashMap<StoreId, u64> = to
+                .iter()
+                .filter_map(|s| Some((*s, d.store_for(*s)?.capacity().ok()?.free)))
+                .collect();
+            let mut files = files;
+            files.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+            // Pick each file's destination up front, then copy a few at a
+            // time per destination.
+            let mut picks: Vec<(FileId, u64, StoreId)> = Vec::new();
+            for (f, size) in files {
+                let Some((&dst, r)) = room
+                    .iter_mut()
+                    .max_by_key(|(s, r)| (**r, std::cmp::Reverse(**s)))
+                else {
+                    progress
+                        .lock()
+                        .failed
+                        .push((f, "no usable store to move it to".into()));
+                    continue;
+                };
+                *r = r.saturating_sub(size);
+                picks.push((f, size, dst));
+            }
+            futures::stream::iter(picks)
+                .map(|(f, size, dst)| {
+                    let vfs = vfs.clone();
+                    let progress = progress.clone();
+                    async move {
+                        if progress.lock().cancelled {
+                            return (f, size, None);
+                        }
+                        (f, size, Some(vfs.move_between(f, from, dst).await))
+                    }
+                })
+                .buffer_unordered(8)
+                .for_each(|(f, size, r)| {
+                    let mut p = progress.lock();
+                    match r {
+                        Some(Ok(_)) => {
+                            p.done_files += 1;
+                            p.done_bytes += size;
+                        }
+                        Some(Err(e)) => p.failed.push((f, e.to_string())),
+                        None => {}
+                    }
+                    futures::future::ready(())
+                })
+                .await;
+            progress.lock().finished = true;
+        });
+    }
+
     fn start_replicate(
         self: &Arc<Self>,
         job: u64,
@@ -538,8 +698,15 @@ impl Admin {
                             .entry(job)
                             .or_default()
                             .push(Arc::downgrade(&copied));
+                        // A copy for this host goes on whichever of its
+                        // disks has the most room (ADR-073).
+                        let into = if target == vfs.data().id().live_store() {
+                            vfs.pick_store(size)
+                        } else {
+                            target
+                        };
                         tokio::select! {
-                            r = vfs.replicate_counting(f, target, &copied) => (f, size, Some(r)),
+                            r = vfs.replicate_counting(f, into, &copied) => (f, size, Some(r)),
                             _ = stop => (f, size, None),
                         }
                     }
@@ -610,14 +777,24 @@ impl Admin {
         p
     }
 
+    /// Evict from `store`; naming this host's live store means this host,
+    /// whichever of its disks holds the copy (ADR-073).
     async fn evict(&self, files: Vec<FileId>, store: StoreId) -> AdminResp {
         let mut removed = 0;
         let mut refused = Vec::new();
+        let whole_host = store == self.vfs.data().id().live_store();
         for f in files {
-            match self.vfs.evict_from(f, store).await {
-                Ok(true) => removed += 1,
-                Ok(false) => {}
-                Err(e) => refused.push((f, e.to_string())),
+            let stores: Vec<StoreId> = if whole_host {
+                self.vfs.stores_holding(f)
+            } else {
+                vec![store]
+            };
+            for st in stores {
+                match self.vfs.evict_from(f, st).await {
+                    Ok(true) => removed += 1,
+                    Ok(false) => {}
+                    Err(e) => refused.push((f, e.to_string())),
+                }
             }
         }
         AdminResp::Evicted { removed, refused }
@@ -636,6 +813,33 @@ impl Handler for AdminService {
                 AdminReq::Info => AdminResp::Info(Box::new(a.info())),
                 AdminReq::Net => AdminResp::Net(Box::new(a.net())),
                 AdminReq::PushLoads { group } => AdminResp::PushLoads(a.push_loads(group)),
+                AdminReq::Disks => {
+                    let a = a.clone();
+                    match tokio::task::spawn_blocking(move || a.disks()).await {
+                        Ok(d) => AdminResp::Disks(d),
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    }
+                }
+                AdminReq::InitDisk { store, name, path } => {
+                    let d = a.vfs.data();
+                    let identity = d.store_identity(store, &name);
+                    match nest_store::init_marker(std::path::Path::new(&path), &identity) {
+                        Ok(()) => match d.disk(store) {
+                            Some(_) => AdminResp::Started,
+                            None => AdminResp::Err(format!("{path} is not usable as a disk here")),
+                        },
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    }
+                }
+                AdminReq::MoveLocal {
+                    job,
+                    files,
+                    from,
+                    to,
+                } => {
+                    a.start_move(job, files, from, to);
+                    AdminResp::Started
+                }
                 AdminReq::StartReplicate {
                     job,
                     files,

@@ -658,6 +658,71 @@ fn stores_register() {
     );
 }
 
+#[test]
+fn disks_are_numbered_per_host_and_never_reused() {
+    let mut db = Db::new();
+    let disk = |db: &mut Db, name: &str, node: u64| {
+        db.run(Command::RegisterStore {
+            name: name.into(),
+            class: nest_meta::StoreClass::Disk,
+            node: Some(NodeId(node)),
+            config: "{}".into(),
+        })
+        .0
+    };
+    assert_eq!(
+        disk(&mut db, "raptor:nvme1", 1),
+        Ok(Reply::Store(NodeId(1).disk_store(1)))
+    );
+    assert_eq!(
+        disk(&mut db, "raptor:nvme2", 1),
+        Ok(Reply::Store(NodeId(1).disk_store(2)))
+    );
+    assert_eq!(
+        disk(&mut db, "ostrich:nvme1", 2),
+        Ok(Reply::Store(NodeId(2).disk_store(1)))
+    );
+    let d1 = NodeId(1).disk_store(1);
+    assert_eq!(d1.host(), Some(NodeId(1)));
+    assert!(d1.is_disk() && !d1.is_archive());
+    assert_eq!(StoreId(1 << 20).host(), None);
+    assert_eq!(StoreId(7).host(), Some(NodeId(7)));
+
+    // A disk holding a copy is not forgotten.
+    let f = db.file(FileId::ROOT, "w", 1, 10).id;
+    db.ok(Command::PublishReplica {
+        file: f,
+        generation: Generation(1),
+        store: d1,
+    });
+    assert!(matches!(
+        db.run(Command::DeleteStore { store: d1 }).0,
+        Err(NestError::Busy(_))
+    ));
+    db.ok(Command::RetireReplica {
+        file: f,
+        generation: Generation(1),
+        store: d1,
+        allow_last: false,
+    });
+    db.ok(Command::DeleteStore { store: d1 });
+    // Removing disk 1 never hands its number to the next disk.
+    let r = db
+        .run(Command::DeleteStore {
+            store: NodeId(1).disk_store(2),
+        })
+        .0;
+    assert_eq!(r, Ok(Reply::Done));
+    assert_eq!(
+        disk(&mut db, "raptor:nvme3", 1),
+        Ok(Reply::Store(NodeId(1).disk_store(3)))
+    );
+    assert!(matches!(
+        db.run(Command::DeleteStore { store: StoreId(1) }).0,
+        Err(NestError::Invalid(_))
+    ));
+}
+
 fn lock(
     db: &mut Db,
     f: FileId,

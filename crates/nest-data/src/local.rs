@@ -14,8 +14,9 @@ const SHARDS: usize = 8;
 
 #[derive(Debug)]
 enum ObjOp {
-    /// Remove a fenced object (invalidated replica or dead working object).
-    Delete(ObjectKey),
+    /// Remove a fenced object (invalidated replica or dead working object)
+    /// from one of this host's stores.
+    Delete(StoreId, ObjectKey),
     /// Make the owner's working object exist: convert `from` in place or
     /// start empty.
     Prepare {
@@ -25,11 +26,12 @@ enum ObjOp {
 }
 
 /// First store id used for archive stores; lower ids are node live stores.
-pub const ARCHIVE_STORE_BASE: u64 = 1 << 20;
+pub const ARCHIVE_STORE_BASE: u64 = StoreId::ARCHIVE_BASE;
 
-/// Whether `store` is an archive store (as opposed to a node's live store).
+/// Whether `store` is an archive store (as opposed to a host's live store
+/// or one of its disks).
 pub fn is_archive(store: StoreId) -> bool {
-    store.0 >= ARCHIVE_STORE_BASE
+    store.is_archive()
 }
 
 /// Configuration of an archive store (the `config` JSON of its row).
@@ -39,7 +41,15 @@ pub struct ArchiveConfig {
     pub gateways: Vec<NodeId>,
 }
 
-/// An archive store this node is a gateway for.
+/// Configuration of one of a host's extra disks (ADR-073).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DiskConfig {
+    pub path: String,
+}
+
+/// An archive store this node is a gateway for, or one of its own disks
+/// (ADR-073: the same marker rule, so an unmounted disk's empty mountpoint
+/// is never read or written).
 pub struct Archive {
     pub id: StoreId,
     pub name: String,
@@ -85,8 +95,8 @@ pub(crate) struct State {
     pub(crate) orphans_held: HashSet<FileId>,
     /// Orphans ready to be released in the next batch.
     pub(crate) release: Vec<FileId>,
-    /// Objects that must not be served: deletion is in flight.
-    pub(crate) fenced: HashSet<ObjectKey>,
+    /// Copies that must not be served, by store: deletion is in flight.
+    pub(crate) fenced: HashSet<(StoreId, ObjectKey)>,
     /// Working objects ready for writes.
     pub(crate) ready: HashSet<ObjectKey>,
 }
@@ -140,6 +150,8 @@ pub struct DataNode {
     readers: Mutex<Vec<rusqlite::Connection>>,
     /// Archive stores this node is a gateway for, opened on first use.
     archives: Mutex<HashMap<StoreId, Arc<Archive>>>,
+    /// This host's extra disks (ADR-073), opened on first use.
+    disks: Mutex<HashMap<StoreId, Arc<Archive>>>,
     weak: Weak<DataNode>,
 }
 
@@ -192,6 +204,7 @@ impl DataNode {
             lapsed_at: Mutex::new(None),
             readers: Mutex::new(Vec::new()),
             archives: Mutex::new(HashMap::new()),
+            disks: Mutex::new(HashMap::new()),
         });
         for rx in receivers {
             tokio::spawn(worker(Arc::downgrade(&d), rx, d.gate.subscribe()));
@@ -274,6 +287,99 @@ impl DataNode {
         Some(a)
     }
 
+    /// The disks metadata records for this host: (id, name, path).
+    pub fn disk_rows(&self) -> Vec<(StoreId, String, String)> {
+        self.with_reader(query::stores)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.id.is_disk() && r.node == Some(self.id))
+            .filter_map(|r| {
+                let cfg: DiskConfig = serde_json::from_str(&r.config).ok()?;
+                Some((r.id, r.name, cfg.path))
+            })
+            .collect()
+    }
+
+    /// One of this host's disks, if its marker is in place.
+    pub fn disk(&self, id: StoreId) -> Option<Arc<Archive>> {
+        if !id.is_disk() || id.host() != Some(self.id) {
+            return None;
+        }
+        if let Some(a) = self.disks.lock().get(&id).cloned() {
+            return a.healthy().then_some(a);
+        }
+        let (_, name, path) = self.disk_rows().into_iter().find(|(d, _, _)| *d == id)?;
+        let identity = self.store_identity(id, &name);
+        if !nest_store::marker_ok(std::path::Path::new(&path), &identity) {
+            return None;
+        }
+        // A local NVMe, written like the host's own store.
+        let store = ObjectStore::open(std::path::Path::new(&path))
+            .ok()?
+            .window(4);
+        let a = Arc::new(Archive {
+            id,
+            name,
+            config: ArchiveConfig {
+                path,
+                gateways: vec![self.id],
+            },
+            identity,
+            store: Arc::new(store),
+            checked: parking_lot::Mutex::new(None),
+        });
+        self.disks.lock().insert(id, a.clone());
+        Some(a)
+    }
+
+    /// This host's disks that are usable now.
+    pub fn disks(&self) -> Vec<Arc<Archive>> {
+        self.disk_rows()
+            .into_iter()
+            .filter_map(|(id, _, _)| self.disk(id))
+            .collect()
+    }
+
+    /// The object store of `store` on this host: its live store, one of
+    /// its disks, or an archive it is a gateway for (healthy ones only).
+    pub fn store_for(&self, store: StoreId) -> Option<Arc<ObjectStore>> {
+        if store == self.id.live_store() {
+            Some(self.store.clone())
+        } else if store.is_disk() {
+            self.disk(store).map(|d| d.store.clone())
+        } else {
+            self.archive(store).map(|a| a.store.clone())
+        }
+    }
+
+    /// Where this host may serve `key` from its own disks right now: its
+    /// live store, else a disk listed as holding it (ADR-073).
+    pub fn servable_local(&self, key: ObjectKey) -> Option<(StoreId, Arc<ObjectStore>)> {
+        if self.servable(key) {
+            return Some((self.id.live_store(), self.store.clone()));
+        }
+        if !self.lease_valid() || self.meta.get().is_none() {
+            return None;
+        }
+        let stores: Vec<StoreId> = self
+            .with_reader(|c| query::replicas(c, key.file))
+            .ok()?
+            .into_iter()
+            .filter(|r| {
+                r.generation == key.generation
+                    && r.state == nest_types::ReplicaState::Live
+                    && r.store.is_disk()
+                    && r.store.host() == Some(self.id)
+            })
+            .map(|r| r.store)
+            .filter(|s| !self.st.lock().fenced.contains(&(*s, key)))
+            .collect();
+        stores.into_iter().find_map(|s| {
+            let d = self.disk(s)?;
+            d.store.exists(key).then(|| (s, d.store.clone()))
+        })
+    }
+
     /// True if this node may serve `key` from archive store `store` now.
     pub fn servable_archive(&self, store: StoreId, key: ObjectKey) -> Option<Arc<Archive>> {
         if !self.lease_valid() {
@@ -309,12 +415,17 @@ impl DataNode {
     /// replica here, it is not fenced for deletion, and it exists.
     /// The in-memory part of `servable`: lease held, not fenced. For
     /// re-checking a copy already found servable (no queries, no I/O).
-    pub fn may_serve_now(&self, key: ObjectKey) -> bool {
-        self.lease_valid() && !self.st.lock().fenced.contains(&key) && self.meta.get().is_some()
+    pub fn may_serve_now(&self, store: StoreId, key: ObjectKey) -> bool {
+        self.lease_valid()
+            && !self.st.lock().fenced.contains(&(store, key))
+            && self.meta.get().is_some()
     }
 
     pub fn servable(&self, key: ObjectKey) -> bool {
-        if !self.lease_valid() || self.st.lock().fenced.contains(&key) || self.meta.get().is_none()
+        let mine = self.id.live_store();
+        if !self.lease_valid()
+            || self.st.lock().fenced.contains(&(mine, key))
+            || self.meta.get().is_none()
         {
             return false;
         }
@@ -400,7 +511,7 @@ impl DataNode {
 
     fn submit(&self, op: ObjOp) {
         let file = match &op {
-            ObjOp::Delete(k) | ObjOp::Prepare { key: k, .. } => k.file,
+            ObjOp::Delete(_, k) | ObjOp::Prepare { key: k, .. } => k.file,
         };
         let _ = self.shard(file).send(op);
     }
@@ -475,10 +586,10 @@ impl DataNode {
                 file,
                 generation,
                 store,
-            } if *store == mine => {
+            } if *store == mine || (store.is_disk() && store.host() == Some(self.id)) => {
                 let key = ObjectKey::new(*file, *generation);
-                self.st.lock().fenced.insert(key);
-                self.submit(ObjOp::Delete(key));
+                self.st.lock().fenced.insert((*store, key));
+                self.submit(ObjOp::Delete(*store, key));
             }
             Effect::WorkingObjectDeleted {
                 file,
@@ -487,10 +598,10 @@ impl DataNode {
             } if *owner == self.id => {
                 let key = ObjectKey::new(*file, *generation);
                 let mut st = self.st.lock();
-                st.fenced.insert(key);
+                st.fenced.insert((mine, key));
                 st.ready.remove(&key);
                 drop(st);
-                self.submit(ObjOp::Delete(key));
+                self.submit(ObjOp::Delete(mine, key));
             }
             Effect::OwnershipGranted {
                 file,
@@ -537,11 +648,18 @@ impl DataNode {
     /// effects may repeat work.
     fn run_op(&self, op: ObjOp) {
         match op {
-            ObjOp::Delete(key) => {
-                match self.store.delete(key) {
+            ObjOp::Delete(store, key) => {
+                let Some(st) = self.store_for(store) else {
+                    // An unmounted disk: its startup reconciliation removes
+                    // the object once it is back (nothing lists it).
+                    tracing::warn!(?key, %store, "disk not usable; deleting the copy later");
+                    self.st.lock().fenced.remove(&(store, key));
+                    return;
+                };
+                match st.delete(key) {
                     Ok(_) => {
                         self.deletions.fetch_add(1, Ordering::Relaxed);
-                        self.st.lock().fenced.remove(&key);
+                        self.st.lock().fenced.remove(&(store, key));
                     }
                     // Stays fenced; startup reconciliation retries.
                     Err(e) => {
@@ -612,12 +730,29 @@ impl DataNode {
         let meta = self.meta().clone();
         let store = self.store.clone();
         let me = self.id;
-        let report =
+        let disks: Vec<Arc<Archive>> = self.disks();
+        let m2 = meta.clone();
+        let mut report =
             tokio::task::spawn_blocking(move || reconcile_blocking(&meta, &store, me)).await??;
-        let mut st = self.st.lock();
-        for k in &report.deleted {
-            st.fenced.remove(k);
+        // Each usable disk the same way (ADR-073); copies on a disk that is
+        // not mounted stay listed and unread until it is back.
+        let mut disk_missing = Vec::new();
+        for d in disks {
+            let (m, st, id) = (m2.clone(), d.store.clone(), d.id);
+            match tokio::task::spawn_blocking(move || reconcile_disk(&m, &st, id)).await? {
+                Ok(r) => {
+                    report.kept += r.kept;
+                    report.deleted.extend(r.deleted.iter().copied());
+                    disk_missing.extend(r.missing.into_iter().map(|k| (id, k)));
+                }
+                Err(e) => tracing::error!(disk = %d.name, error = %e, "reconciling a disk failed"),
+            }
         }
+        self.retire_disk_missing(disk_missing);
+        let mut st = self.st.lock();
+        let mine = me.live_store();
+        st.fenced
+            .retain(|(s, k)| *s != mine || !report.deleted.contains(k));
         let owned = {
             let c = self.meta().open_reader()?;
             query::owned_by(&c, me)?
@@ -698,6 +833,28 @@ impl DataNode {
                 tracing::warn!(?k, error = %e, "retiring missing replica failed");
             }
         }
+    }
+
+    /// Copies metadata lists on a disk that the disk does not have.
+    fn retire_disk_missing(&self, missing: Vec<(StoreId, ObjectKey)>) {
+        if missing.is_empty() {
+            return;
+        }
+        let Some(d) = self.weak.upgrade() else { return };
+        tokio::spawn(async move {
+            for (store, k) in missing {
+                tracing::error!(?k, %store, "copy missing from its disk; retiring it");
+                let _ = d
+                    .meta()
+                    .propose(nest_meta::Command::RetireReplica {
+                        file: k.file,
+                        generation: k.generation,
+                        store,
+                        allow_last: true,
+                    })
+                    .await;
+            }
+        });
     }
 
     /// After startup: report lost replicas and settle ownerships whose
@@ -794,6 +951,34 @@ fn reconcile_blocking(
         }
     }
     report.deleted.sort();
+    report.missing.sort();
+    Ok(report)
+}
+
+/// A disk holds copies only (never working objects): keep what metadata
+/// lists, remove the rest, report what is missing.
+fn reconcile_disk(
+    meta: &MetaNode,
+    store: &ObjectStore,
+    id: StoreId,
+) -> anyhow::Result<ReconcileReport> {
+    let c = meta.open_reader()?;
+    let expected: HashSet<ObjectKey> = query::store_inventory(&c, id)?
+        .into_iter()
+        .map(|(f, g)| ObjectKey::new(f, g))
+        .collect();
+    drop(c);
+    let disk: HashSet<ObjectKey> = store.scan()?.into_iter().map(|o| o.key).collect();
+    let mut report = ReconcileReport::default();
+    for k in &disk {
+        if expected.contains(k) {
+            report.kept += 1;
+        } else {
+            store.delete(*k)?;
+            report.deleted.push(*k);
+        }
+    }
+    report.missing = expected.difference(&disk).copied().collect();
     report.missing.sort();
     Ok(report)
 }

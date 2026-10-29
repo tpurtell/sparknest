@@ -259,6 +259,11 @@ pub enum Command {
         name: String,
         value: Option<u64>,
     },
+    /// Forget a host's disk (ADR-073). Refused while any copy is recorded
+    /// in it: drain it first, or retire its copies (a lost disk).
+    DeleteStore {
+        store: StoreId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +319,9 @@ pub enum LockKind {
 pub enum StoreClass {
     Live,
     Archive,
+    /// One of a host's extra disks (ADR-073): its id is the host's
+    /// `disk_store(k)`, the next unused `k`.
+    Disk,
 }
 
 impl StoreClass {
@@ -321,6 +329,7 @@ impl StoreClass {
         match self {
             StoreClass::Live => 0,
             StoreClass::Archive => 1,
+            StoreClass::Disk => 2,
         }
     }
 }

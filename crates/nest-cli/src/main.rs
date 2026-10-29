@@ -212,6 +212,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: StoreCmd,
     },
+    /// Hosts' disks: each extra disk is a store of its own (ADR-073).
+    Disk {
+        #[command(subcommand)]
+        cmd: DiskCmd,
+    },
     /// Copy a selection into an archive store, then drop its live copies.
     Offload {
         selector: String,
@@ -747,6 +752,37 @@ enum StoreCmd {
     },
     /// Archive stores with health and capacity per gateway.
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+enum DiskCmd {
+    /// Every host's stores: its live store, then each extra disk.
+    Ls,
+    /// Add a disk to a host: PATH is a mounted directory on that host,
+    /// empty (or this disk's own). Copies for the host then spread over its
+    /// disks by free space.
+    Add {
+        host: String,
+        path: String,
+        /// Defaults to `<host>:disk<k>`.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Move every copy off a disk onto its host's other stores (on that
+    /// host; nothing crosses the network).
+    Drain {
+        name: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Forget a disk with nothing on it.
+    Rm {
+        name: String,
+        /// The disk is lost: retire the copies recorded on it first (never
+        /// a file's last copy).
+        #[arg(long)]
+        forget_copies: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1915,6 +1951,70 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 v
+            }
+        },
+        Cmd::Disk { cmd } => match cmd {
+            DiskCmd::Ls => {
+                let v = c.get("/v1/disks").await?;
+                if !cli.json {
+                    for h in v["hosts"].as_array().into_iter().flatten() {
+                        let host = h["host"].as_str().unwrap_or("");
+                        if let Some(e) = h["error"].as_str() {
+                            println!("{host}: {e}");
+                            continue;
+                        }
+                        println!("{host}");
+                        for d in h["disks"].as_array().into_iter().flatten() {
+                            let rate = d["read_bps"].as_u64().unwrap_or(0);
+                            println!(
+                                "  {:<16} {:<9} free {} of {}, {} copies ({}), {}  {}",
+                                d["name"].as_str().unwrap_or(""),
+                                match (d["primary"].as_bool(), d["healthy"].as_bool()) {
+                                    (_, Some(false)) => "UNUSABLE",
+                                    (Some(true), _) => "primary",
+                                    _ => "disk",
+                                },
+                                human(d["free_bytes"].as_u64().unwrap_or(0)),
+                                human(d["total_bytes"].as_u64().unwrap_or(0)),
+                                d["objects"],
+                                human(d["object_bytes"].as_u64().unwrap_or(0)),
+                                if rate > 0 {
+                                    format!("{}/s", human(rate))
+                                } else {
+                                    "rate unmeasured".into()
+                                },
+                                d["path"].as_str().unwrap_or(""),
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                v
+            }
+            DiskCmd::Add { host, path, name } => {
+                c.post(
+                    "/v1/disks",
+                    json!({ "host": host, "path": path, "name": name }),
+                )
+                .await?
+            }
+            DiskCmd::Drain { name, wait } => {
+                let v = c
+                    .post(&format!("/v1/disks/{}/drain", enc(name)), json!({}))
+                    .await?;
+                let id = v["job"].as_u64().unwrap_or(0);
+                if *wait { wait_job(&c, id).await? } else { v }
+            }
+            DiskCmd::Rm {
+                name,
+                forget_copies,
+            } => {
+                c.call(
+                    Method::DELETE,
+                    &format!("/v1/disks/{}?forget_copies={forget_copies}", enc(name)),
+                    None,
+                )
+                .await?
             }
         },
         Cmd::Offload {

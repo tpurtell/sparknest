@@ -1,7 +1,7 @@
 // Cluster state shared by every view, refreshed every 2 s while the page is
 // visible, plus routing and toasts.
 
-import { post, hasToken, tokenRefused, forgetToken, ApiError, net, wsUrl, setTransport, type Status, type Store, type Job, type LogLine } from "./api";
+import { post, hasToken, tokenRefused, forgetToken, ApiError, net, wsUrl, setTransport, type Status, type Store, type DiskInfo, type Job, type LogLine } from "./api";
 
 /** One run of `fn` at a time: a slow server gets one request of each kind,
  * never a growing pile. A call made meanwhile is not lost: it runs once
@@ -42,6 +42,8 @@ export const app = $state({
   authed: hasToken(),
   status: null as Status | null,
   stores: [] as Store[],
+  /** Hosts with extra disks: their stores, by host name (ADR-073). */
+  disks: {} as Record<string, DiskInfo[]>,
   jobs: [] as Job[],
   groups: [] as { name: string; members: string[] }[],
   /** Fabric bytes/s per host, from counter differences between polls. */
@@ -183,6 +185,7 @@ function connect() {
       }
       app.error = "";
       apply(m.data.status, m.data.stores, m.data.jobs, m.data.groups);
+      app.disks = m.data.disks ?? {};
     } else if (m.type === "changed") app.changed++;
     else if (m.type === "lines") onLines?.(m.lines);
   };
@@ -262,6 +265,9 @@ export function targets(): { name: string; kind: "host" | "store" }[] {
     ...app.stores.map((s) => ({ name: s.name, kind: "store" as const })),
   ];
 }
+
+/** A host's extra disks (not its primary store); empty for a one-disk host. */
+export const extraDisks = (host: string) => (app.disks[host] ?? []).filter((d) => !d.primary);
 
 // ---------------------------------------------------------------- toasts
 

@@ -150,6 +150,9 @@ pub struct Balancer {
     /// Holders' measured disk read rate (bytes/s) and this host's link
     /// rate, for capping how many holders a stripe uses.
     capacity: Mutex<(HashMap<NodeId, u64>, u64)>,
+    /// Each store's read rate (a host's live store and its disks; ADR-073),
+    /// for push sources.
+    stores: Mutex<HashMap<nest_types::StoreId, u64>>,
 }
 
 /// A read in progress from one source; recorded when finished.
@@ -218,6 +221,26 @@ impl Balancer {
     /// Holders' disk read rates as last shared (bytes/s; 0 for unknown).
     pub fn disk_rates(&self) -> HashMap<NodeId, u64> {
         self.capacity.lock().0.clone()
+    }
+
+    /// Each store's read rate (bytes/s): a host's disks as they reported
+    /// them, its live store at the host's rate otherwise.
+    pub fn set_store_rates(&self, rates: HashMap<nest_types::StoreId, u64>) {
+        *self.stores.lock() = rates;
+    }
+
+    /// Store read rates for push sources: those set, else each host's
+    /// rate for its live store.
+    pub fn store_rates(&self) -> HashMap<nest_types::StoreId, u64> {
+        let mut out: HashMap<nest_types::StoreId, u64> = self
+            .capacity
+            .lock()
+            .0
+            .iter()
+            .map(|(n, b)| (n.live_store(), *b))
+            .collect();
+        out.extend(self.stores.lock().iter().map(|(s, b)| (*s, *b)));
+        out
     }
 
     /// The prefix of `ranked` whose disks can fill the links with headroom

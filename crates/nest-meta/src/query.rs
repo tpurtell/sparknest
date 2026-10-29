@@ -170,6 +170,27 @@ pub fn has_live_replica(
     .is_some())
 }
 
+/// Whether `node` holds a live copy of `generation` in any of its stores:
+/// its live store or one of its disks (ADR-073).
+pub fn host_holds(
+    c: &Connection,
+    file: FileId,
+    generation: Generation,
+    node: NodeId,
+) -> rusqlite::Result<bool> {
+    let lo = node.disk_store(0).0 as i64;
+    Ok(c.prepare_cached(
+        "SELECT 1 FROM replicas WHERE file = ?1 AND gen = ?2 AND state = 1 \
+         AND (store = ?3 OR (store > ?4 AND store < ?4 + 256))",
+    )?
+    .query_row(
+        params![file.0 as i64, generation.0 as i64, node.0 as i64, lo],
+        |_| Ok(()),
+    )
+    .optional()?
+    .is_some())
+}
+
 /// All (file, generation) copies held in a store: the inventory a node
 /// reconciles its object directory against at startup.
 pub fn store_inventory(

@@ -637,6 +637,125 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/disks:
+    get:
+      tags: [stores]
+      summary: Every host's stores, its live store and extra disks (ADR-073)
+      operationId: disks
+      responses:
+        "200":
+          description: Per host.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hosts]
+                properties:
+                  hosts:
+                    type: array
+                    items:
+                      type: object
+                      required: [host, offgrid, disks, error]
+                      properties:
+                        host:
+                          type: string
+                        offgrid:
+                          type: boolean
+                        disks:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/DiskInfo"
+                        error:
+                          type: [string, "null"]
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [stores]
+      summary: Add a disk to a host
+      description: >-
+        Registers the disk and has the host write its marker. The path must
+        be a mounted directory, empty or already this disk's. Refused until
+        every host runs 0.7.0 or later.
+      operationId: addDisk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host, path]
+              properties:
+                host:
+                  type: string
+                path:
+                  type: string
+                  description: The disk's directory on that host.
+                name:
+                  type: string
+                  description: "Defaults to `<host>:disk<k>`."
+      responses:
+        "200":
+          description: The new disk.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [store, name]
+                properties:
+                  store:
+                    type: integer
+                  name:
+                    type: string
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/disks/{name}:
+    delete:
+      tags: [stores]
+      summary: Forget a disk with nothing on it
+      operationId: removeDisk
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: forget_copies
+          in: query
+          required: false
+          description: "A lost disk: retire the copies recorded on it first (never a file's last copy)."
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed, forgot]
+                properties:
+                  removed:
+                    type: string
+                  forgot:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/disks/{name}/drain:
+    post:
+      tags: [stores]
+      summary: Move every copy off a disk onto its host's other stores
+      operationId: drainDisk
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Job"
+        default:
+          $ref: "#/components/responses/Error"
   /v1/stores:
     get:
       tags: [stores]
@@ -2728,6 +2847,34 @@ components:
               - $ref: "#/components/schemas/StoreHealth"
             minItems: 2
             maxItems: 2
+
+    DiskInfo:
+      type: object
+      required: [store, name, path, healthy, total_bytes, free_bytes, objects, object_bytes, read_bps, primary]
+      properties:
+        store:
+          type: integer
+        name:
+          type: string
+        path:
+          type: string
+        healthy:
+          type: boolean
+          description: Its marker is present (an unmounted disk is never read or written).
+        total_bytes:
+          type: integer
+        free_bytes:
+          type: integer
+        objects:
+          type: integer
+        object_bytes:
+          type: integer
+        read_bps:
+          type: integer
+          description: Measured read rate, bytes/s; 0 until measured.
+        primary:
+          type: boolean
+          description: The host's live store, where metadata and writes live.
 
     StoreHealth:
       type: object

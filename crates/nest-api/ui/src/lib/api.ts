@@ -170,6 +170,19 @@ export interface Store {
   path: string;
   gateways: [string, StoreHealth][];
 }
+/** One of a host's stores: its live store (primary) or an extra disk (ADR-073). */
+export interface DiskInfo {
+  store: number;
+  name: string;
+  path: string;
+  healthy: boolean;
+  total_bytes: number;
+  free_bytes: number;
+  objects: number;
+  object_bytes: number;
+  read_bps: number;
+  primary: boolean;
+}
 export interface JobProgress {
   total_files: number;
   done_files: number;

@@ -74,6 +74,10 @@ pub struct Copy {
     pub group: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// Which of the host's stores: one of its disks (ADR-073); `None` for
+    /// its live store, or for an added copy the host places itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<StoreId>,
 }
 
 impl Copy {
@@ -97,6 +101,7 @@ impl Copy {
             skip: false,
             group: String::new(),
             name: String::new(),
+            store: None,
         }
     }
 }
@@ -358,14 +363,45 @@ impl World {
             .iter()
             .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.free_bytes)))
             .collect();
-        let total = status
+        let total: HashMap<NodeId, u64> = status
             .iter()
             .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.total_bytes)))
             .collect();
-        let disk = status
+        let mut disk: HashMap<NodeId, u64> = status
             .iter()
             .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.disk_read_bps)))
             .collect();
+        // A host with several disks (ADR-073) reads at their rates together,
+        // as far as its link carries it (its info already sums their space).
+        let link: HashMap<NodeId, u64> = status
+            .iter()
+            .filter_map(|s| s.info.as_ref().map(|i| (s.node, i.link_bps)))
+            .collect();
+        for (h, r) in placer.disks().await.unwrap_or_default() {
+            let Ok(ds) = r else { continue };
+            if ds.len() < 2 {
+                continue;
+            }
+            let usable: Vec<_> = ds.iter().filter(|d| d.healthy).collect();
+            let known: Vec<u64> = usable
+                .iter()
+                .map(|d| d.read_bps)
+                .filter(|b| *b > 0)
+                .collect();
+            if !known.is_empty() {
+                let each = known.iter().sum::<u64>() / known.len() as u64;
+                let sum: u64 = usable
+                    .iter()
+                    .map(|d| if d.read_bps > 0 { d.read_bps } else { each })
+                    .sum();
+                let cap = link
+                    .get(&h.node)
+                    .copied()
+                    .filter(|l| *l > 0)
+                    .unwrap_or(u64::MAX);
+                disk.insert(h.node, sum.min(cap));
+            }
+        }
         let required_by = requirements(placer).await?;
         let (copies_on, count, created_ms) = collect_copies(placer)?;
         let usage = if usage_days > 0 {
@@ -1669,18 +1705,18 @@ fn collect_copies(placer: &Placer) -> NestResult<CopyMaps> {
         let (file, generation) = (FileId(f), Generation(g));
         *count.entry((file, generation)).or_default() += 1;
         created.insert(file, (mtime_ns.max(0) as u64) / 1_000_000);
-        if !nest_data::is_archive(StoreId(store)) {
+        // A host's copy, on whichever of its stores (ADR-073); the store is
+        // kept so a removal retires that one.
+        if let Some(host) = StoreId(store).host() {
             let path = query::path_of(&c, file)
                 .map_err(sql)?
                 .map(|p| String::from_utf8_lossy(&p).into_owned())
                 .unwrap_or_else(|| format!("<file {f}>"));
-            copies_on.entry(NodeId(store)).or_default().push(Copy::new(
-                file,
-                generation,
-                size,
-                path,
-                String::new(),
-            ));
+            let mut cp = Copy::new(file, generation, size, path, String::new());
+            if StoreId(store).is_disk() {
+                cp.store = Some(StoreId(store));
+            }
+            copies_on.entry(host).or_default().push(cp);
         }
     }
     Ok((copies_on, count, created))

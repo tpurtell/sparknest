@@ -690,11 +690,12 @@ async fn fill_small_files(vfs: &Arc<Vfs>, base: &str) {
         Ok(Ok(m)) => m,
         _ => return,
     };
-    let me = vfs.data().id().live_store();
+    let me = vfs.data().id();
     for e in m.entries.iter().filter(|e| e.stable && e.size <= SMALL) {
+        // On any of this host's disks counts (ADR-073).
         let have = vfs
             .data()
-            .with_reader(|c| nest_meta::query::has_live_replica(c, e.file, e.generation, me))
+            .with_reader(|c| nest_meta::query::host_holds(c, e.file, e.generation, me))
             .unwrap_or(true);
         if !have && let Err(err) = vfs.replicate_here(e.file).await {
             tracing::debug!(path = %e.path, error = %err, "could not copy a small file here");

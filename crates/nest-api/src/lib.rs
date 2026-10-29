@@ -12,7 +12,7 @@ mod transfer;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use nest_data::Vfs;
 use nest_meta::{SealPolicy, query};
@@ -172,6 +172,9 @@ pub fn router(api: Api) -> Router {
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/import", post(import))
         .route("/v1/stores", get(stores).post(add_store))
+        .route("/v1/disks", get(disks).post(add_disk))
+        .route("/v1/disks/{name}", delete(remove_disk))
+        .route("/v1/disks/{name}/drain", post(drain_disk))
         .route("/v1/offload", post(offload))
         .route("/v1/plans", post(make_plan))
         .route("/v1/plans/{id}", get(get_plan))
@@ -380,7 +383,9 @@ async fn ls(State(api): State<Api>, Query(q): Query<PathQ>) -> R<serde_json::Val
             .map_err(|e| bad(e.to_string()))?
             .into_iter()
             .filter(|r| r.generation == a.generation)
-            .map(|r| host(r.store.0))
+            .map(|r| host(r.store.host().map_or(r.store.0, |h| h.0)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         Ok(LsEntry {
             name,
@@ -1366,6 +1371,59 @@ async fn add_store(State(api): State<Api>, Json(r): Json<AddStoreReq>) -> R<serd
         .map(|(g, r)| json!({ "gateway": g, "ok": r.is_ok(), "error": r.err() }))
         .collect();
     Ok(Json(json!({ "name": r.name, "gateways": gateways })))
+}
+
+/// Every host's stores: its live store and extra disks (ADR-073).
+async fn disks(State(api): State<Api>) -> R<serde_json::Value> {
+    let hosts: Vec<serde_json::Value> = api
+        .placer
+        .disks()
+        .await?
+        .into_iter()
+        .map(|(h, r)| match r {
+            Ok(d) => json!({ "host": h.name, "offgrid": h.offgrid, "disks": d, "error": null }),
+            Err(e) => json!({ "host": h.name, "offgrid": h.offgrid, "disks": [], "error": e }),
+        })
+        .collect();
+    Ok(Json(json!({ "hosts": hosts })))
+}
+
+#[derive(Deserialize)]
+struct AddDiskReq {
+    host: String,
+    path: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn add_disk(State(api): State<Api>, Json(r): Json<AddDiskReq>) -> R<serde_json::Value> {
+    require_every_host_upgraded(&api, "adding a disk").await?;
+    let id = api
+        .placer
+        .add_disk(&r.host, &r.path, r.name.as_deref())
+        .await?;
+    let (_, name, _) = api.placer.find_disk(&id.0.to_string())?;
+    Ok(Json(json!({ "store": id.0, "name": name })))
+}
+
+async fn drain_disk(State(api): State<Api>, Path(name): Path<String>) -> R<serde_json::Value> {
+    Ok(Json(json!({ "job": api.placer.drain_disk(&name).await? })))
+}
+
+#[derive(Deserialize)]
+struct RemoveDiskQ {
+    #[serde(default)]
+    forget_copies: bool,
+}
+
+async fn remove_disk(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Query(q): Query<RemoveDiskQ>,
+) -> R<serde_json::Value> {
+    require_every_host_upgraded(&api, "removing a disk").await?;
+    let forgot = api.placer.remove_disk(&name, q.forget_copies).await?;
+    Ok(Json(json!({ "removed": name, "forgot": forgot })))
 }
 
 #[derive(Deserialize)]

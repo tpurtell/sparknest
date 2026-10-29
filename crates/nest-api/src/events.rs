@@ -58,6 +58,7 @@ impl Default for Events {
 async fn snapshot(api: &Api) -> Option<String> {
     let status = crate::status_json_live(api).await.ok()?;
     let stores = api.placer.stores_listing().await.unwrap_or_default();
+    let disks = api.placer.disks_listing().await;
     let groups: Vec<_> = api
         .placer
         .groups()
@@ -70,6 +71,7 @@ async fn snapshot(api: &Api) -> Option<String> {
             "status": status,
             "jobs": api.placer.all_jobs().await,
             "stores": stores,
+            "disks": disks,
             "groups": groups,
             "ui": crate::ui_id(),
         })

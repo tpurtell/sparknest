@@ -2490,3 +2490,61 @@ every blob again (about 1.5 TB for that model alone).
    again every run until it is repaired; one that cannot be read is not
    recorded. The report gives `hashed` and `already_verified`.
 3. Hashing drops the object's pages afterwards, as copies do.
+
+## ADR-073 — Several disks per host: each extra disk is a store of its own (2026-10-29)
+
+**Context.** raptor is getting two more 8 TB PCIe 5 NVMe drives beside its
+3.7 TB system disk (90% full). Everything assumed one store per host, with
+the store id equal to the node id: a copy's id named its host. A RAID0
+stripe would hide the disks from sparknest but needs matching drives,
+cannot take in the system disk, and loses every copy on it with either
+drive. Push loads (ADR-063) already run one stream per store, and
+placement by speed (ADR-066) already weighs sources by disk rate.
+
+**Decision.**
+1. **A disk is a store.** `nest disk add HOST PATH` registers a store of
+   the new class `Disk` (`StoreClass` appended, ADR-018), with id
+   `2^40 + (node << 8) + k`, `k` from a per-host counter that never reuses
+   a number. Any host reads a copy's host from its id
+   (`StoreId::host()`), with no lookup. The disk carries the same marker
+   as an archive: an unmounted disk's empty mountpoint is never read or
+   written. `DeleteStore` (appended) forgets a disk with nothing on it.
+2. **A host holds a file once.** Copy counts, `@all` replication,
+   readiness, plans and the UI count hosts; a disk is only where a host
+   keeps its copy. A copy for a host goes on whichever of its stores has
+   the most room after the copies already headed there
+   (`Vfs::pick_store`), at most 8 transfers into each at once, so a job
+   fills the disks side by side. A host with a copy on one disk is not
+   given a second on another.
+3. **Writes stay on the live store.** Working objects, ownership, the
+   metadata database and the Raft log are on the host's live store as
+   before; the data reserve (ADR-024) applies there only. Writing a file
+   whose only local copy is on a disk first copies it into the live store
+   on the host, then retires the disk's copy.
+4. **Reads.** A host serves and reads its disk copies as it does its live
+   store's: they rank as local, before any other host, and before an
+   archive. Fences are per store, so a copy moving between a host's disks
+   is never unservable.
+5. **Push.** Each disk is a stream of its own, given files by its own
+   measured rate (each disk is probed as the live store is). The planner
+   sizes a host's share by its disks' rates together, capped at its link.
+6. **Startup.** Each usable disk is reconciled against metadata: objects
+   nothing lists are removed, listed copies missing from it are retired.
+   A disk that is not mounted keeps its records and serves nothing until
+   it is back.
+7. **Drain and loss.** `nest disk drain NAME` moves a disk's copies to its
+   host's other stores, on the host. `nest disk rm NAME` forgets an empty
+   disk; `--forget-copies` first retires the copies of a lost one (never
+   a file's last copy). `nest cluster remove --forget-copies` covers every
+   store of the host.
+8. **Seen as one host.** The host's info sums its stores' space and
+   copies (as `statfs` does); `GET /v1/disks` lists each store and the UI
+   shows them on the host's card and in the Place dialog. The API refuses
+   `nest disk add` until every host runs 0.7.0, which decodes the new
+   class and command.
+
+**Alternatives.** RAID0 or LVM striping (above). Several live stores with
+ids from a lookup table: every hot path that maps a copy to its host
+would query it. Letting a host hold a file on two of its disks: twice the
+space for no protection against losing the host, and every copy count
+would need to tell hosts from disks.

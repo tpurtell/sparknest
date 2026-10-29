@@ -456,14 +456,15 @@ struct Resolved {
 /// the median, and with no rates at all every holder counts the same, which
 /// balances bytes). A host's rate is its own store's; an archive has none.
 /// This host's own copies win ties (ADR-066).
-fn assign(files: &[Resolved], me: NodeId, rates: &HashMap<NodeId, u64>) -> Vec<Src> {
+fn assign(files: &[Resolved], me: NodeId, rates: &HashMap<StoreId, u64>) -> Vec<Src> {
     let mut known: Vec<u64> = rates.values().copied().filter(|b| *b > 0).collect();
     known.sort_unstable();
     let median = known.get(known.len() / 2).copied().unwrap_or(1);
+    // Each of a host's disks streams at its own rate (ADR-073).
     let rate = |s: &Src| {
-        Some(s.host)
-            .filter(|h| h.live_store() == s.store)
-            .and_then(|h| rates.get(&h).copied())
+        rates
+            .get(&s.store)
+            .copied()
             .filter(|b| *b > 0)
             .unwrap_or(median) as f64
     };
@@ -907,7 +908,7 @@ impl Push {
             .map_err(|e| invalid(format!("plan: {e}")))?;
         let rates = self
             .vfs()
-            .map(|v| v.balancer().disk_rates())
+            .map(|v| v.balancer().store_rates())
             .unwrap_or_default();
         let holder = assign(&resolved, me, &rates);
 
@@ -1068,6 +1069,21 @@ impl Push {
     fn src_name(&self, s: Src) -> String {
         if s.store == s.host.live_store() {
             return self.name_of(s.host);
+        }
+        if s.store.is_disk() {
+            let k = s.store.0 & 0xff;
+            return self
+                .vfs()
+                .ok()
+                .and_then(|v| {
+                    v.data()
+                        .with_reader(nest_meta::query::stores)
+                        .ok()?
+                        .into_iter()
+                        .find(|r| r.id == s.store)
+                        .map(|r| r.name)
+                })
+                .unwrap_or_else(|| format!("{}:disk{k}", self.name_of(s.host)));
         }
         self.vfs()
             .ok()
@@ -2629,9 +2645,9 @@ mod tests {
     fn faster_disks_carry_more_and_finish_together() {
         // Two disks twice as fast as the other four (rhea and moa against
         // the 5.6 GB/s Sparks).
-        let rates: HashMap<NodeId, u64> = [(1, 6), (2, 6), (3, 6), (4, 6), (5, 12), (6, 12)]
+        let rates: HashMap<StoreId, u64> = [(1, 6), (2, 6), (3, 6), (4, 6), (5, 12), (6, 12)]
             .into_iter()
-            .map(|(n, r)| (NodeId(n), r))
+            .map(|(n, r)| (StoreId(n), r))
             .collect();
         let f = files(80, 1, &[1, 2, 3, 4, 5, 6]);
         let b = bytes(&f, &assign(&f, NodeId(1), &rates));
@@ -2644,7 +2660,7 @@ mod tests {
 
     #[test]
     fn unknown_rates_count_at_the_median_and_own_copy_wins_ties() {
-        let rates = HashMap::from([(NodeId(2), 10), (NodeId(3), 0)]);
+        let rates = HashMap::from([(StoreId(2), 10), (StoreId(3), 0)]);
         let f = files(1, 5, &[2, 1, 3]);
         assert_eq!(assign(&f, NodeId(1), &rates), vec![Src::host(NodeId(1))]);
     }
@@ -2682,8 +2698,35 @@ mod tests {
         for r in &mut f[2..] {
             r.holders = vec![archive];
         }
-        let to = assign(&f, NodeId(1), &HashMap::from([(NodeId(1), 10)]));
+        let to = assign(&f, NodeId(1), &HashMap::from([(StoreId(1), 10)]));
         assert_eq!(to[..2], [Src::host(NodeId(1)); 2]);
         assert_eq!(to[2..], [archive; 2]);
+    }
+
+    #[test]
+    fn a_hosts_disks_are_streams_of_their_own_at_their_own_rates() {
+        // Host 1 has its live store and two disks, each twice a Spark's
+        // speed; hosts 2 and 3 one disk each. Every file is everywhere.
+        let d = |k| Src {
+            store: NodeId(1).disk_store(k),
+            host: NodeId(1),
+        };
+        let mut f = files(70, 1, &[1, 2, 3]);
+        for r in &mut f {
+            r.holders.extend([d(1), d(2)]);
+        }
+        let rates = HashMap::from([
+            (StoreId(1), 10),
+            (NodeId(1).disk_store(1), 20),
+            (NodeId(1).disk_store(2), 20),
+            (StoreId(2), 10),
+            (StoreId(3), 10),
+        ]);
+        let b = bytes(&f, &assign(&f, NodeId(2), &rates));
+        assert_eq!(b[&1], 10, "{b:?}");
+        assert_eq!(b[&NodeId(1).disk_store(1).0], 20, "{b:?}");
+        assert_eq!(b[&NodeId(1).disk_store(2).0], 20, "{b:?}");
+        assert_eq!(b[&2], 10, "{b:?}");
+        assert_eq!(b[&3], 10, "{b:?}");
     }
 }

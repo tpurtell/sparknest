@@ -337,6 +337,10 @@ pub struct Vfs {
     /// gains nothing from more; dozens of queued offloads once pinned
     /// hundreds of threads on a 150 MB/s disk).
     archive_slots: Mutex<HashMap<nest_types::StoreId, Arc<tokio::sync::Semaphore>>>,
+    /// Transfers into each of this host's stores (`DISK_TRANSFERS`).
+    disk_slots: Mutex<HashMap<nest_types::StoreId, Arc<tokio::sync::Semaphore>>>,
+    /// Bytes of copies recently sent to each store (`pick_store`).
+    store_pending: Mutex<HashMap<nest_types::StoreId, u64>>,
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
     fabric: Mutex<Option<Arc<nest_fabric::Fabric>>>,
@@ -465,6 +469,8 @@ impl Vfs {
             inflight: Mutex::new(HashMap::new()),
             serve_files: Mutex::new(HashMap::new()),
             archive_slots: Mutex::new(HashMap::new()),
+            disk_slots: Mutex::new(HashMap::new()),
+            store_pending: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
             fence_hooks: Mutex::new(Vec::new()),
             fabric: Mutex::new(None),
@@ -514,6 +520,19 @@ impl Vfs {
         self.disk_bps.load(Ordering::Relaxed)
     }
 
+    /// Each of this host's extra disks with its measured read rate
+    /// (bytes/s, 0 until measured; ADR-073), kept beside its objects.
+    pub fn disk_store_rates(&self) -> Vec<(nest_types::StoreId, u64)> {
+        self.d
+            .disks()
+            .iter()
+            .map(|d| {
+                let b = crate::diskprobe::load(d.store.root()).map_or(0, |b| b.bytes_per_s);
+                (d.id, b)
+            })
+            .collect()
+    }
+
     /// Set the measured disk read rate (tests: in-process nodes share one
     /// disk, so their measured rates are alike).
     pub fn set_disk_read_bps(&self, bps: u64) {
@@ -552,12 +571,13 @@ impl Vfs {
             .filter(|r| {
                 r.generation == a.generation
                     && r.state == nest_types::ReplicaState::Live
-                    && !crate::is_archive(r.store)
-                    && NodeId(r.store.0) != me
+                    && r.store.host().is_some_and(|h| h != me)
             })
-            .map(|r| NodeId(r.store.0))
+            .filter_map(|r| r.store.host())
             // Off-grid hosts are not on the fabric: never part of a spread.
             .filter(|n| !offgrid.contains(n))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .map(Source::Peer)
             .collect();
         (!sources.is_empty()).then_some(Route { sources })
@@ -809,10 +829,12 @@ impl Vfs {
                 file,
                 generation,
                 store,
-            } if *store == self.me().live_store() => {
-                self.serve_files
-                    .lock()
-                    .remove(&ObjectKey::new(*file, *generation));
+            } if store.host() == Some(self.me()) => {
+                let key = ObjectKey::new(*file, *generation);
+                let mut m = self.serve_files.lock();
+                if m.get(&key).is_some_and(|e| e.store == *store) {
+                    m.remove(&key);
+                }
             }
             Effect::OwnershipGranted {
                 file,
@@ -1438,6 +1460,11 @@ impl Vfs {
         if discard || a.size == 0 || self.d.servable(ObjectKey::new(a.id, a.generation)) {
             return Ok(me);
         }
+        // Held only on one of this host's disks: that copy becomes the
+        // working object once it is in the live store (ADR-073).
+        if self.holds_live(a) && self.pull_to_live(a).await.is_ok() {
+            return Ok(me);
+        }
         for h in self.holders(a)? {
             if self.call(h, &DataReq::Ping).await.is_ok() {
                 return Ok(h);
@@ -1508,8 +1535,13 @@ impl Vfs {
                 }
                 continue;
             }
-            let host = NodeId(r.store.0);
-            if host == me && !self.holds_live(a) {
+            let Some(host) = r.store.host() else { continue };
+            if host == me
+                && self
+                    .d
+                    .servable_local(ObjectKey::new(a.id, a.generation))
+                    .is_none_or(|(s, _)| s != r.store)
+            {
                 continue;
             }
             out.push((r.store, host, if offgrid.contains(&host) { 2 } else { 0 }));
@@ -1525,8 +1557,30 @@ impl Vfs {
         file: FileId,
         generation: Generation,
     ) -> NestResult<PushObject> {
-        if !crate::is_archive(store) {
+        if store == self.me().live_store() {
             return self.push_open(file, generation);
+        }
+        if store.is_disk() {
+            let a = self.raw_attr(file)?;
+            if a.generation != generation {
+                return Err(NestError::Stale);
+            }
+            let key = ObjectKey::new(file, generation);
+            let st = match self.d.servable_local(key) {
+                Some((s, st)) if s == store => st,
+                _ => {
+                    return Err(NestError::Unavailable(
+                        "that disk does not serve this copy here".into(),
+                    ));
+                }
+            };
+            let buffered = Arc::new(st.open_read(key).map_err(io)?);
+            let direct = st.open_read_direct(key).ok();
+            return Ok(PushObject {
+                buffered,
+                direct,
+                size: a.size,
+            });
         }
         let a = self.raw_attr(file)?;
         if a.generation != generation {
@@ -1547,7 +1601,9 @@ impl Vfs {
 
     /// Whether this host's own store holds a live copy of `a`'s generation.
     pub fn holds_live(&self, a: &FileAttr) -> bool {
-        self.d.servable(ObjectKey::new(a.id, a.generation))
+        self.d
+            .servable_local(ObjectKey::new(a.id, a.generation))
+            .is_some()
     }
 
     /// Where `file`'s current generation can be read from: every live copy,
@@ -1562,11 +1618,12 @@ impl Vfs {
             .filter(|r| r.generation == a.generation && r.state == nest_types::ReplicaState::Live)
             .filter_map(|r| {
                 let s = stores.iter().find(|s| s.id == r.store)?;
-                let kind = if crate::is_archive(r.store) {
+                let host = r.store.host();
+                let kind = if host.is_none() {
                     CopyKind::Archive
-                } else if s.node == Some(self.me()) {
+                } else if host == Some(self.me()) {
                     CopyKind::Local
-                } else if s.node.is_some_and(|n| offgrid.contains(&n)) {
+                } else if host.is_some_and(|n| offgrid.contains(&n)) {
                     CopyKind::Offgrid
                 } else {
                     CopyKind::Fabric
@@ -1591,7 +1648,7 @@ impl Vfs {
         let name = |n: NodeId| {
             stores
                 .iter()
-                .find(|s| s.node == Some(n) && !crate::is_archive(s.id))
+                .find(|s| s.id == n.live_store())
                 .map_or_else(|| format!("node{}", n.0), |s| s.name.clone())
         };
         let hosts: Vec<_> = m
@@ -1633,10 +1690,12 @@ impl Vfs {
             .collect();
         let mut nodes: Vec<NodeId> = replicas
             .iter()
-            .filter(|r| !crate::is_archive(r.store))
-            .map(|r| NodeId(r.store.0))
+            .filter_map(|r| r.store.host())
             .filter(|n| *n != self.me())
             .collect();
+        // A host with copies on two of its disks is one holder.
+        nodes.sort();
+        nodes.dedup();
         if !nodes.is_empty() {
             let k = (a.id.0 as usize) % nodes.len();
             nodes.rotate_left(k);
@@ -1965,8 +2024,9 @@ impl Vfs {
         match (a.gen_state, a.owner) {
             (GenState::Owned, Some(o)) if o == self.me() => Some(self.d.store().clone()),
             (GenState::Stable, _) => {
-                if self.d.servable(key) {
-                    return Some(self.d.store().clone());
+                // The live store, or one of this host's disks (ADR-073).
+                if let Some((_, st)) = self.d.servable_local(key) {
+                    return Some(st);
                 }
                 let replicas = self.q(|c| query::replicas(c, a.id)).ok()?;
                 replicas
@@ -1985,11 +2045,18 @@ impl Vfs {
     /// NAS share); the archive stays the fallback when those holders fail.
     fn own_read_source(&self, a: &FileAttr) -> Option<Arc<nest_store::ObjectStore>> {
         let src = self.local_source(a)?;
-        if Arc::ptr_eq(&src, self.d.store()) || !self.live_elsewhere(a) {
+        if self.is_own_disk(&src) || !self.live_elsewhere(a) {
             Some(src)
         } else {
             None
         }
+    }
+
+    /// Whether `src` is this host's live store or one of its disks (not an
+    /// archive it is a gateway for).
+    fn is_own_disk(&self, src: &Arc<nest_store::ObjectStore>) -> bool {
+        Arc::ptr_eq(src, self.d.store())
+            || self.d.disks().iter().any(|d| Arc::ptr_eq(src, &d.store))
     }
 
     /// Whether another node holds a live (non-archive) copy of `a`'s generation.
@@ -2000,8 +2067,7 @@ impl Vfs {
                 rs.iter().any(|r| {
                     r.generation == a.generation
                         && r.state == nest_types::ReplicaState::Live
-                        && !crate::is_archive(r.store)
-                        && NodeId(r.store.0) != me
+                        && r.store.host().is_some_and(|h| h != me)
                 })
             })
             .unwrap_or(false)
@@ -2017,7 +2083,9 @@ impl Vfs {
         }
         let a = self.raw_attr(file)?;
         let f = Arc::new(self.servable_object(file, generation)?);
-        if a.gen_state == GenState::Stable && self.d.servable(key) {
+        if a.gen_state == GenState::Stable
+            && let Some((store, _)) = self.d.servable_local(key)
+        {
             let mut m = self.serve_files.lock();
             m.retain(|_, e| e.live());
             if m.len() >= SERVE_FILES_MAX {
@@ -2028,6 +2096,7 @@ impl Vfs {
                 key,
                 ServeEntry {
                     file: f.clone(),
+                    store,
                     opened: now,
                     used: now,
                 },
@@ -2052,14 +2121,14 @@ impl Vfs {
     }
 
     fn cached_serve_file(&self, key: ObjectKey) -> Option<Arc<std::fs::File>> {
-        let f = match self.serve_files.lock().get_mut(&key) {
+        let (f, store) = match self.serve_files.lock().get_mut(&key) {
             Some(e) if e.live() => {
                 e.used = std::time::Instant::now();
-                e.file.clone()
+                (e.file.clone(), e.store)
             }
             _ => return None,
         };
-        self.d.may_serve_now(key).then_some(f)
+        self.d.may_serve_now(store, key).then_some(f)
     }
 
     fn servable_object(&self, file: FileId, generation: Generation) -> NestResult<std::fs::File> {
@@ -2146,8 +2215,8 @@ impl Vfs {
                     Passthrough::Never => false,
                 };
             if allowed
-                && self.d.servable(key)
-                && let Ok(f) = self.d.store().open_read(key)
+                && let Some((_, st)) = self.d.servable_local(key)
+                && let Ok(f) = st.open_read(key)
             {
                 return OpenMode::Passthrough(f);
             }
@@ -2951,16 +3020,12 @@ impl Vfs {
         target: nest_types::StoreId,
         copied: &Arc<AtomicU64>,
     ) -> NestResult<u64> {
-        let dest: Arc<nest_store::ObjectStore> = if target == self.me().live_store() {
-            self.d.store().clone()
-        } else {
-            match self.d.archive(target) {
-                Some(a) => a.store.clone(),
-                None => {
-                    return Err(NestError::Unavailable(format!(
-                        "store {target} is not reachable through this node (not a gateway, or its marker is missing)"
-                    )));
-                }
+        let dest: Arc<nest_store::ObjectStore> = match self.d.store_for(target) {
+            Some(st) => st,
+            None => {
+                return Err(NestError::Unavailable(format!(
+                    "store {target} is not reachable through this node (not its disk or a gateway, or its marker is missing)"
+                )));
             }
         };
         let a = self.raw_attr(file)?;
@@ -2977,6 +3042,23 @@ impl Vfs {
         if self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
             return Ok(0);
         }
+        // Into the host's own stores, one at a time per disk: transfers
+        // fill the disks side by side rather than each in turn (ADR-073).
+        let _disk_slot = if target.host() == Some(self.me()) {
+            let sem = self
+                .disk_slots
+                .lock()
+                .entry(target)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(DISK_TRANSFERS)))
+                .clone();
+            Some(
+                sem.acquire_owned()
+                    .await
+                    .map_err(|_| NestError::Unavailable("shutting down".into()))?,
+            )
+        } else {
+            None
+        };
         let _slot = if crate::is_archive(target) {
             let sem = self
                 .archive_slots
@@ -3409,9 +3491,13 @@ impl Vfs {
     pub async fn evict_from(&self, file: FileId, store: nest_types::StoreId) -> NestResult<bool> {
         let a = self.raw_attr(file)?;
         // Never hold open an object about to be removed here.
-        self.serve_files
-            .lock()
-            .remove(&ObjectKey::new(file, a.generation));
+        {
+            let key = ObjectKey::new(file, a.generation);
+            let mut m = self.serve_files.lock();
+            if m.get(&key).is_some_and(|e| e.store == store) {
+                m.remove(&key);
+            }
+        }
         let me_store = store;
         if !self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
             return Ok(false);
@@ -3426,10 +3512,118 @@ impl Vfs {
         Ok(true)
     }
 
+    /// Which of this host's stores a new copy of `size` bytes goes into:
+    /// the one with the most free space after what copies already headed
+    /// there will take (its live store when it has no disks; ADR-073). The
+    /// live store keeps its data reserve for metadata.
+    pub fn pick_store(&self, size: u64) -> nest_types::StoreId {
+        let live = self.me().live_store();
+        let disks = self.d.disks();
+        if disks.is_empty() {
+            return live;
+        }
+        let mut pending = self.store_pending.lock();
+        let mut best = (live, i128::MIN);
+        let live_room =
+            self.d
+                .store()
+                .capacity()
+                .map_or(0, |c| c.free.saturating_sub(self.d.store().reserve())) as i128;
+        for (id, room) in std::iter::once((live, live_room)).chain(
+            disks
+                .iter()
+                .map(|d| (d.id, d.store.capacity().map_or(0, |c| c.free) as i128)),
+        ) {
+            let left = room - pending.get(&id).copied().unwrap_or(0) as i128;
+            if left > best.1 {
+                best = (id, left);
+            }
+        }
+        *pending.entry(best.0).or_default() += size;
+        // Forget the estimate once the statvfs it adjusts has caught up.
+        let w = self.weak.clone();
+        let (id, n) = (best.0, size);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            if let Some(v) = w.upgrade() {
+                let mut p = v.store_pending.lock();
+                if let Some(x) = p.get_mut(&id) {
+                    *x = x.saturating_sub(n);
+                }
+            }
+        });
+        best.0
+    }
+
+    /// This host's stores holding a live copy of `file`'s current
+    /// generation (its live store and disks).
+    pub fn stores_holding(&self, file: FileId) -> Vec<nest_types::StoreId> {
+        let Ok(a) = self.raw_attr(file) else {
+            return Vec::new();
+        };
+        let me = self.me();
+        self.q(|c| query::replicas(c, file))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                r.generation == a.generation
+                    && r.state == nest_types::ReplicaState::Live
+                    && r.store.host() == Some(me)
+            })
+            .map(|r| r.store)
+            .collect()
+    }
+
+    /// Make this host's live store hold `a`'s generation when only one of
+    /// its disks does, so the copy can become a working object (writes and
+    /// ownership use the live store; ADR-073). The disk's copy then goes.
+    async fn pull_to_live(&self, a: &FileAttr) -> NestResult<()> {
+        let key = ObjectKey::new(a.id, a.generation);
+        let Some((from, _)) = self.d.servable_local(key) else {
+            return Err(NestError::Unavailable("no copy here".into()));
+        };
+        let live = self.me().live_store();
+        if from == live {
+            return Ok(());
+        }
+        self.replicate_into(a.id, live).await?;
+        let _ = self.evict_generation(a.id, a.generation, from).await;
+        Ok(())
+    }
+
+    /// Move this host's copy of `file` from one of its stores to another
+    /// (its live store or a disk): copied on this host, never over the
+    /// network, then removed from `from` (ADR-073).
+    pub async fn move_between(
+        &self,
+        file: FileId,
+        from: nest_types::StoreId,
+        to: nest_types::StoreId,
+    ) -> NestResult<u64> {
+        if from.host() != Some(self.me()) || to.host() != Some(self.me()) {
+            return Err(NestError::Invalid("both stores must be this host's".into()));
+        }
+        let a = self.raw_attr(file)?;
+        if !self.q(|c| query::has_live_replica(c, file, a.generation, from))? {
+            return Ok(0);
+        }
+        let n = self.replicate_into(file, to).await?;
+        self.evict_generation(file, a.generation, from).await?;
+        Ok(n)
+    }
+
     // ------------------------------------------------------------ misc
 
+    /// The mount's size and free space: the live store's disk and every
+    /// usable extra disk together (ADR-073).
     pub fn statfs(&self) -> NestResult<(nest_store::Capacity, u64)> {
-        let cap = self.d.store().capacity().map_err(io)?;
+        let mut cap = self.d.store().capacity().map_err(io)?;
+        for d in self.d.disks() {
+            if let Ok(c) = d.store.capacity() {
+                cap.total += c.total;
+                cap.free += c.free;
+            }
+        }
         let t = self.q(query::totals)?;
         Ok((cap, t.files + t.dirs))
     }
@@ -3437,6 +3631,11 @@ impl Vfs {
 
 /// Transfers into one archive store at once.
 const ARCHIVE_TRANSFERS: usize = 2;
+
+/// Transfers into one of a host's own stores at once (ADR-073): enough to
+/// keep an NVMe busy, so a job spread over a host's disks fills them
+/// together.
+const DISK_TRANSFERS: usize = 8;
 
 /// How long a handle trusts a STABLE generation's attributes on the fast
 /// path.
@@ -3453,6 +3652,8 @@ const SERVE_FILES_MAX: usize = 4096;
 /// An object kept open for serving (see `Vfs::serve_files`).
 struct ServeEntry {
     file: Arc<std::fs::File>,
+    /// The store it was opened from (this host's live store or a disk).
+    store: nest_types::StoreId,
     opened: std::time::Instant,
     used: std::time::Instant,
 }
@@ -3597,6 +3798,24 @@ async fn probe_disk(vfs: Weak<Vfs>) {
                 crate::diskprobe::save(v.d.store().root(), &b);
                 v.disk_bps.store(bps, Ordering::Relaxed);
                 tracing::info!(bytes_per_s = bps, "disk read rate measured");
+            }
+            // Each extra disk the same way (ADR-073), one at a time.
+            let disks = match vfs.upgrade() {
+                Some(v) => v.d.disks(),
+                None => return,
+            };
+            for d in disks {
+                let st = d.store.clone();
+                if let Ok(Some(bps)) =
+                    tokio::task::spawn_blocking(move || crate::diskprobe::measure(&st)).await
+                {
+                    let b = crate::diskprobe::DiskBandwidth {
+                        bytes_per_s: bps,
+                        measured_at: now,
+                    };
+                    crate::diskprobe::save(d.store.root(), &b);
+                    tracing::info!(disk = %d.name, bytes_per_s = bps, "disk read rate measured");
+                }
             }
             tokio::time::sleep(Duration::from_secs(600)).await;
         } else {

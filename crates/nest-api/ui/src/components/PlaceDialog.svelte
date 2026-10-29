@@ -5,7 +5,7 @@
   // only, ADR-047), or in an archive. Placements are planned and shown as an
   // editable plan before anything moves.
   import { get, post, type Plan, type Readiness, type HostUsage } from "../lib/api";
-  import { app, startJob, singleFlight } from "../lib/state.svelte";
+  import { app, startJob, singleFlight, extraDisks } from "../lib/state.svelte";
   import { human } from "../lib/format";
   import { placing } from "../lib/ui.svelte";
   import { portal } from "../lib/portal";
@@ -44,7 +44,12 @@
     return r ? r.bytes - r.missing_bytes : 0;
   };
   const free = (h: string) => app.status?.nodes.find((n) => n.name === h)?.info?.free_bytes ?? 0;
-  const disk = (h: string) => app.status?.nodes.find((n) => n.name === h)?.info?.disk_read_bps ?? 0;
+  // A host's disks together (ADR-073): copies there spread over them.
+  const stores = (h: string) => (app.disks[h] ?? []).filter((d) => d.healthy);
+  const disk = (h: string) => {
+    const s = stores(h);
+    return s.length > 1 ? s.reduce((a, d) => a + d.read_bps, 0) : app.status?.nodes.find((n) => n.name === h)?.info?.disk_read_bps ?? 0;
+  };
   // Relative use of this selection: the most-reading host a full bar, the
   // least an empty one.
   const useBar = $derived.by(() => {
@@ -199,12 +204,13 @@
               <div class="row"><b>{h}</b>{#if mode === "single" && h === best}<span class="badge spark">best</span>{/if}</div>
               <span class="tiny muted mono">{held(h) ? `holds ${human(held(h))}` : "holds none"}</span>
               <span class="tiny muted mono">{human(free(h))} free</span>
+              {#if extraDisks(h).length}<span class="tiny muted mono" title={stores(h).map((d) => `${d.name}: ${human(d.free_bytes)} free`).join("\n")}>{stores(h).length} disks</span>{/if}
               {#if mode === "multi" && disk(h)}<span class="tiny muted mono">disk {human(disk(h))}/s</span>{/if}
               <span class="use" title="{human(read(h))} read here in 30 days"><i style="width:{useBar(h) * 100}%"></i></span>
             </button>
           {/each}
         </div>
-        <div class="tiny muted legend">bar: how much each host read it (most = full)</div>
+        <div class="tiny muted legend">bar: how much each host read it (most = full){Object.keys(app.disks).length ? " · a host with several disks spreads its copies over them by free space" : ""}</div>
         {#if mode === "multi"}
           <div class="factor">
             <div class="row">

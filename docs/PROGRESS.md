@@ -3,6 +3,28 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-29 — 0.7.0: several disks per host (ADR-073)
+
+- For raptor's two new 8 TB PCIe 5 NVMe drives: each extra disk is a
+  store of its own (`nest disk add|ls|drain|rm`, `/v1/disks`), its id
+  naming its host. A host still holds each file once; copies for it go
+  on whichever of its disks has the most room, so a job fills the disks
+  side by side. Writes, ownership and metadata stay on the live store.
+- Reads, serving, passthrough and push treat a host's disks as local;
+  push runs one stream per disk at its own measured rate, and Place by
+  speed sizes a host's share by its disks together (capped at its link).
+- Startup reconciles each mounted disk; an unmounted disk (marker
+  missing) is never read or written and keeps its records until it is
+  back. Drain moves a disk's copies on the host; `rm --forget-copies`
+  covers a lost disk.
+- UI: each host card lists its disks with space and health; the Place
+  dialog shows how many disks a host has and their combined speed.
+- 0.6.7 off-grid fixes (ADR-071, ADR-072) are on kakapo, cassowary and
+  maxq; raptor and the Sparks wait for cuteafd's V4 release window, then
+  take 0.7.0 directly.
+- Next: install the drives, `nest disk add raptor /srv/sparknest-nvme1`
+  (and nvme2), measure the three-disk push rate on raptor.
+
 ## 2026-10-21 — 0.6.0, 0.6.1, 0.6.2 released and deployed; first production push loads
 
 - 0.6.0 on all ten hosts (cassowary joined as an off-grid host, node 10),

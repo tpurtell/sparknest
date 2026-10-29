@@ -392,6 +392,7 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
             node,
             config,
         } => register_store(c, name, *class, *node, config),
+        Command::DeleteStore { store } => delete_store(c, *store),
         Command::Batch(cmds) => {
             let mut out = Vec::with_capacity(cmds.len());
             for sub in cmds {
@@ -1384,6 +1385,23 @@ fn register_store(
             return err(NestError::Invalid("live store needs a node".into()));
         }
         (StoreClass::Archive, _) => StoreId(kv_next(c, "next_store")? as u64),
+        (StoreClass::Disk, Some(n)) => {
+            // Numbered per host from a counter: a number is never reused,
+            // so old records never name a new disk.
+            let key = format!("next_disk:{}", n.0);
+            let k: i64 = c
+                .prepare_cached(
+                    "INSERT INTO kv (k, v) VALUES (?1, 2) ON CONFLICT(k) DO UPDATE SET v = v + 1 RETURNING v - 1",
+                )?
+                .query_row(params![key], |r| r.get(0))?;
+            if k > 255 {
+                return err(NestError::Invalid("a host has at most 255 disks".into()));
+            }
+            n.disk_store(k as u8)
+        }
+        (StoreClass::Disk, None) => {
+            return err(NestError::Invalid("a disk needs its host".into()));
+        }
     };
     c.prepare_cached(
         "INSERT INTO stores (id, name, class, node, config) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1396,6 +1414,27 @@ fn register_store(
         config
     ])?;
     Ok(Reply::Store(id))
+}
+
+fn delete_store(c: &Connection, store: StoreId) -> R<Reply> {
+    if !store.is_disk() {
+        return err(NestError::Invalid(
+            "only a host's disk can be removed".into(),
+        ));
+    }
+    let copies: i64 = c
+        .prepare_cached("SELECT count(*) FROM replicas WHERE store = ?1")?
+        .query_row(params![store.0 as i64], |r| r.get(0))?;
+    if copies > 0 {
+        return err(NestError::Busy(format!("{copies} copies are still on it")));
+    }
+    let n = c
+        .prepare_cached("DELETE FROM stores WHERE id = ?1")?
+        .execute(params![store.0 as i64])?;
+    if n == 0 {
+        return err(NestError::NotFound);
+    }
+    Ok(Reply::Done)
 }
 
 #[allow(dead_code)]

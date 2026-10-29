@@ -77,6 +77,9 @@ pub struct ClusterJob {
     host_jobs: Vec<(NodeId, u64)>,
 }
 
+/// Hosts' stores by host name (`Placer::disks_listing`).
+pub type DisksByHost = HashMap<String, Vec<admin::DiskInfo>>;
+
 fn cancelled(job: &Mutex<ClusterJob>) -> NestResult<()> {
     if job.lock().cancelled {
         return Err(NestError::Io(
@@ -139,6 +142,8 @@ pub struct Placer {
     /// Other nodes' jobs as last heard, for when one answers slowly.
     jobs_cache: Mutex<HashMap<NodeId, Vec<ClusterJob>>>,
     plans: Mutex<HashMap<u64, crate::plan::Plan>>,
+    /// `disks_listing` answer and when it was made.
+    disks_cache: Mutex<Option<(std::time::Instant, DisksByHost)>>,
     next_job: AtomicU64,
     dirty: Arc<tokio::sync::Notify>,
 }
@@ -248,6 +253,7 @@ impl Placer {
             info_cache: Mutex::new(HashMap::new()),
             jobs_cache: Mutex::new(HashMap::new()),
             plans: Mutex::new(HashMap::new()),
+            disks_cache: Mutex::new(None),
             next_job: AtomicU64::new(rand::random::<u32>() as u64),
             dirty: Arc::new(tokio::sync::Notify::new()),
         });
@@ -339,9 +345,11 @@ impl Placer {
     }
 
     pub fn nodes(&self) -> NestResult<Vec<HostRef>> {
+        // Each host's name is its live store's (its disks have their own).
         let names: HashMap<NodeId, String> = query::stores(&self.conn()?)
             .map_err(sql)?
             .into_iter()
+            .filter(|s| s.node.is_some_and(|n| n.live_store() == s.id))
             .filter_map(|s| s.node.map(|n| (n, s.name)))
             .collect();
         let m = self.vfs.data().meta().metrics().membership_config;
@@ -756,6 +764,252 @@ impl Placer {
             .collect())
     }
 
+    /// Every host's stores (`nest disk ls`, ADR-073): its live store and
+    /// each extra disk. A host older than 0.7 answers with its live store
+    /// only, built from its info.
+    pub async fn disks(&self) -> NestResult<Vec<(HostRef, Result<Vec<admin::DiskInfo>, String>)>> {
+        let nodes = self.nodes()?;
+        let out = futures::future::join_all(nodes.into_iter().map(|h| async move {
+            if h.node == self.vfs.data().id() {
+                let a = self.admin.clone();
+                let r = tokio::task::spawn_blocking(move || a.disks())
+                    .await
+                    .map_err(|e| e.to_string());
+                return (h, r);
+            }
+            let r = match admin::call(self.rpc(), h.node, &AdminReq::Disks, Duration::from_secs(4))
+                .await
+            {
+                Ok(AdminResp::Disks(d)) => Ok(d),
+                Ok(other) => Err(format!("unexpected {other:?}")),
+                Err(e) => match self.info_cache.lock().get(&h.node) {
+                    // Older host: one store, as its info describes it.
+                    Some(i) => Ok(vec![admin::DiskInfo {
+                        store: h.node.live_store(),
+                        name: h.name.clone(),
+                        path: String::new(),
+                        healthy: true,
+                        total_bytes: i.total_bytes,
+                        free_bytes: i.free_bytes,
+                        objects: i.objects,
+                        object_bytes: i.object_bytes,
+                        read_bps: i.disk_read_bps,
+                        primary: true,
+                    }]),
+                    None => Err(e.to_string()),
+                },
+            };
+            (h, r)
+        }))
+        .await;
+        // Push sources read each disk at its own rate.
+        let rates = out
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .flatten()
+            .map(|d| (d.store, d.read_bps))
+            .collect();
+        self.vfs.balancer().set_store_rates(rates);
+        Ok(out)
+    }
+
+    /// Hosts with more than one store and their stores, by host name, at
+    /// most 10 s old: for the UI's state, which polls (ADR-073).
+    pub async fn disks_listing(self: &Arc<Self>) -> DisksByHost {
+        let cached = self.disks_cache.lock().clone();
+        if let Some((at, v)) = &cached
+            && at.elapsed() < Duration::from_secs(10)
+        {
+            return v.clone();
+        }
+        // Mark fresh first: one refresh at a time.
+        let old = cached.map(|(_, v)| v).unwrap_or_default();
+        *self.disks_cache.lock() = Some((std::time::Instant::now(), old.clone()));
+        let me = self.clone();
+        let refresh = async move {
+            let v: DisksByHost = me
+                .disks()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(h, r)| Some((h.name, r.ok()?)))
+                .filter(|(_, d)| d.len() > 1)
+                .collect();
+            *me.disks_cache.lock() = Some((std::time::Instant::now(), v.clone()));
+            v
+        };
+        if old.is_empty() {
+            refresh.await
+        } else {
+            tokio::spawn(refresh);
+            old
+        }
+    }
+
+    /// Add a disk to `host` at `path` (a mounted, empty directory or one of
+    /// this disk's own): registered, then its marker written by the host.
+    pub async fn add_disk(
+        &self,
+        host: &str,
+        path: &str,
+        name: Option<&str>,
+    ) -> NestResult<StoreId> {
+        let h = self
+            .resolve_hosts(&[host.to_string()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NestError::Invalid(format!("unknown host {host:?}")))?;
+        let existing = query::stores(&self.conn()?).map_err(sql)?;
+        // The same path on the same host again: initialize it again.
+        let again = existing.iter().find(|r| {
+            r.id.host() == Some(h.node)
+                && r.id.is_disk()
+                && serde_json::from_str::<nest_data::DiskConfig>(&r.config)
+                    .is_ok_and(|c| c.path == path)
+        });
+        let (id, name) = match again {
+            Some(r) => (r.id, r.name.clone()),
+            None => {
+                let k = existing
+                    .iter()
+                    .filter(|r| r.id.host() == Some(h.node) && r.id.is_disk())
+                    .count()
+                    + 1;
+                let name = name.map_or_else(|| format!("{}:disk{k}", h.name), str::to_string);
+                let cfg = serde_json::to_string(&nest_data::DiskConfig { path: path.into() })
+                    .map_err(|e| NestError::Io(e.to_string()))?;
+                let r = self
+                    .vfs
+                    .data()
+                    .meta()
+                    .propose(Command::RegisterStore {
+                        name: name.clone(),
+                        class: StoreClass::Disk,
+                        node: Some(h.node),
+                        config: cfg,
+                    })
+                    .await?;
+                match r {
+                    nest_meta::Reply::Store(id) => (id, name),
+                    other => return Err(NestError::Io(format!("unexpected {other:?}"))),
+                }
+            }
+        };
+        match admin::call(
+            self.rpc(),
+            h.node,
+            &AdminReq::InitDisk {
+                store: id,
+                name,
+                path: path.into(),
+            },
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(_) => Ok(id),
+            Err(e) => Err(NestError::Invalid(format!(
+                "registered, but {} could not prepare {path}: {e}",
+                h.name
+            ))),
+        }
+    }
+
+    /// A disk by name (`raptor:disk1`) or store id.
+    pub fn find_disk(&self, name: &str) -> NestResult<(StoreId, String, NodeId)> {
+        query::stores(&self.conn()?)
+            .map_err(sql)?
+            .into_iter()
+            .find(|r| r.id.is_disk() && (r.name == name || r.id.0.to_string() == name))
+            .and_then(|r| Some((r.id, r.name, r.id.host()?)))
+            .ok_or_else(|| NestError::Invalid(format!("no disk named {name:?}")))
+    }
+
+    /// Move every copy off a disk onto the host's other stores (on the
+    /// host, never over the network). Returns the job.
+    pub async fn drain_disk(self: &Arc<Self>, name: &str) -> NestResult<u64> {
+        let (id, dname, host) = self.find_disk(name)?;
+        let c = self.conn()?;
+        let files: Vec<(FileId, u64)> = query::store_inventory(&c, id)
+            .map_err(sql)?
+            .into_iter()
+            .filter_map(|(f, g)| {
+                let a = query::getattr(&c, f).ok()??;
+                (a.generation == g).then_some((f, a.size))
+            })
+            .collect();
+        drop(c);
+        let others: Vec<StoreId> = std::iter::once(host.live_store())
+            .chain(
+                self.disks()
+                    .await?
+                    .into_iter()
+                    .filter(|(h, _)| h.node == host)
+                    .flat_map(|(_, r)| r.unwrap_or_default())
+                    .filter(|d| !d.primary && d.store != id && d.healthy)
+                    .map(|d| d.store),
+            )
+            .collect();
+        let hname = self
+            .nodes()?
+            .into_iter()
+            .find(|h| h.node == host)
+            .map_or_else(|| format!("node{host}"), |h| h.name);
+        self.move_local_job(format!("drain {dname}"), hname, host, files, id, others)
+            .await
+    }
+
+    /// Run a `MoveLocal` on `host` as a cluster job.
+    async fn move_local_job(
+        self: &Arc<Self>,
+        what: String,
+        hname: String,
+        host: NodeId,
+        files: Vec<(FileId, u64)>,
+        from: StoreId,
+        to: Vec<StoreId>,
+    ) -> NestResult<u64> {
+        self.remote_job(what, hname, host, move |job| AdminReq::MoveLocal {
+            job,
+            files,
+            from,
+            to,
+        })
+        .await
+    }
+
+    /// Forget a disk once nothing is on it (after a drain, or a dead disk
+    /// whose copies were forgotten).
+    pub async fn remove_disk(&self, name: &str, forget_copies: bool) -> NestResult<u64> {
+        let (id, _, _) = self.find_disk(name)?;
+        let mut forgot = 0;
+        if forget_copies {
+            let copies = query::store_inventory(&self.conn()?, id).map_err(sql)?;
+            for chunk in copies.chunks(1024) {
+                let cmds = chunk
+                    .iter()
+                    .map(|&(file, generation)| Command::RetireReplica {
+                        file,
+                        generation,
+                        store: id,
+                        allow_last: false,
+                    })
+                    .collect();
+                if let nest_meta::Reply::Batch(rs) =
+                    self.vfs.data().meta().propose(Command::Batch(cmds)).await?
+                {
+                    forgot += rs.iter().filter(|r| r.is_ok()).count() as u64;
+                }
+            }
+        }
+        self.vfs
+            .data()
+            .meta()
+            .propose(Command::DeleteStore { store: id })
+            .await?;
+        Ok(forgot)
+    }
+
     /// Every host's view of the network (`nest net`, ADR-057). A host that
     /// cannot answer (down, or older than 0.5.0) carries its error.
     pub async fn net(&self) -> NestResult<Vec<NetStatus>> {
@@ -855,9 +1109,14 @@ impl Placer {
                 ready: false,
             };
             for e in &m.entries {
-                if !(e.stable
-                    && query::has_live_replica(&c, e.file, e.generation, h.store).map_err(sql)?)
-                {
+                let held = match h.store.host() {
+                    // A host is ready if any of its stores holds it (ADR-073).
+                    Some(n) if h.store == n.live_store() => {
+                        query::host_holds(&c, e.file, e.generation, n).map_err(sql)?
+                    }
+                    _ => query::has_live_replica(&c, e.file, e.generation, h.store).map_err(sql)?,
+                };
+                if !(e.stable && held) {
                     r.missing_files += 1;
                     r.missing_bytes += e.size;
                 }
@@ -925,7 +1184,13 @@ impl Placer {
                 .iter()
                 .filter(|e| e.stable)
                 .filter(|e| {
-                    !query::has_live_replica(&c, e.file, e.generation, h.store).unwrap_or(false)
+                    let held = match h.store.host() {
+                        Some(n) if h.store == n.live_store() => {
+                            query::host_holds(&c, e.file, e.generation, n)
+                        }
+                        _ => query::has_live_replica(&c, e.file, e.generation, h.store),
+                    };
+                    !held.unwrap_or(false)
                 })
                 .map(|e| (e.file, e.size))
                 .collect();
@@ -1232,8 +1497,9 @@ impl Placer {
                     .iter()
                     .filter(|e| {
                         e.stable
-                            && query::has_live_replica(&c, e.file, e.generation, store)
-                                .unwrap_or(false)
+                            && store.host().is_some_and(|n| {
+                                query::host_holds(&c, e.file, e.generation, n).unwrap_or(false)
+                            })
                     })
                     .fold((0, 0), |(n, b), e| (n + 1, b + e.size))
             };
@@ -2763,8 +3029,7 @@ impl Placer {
                         let c = me.conn()?;
                         let (keep, skip): (Vec<_>, Vec<_>) = copies.into_iter().partition(|x| {
                             x.keeper.or(requires).is_none_or(|k| {
-                                query::has_live_replica(&c, x.file, x.generation, k.live_store())
-                                    .unwrap_or(false)
+                                query::host_holds(&c, x.file, x.generation, k).unwrap_or(false)
                             })
                         });
                         if !skip.is_empty() {
@@ -2785,26 +3050,34 @@ impl Placer {
                     if copies.is_empty() {
                         continue;
                     }
-                    let files = copies.iter().map(|c| (c.file, c.generation)).collect();
-                    match admin::call(
-                        me.rpc(),
-                        node,
-                        &AdminReq::EvictExact {
-                            files,
-                            store: node.live_store(),
-                        },
-                        Duration::from_secs(600),
-                    )
-                    .await?
-                    {
-                        AdminResp::Evicted { removed, refused } => {
-                            let mut j = job.lock();
-                            let p = j.hosts.entry(host.clone()).or_default();
-                            p.done_files += removed;
-                            p.total_files += copies.len() as u64;
-                            p.failed.extend(refused);
+                    // One request per store of the host holding them.
+                    let mut by_store: BTreeMap<StoreId, Vec<(FileId, nest_types::Generation)>> =
+                        BTreeMap::new();
+                    for c in &copies {
+                        by_store
+                            .entry(c.store.unwrap_or(node.live_store()))
+                            .or_default()
+                            .push((c.file, c.generation));
+                    }
+                    for (store, files) in by_store {
+                        let n = files.len() as u64;
+                        match admin::call(
+                            me.rpc(),
+                            node,
+                            &AdminReq::EvictExact { files, store },
+                            Duration::from_secs(600),
+                        )
+                        .await?
+                        {
+                            AdminResp::Evicted { removed, refused } => {
+                                let mut j = job.lock();
+                                let p = j.hosts.entry(host.clone()).or_default();
+                                p.done_files += removed;
+                                p.total_files += n;
+                                p.failed.extend(refused);
+                            }
+                            other => return Err(NestError::Io(format!("unexpected {other:?}"))),
                         }
-                        other => return Err(NestError::Io(format!("unexpected {other:?}"))),
                     }
                 }
                 Ok(())
@@ -3061,14 +3334,29 @@ impl Placer {
                 host.name
             )));
         }
-        let store = host.node.live_store();
-        let copies = query::store_inventory(&self.conn()?, store).map_err(sql)?;
+        // Its live store and every disk it had (ADR-073).
+        let c = self.conn()?;
+        let mut copies = Vec::new();
+        for st in query::stores(&c).map_err(sql)? {
+            if st.id.host() == Some(host.node) {
+                for (f, g) in query::store_inventory(&c, st.id).map_err(sql)? {
+                    copies.push((f, g, st.id));
+                }
+            }
+        }
+        let live = host.node.live_store();
+        if !copies.iter().any(|(_, _, s)| *s == live) {
+            for (f, g) in query::store_inventory(&c, live).map_err(sql)? {
+                copies.push((f, g, live));
+            }
+        }
+        drop(c);
         tracing::warn!(host = %host.name, copies = copies.len(), "forgetting a lost host's copies");
         let (mut retired, mut kept) = (0, Vec::new());
         for chunk in copies.chunks(1024) {
             let cmds = chunk
                 .iter()
-                .map(|&(file, generation)| Command::RetireReplica {
+                .map(|&(file, generation, store)| Command::RetireReplica {
                     file,
                     generation,
                     store,
@@ -3077,7 +3365,7 @@ impl Placer {
                 .collect();
             match self.vfs.data().meta().propose(Command::Batch(cmds)).await? {
                 nest_meta::Reply::Batch(rs) => {
-                    for (r, &(file, _)) in rs.into_iter().zip(chunk) {
+                    for (r, &(file, _, _)) in rs.into_iter().zip(chunk) {
                         match r {
                             Ok(_) | Err(NestError::NotFound) => retired += 1,
                             Err(_) => kept.push(file),
