@@ -269,6 +269,21 @@ struct Handle {
     /// trusted for `ATTR_TTL`: every read names its exact generation, so a
     /// rewrite in between fails as Stale and the slow path refreshes.
     stable_attr: Mutex<Option<(FileAttr, std::time::Instant)>>,
+    /// Where reads of a STABLE generation come from on this host, decided
+    /// with metadata queries and kept until any copy anywhere changes
+    /// (`Vfs::replica_epoch`) or `ATTR_TTL` passes. Without it every
+    /// remote read queried SQLite to learn there is no copy here; 64
+    /// FUSE queues doing that serialised on SQLite's page-cache mutex.
+    local: Mutex<Option<LocalPick>>,
+}
+
+/// A handle's remembered answer to `own_read_source`.
+struct LocalPick {
+    generation: Generation,
+    epoch: u64,
+    at: std::time::Instant,
+    /// The store read from, or none: every read goes to another host.
+    src: Option<(nest_types::StoreId, Arc<nest_store::ObjectStore>)>,
 }
 
 /// A generation readable from several copies.
@@ -333,6 +348,12 @@ pub struct Vfs {
     /// closed as soon as their copy here is invalidated. STABLE
     /// generations only: their bytes never change.
     serve_files: Mutex<HashMap<ObjectKey, ServeEntry>>,
+    /// Bumped whenever a copy of any file is added, removed or replaced
+    /// (after the change is committed): handles re-decide their
+    /// `LocalPick` on the next read.
+    replica_epoch: AtomicU64,
+    /// Metadata queries this VFS ran (tests check the read path runs none).
+    queries: AtomicU64,
     /// Transfers into each archive store at once (a single disk or share
     /// gains nothing from more; dozens of queued offloads once pinned
     /// hundreds of threads on a 150 MB/s disk).
@@ -466,6 +487,8 @@ impl Vfs {
             fences: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             serve_files: Mutex::new(HashMap::new()),
+            replica_epoch: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
             archive_slots: Mutex::new(HashMap::new()),
             disk_slots: Mutex::new(HashMap::new()),
             inflight_done: tokio::sync::Notify::new(),
@@ -615,7 +638,7 @@ impl Vfs {
     pub fn prepare_remote(&self, fh: u64, offset: u64, size: u32) -> Option<ScatteredRead> {
         let h = self.handle(fh).ok()?;
         let a = self.fast_attr(&h)?;
-        if a.gen_state != GenState::Stable || self.own_read_source(&a).is_some() {
+        if a.gen_state != GenState::Stable || self.read_source(&h, &a).is_some() {
             return None;
         }
         let fab = self.fabric()?;
@@ -781,6 +804,7 @@ impl Vfs {
 
     /// Run a closure with a pooled read-only metadata connection.
     pub(crate) fn q<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> NestResult<T> {
+        self.queries.fetch_add(1, Ordering::Relaxed);
         let c = self.readers.lock().pop();
         let c = match c {
             Some(c) => c,
@@ -818,6 +842,16 @@ impl Vfs {
     // ------------------------------------------------------------ effects
 
     fn on_effect(&self, index: u64, e: &Effect) {
+        if matches!(
+            e,
+            Effect::ReplicaInvalidated { .. }
+                | Effect::ReplicaPublished { .. }
+                | Effect::Finalized { .. }
+                | Effect::OwnershipGranted { .. }
+                | Effect::FileDeleted { .. }
+        ) {
+            self.replica_epoch.fetch_add(1, Ordering::SeqCst);
+        }
         match e {
             // Deleted, evicted or superseded by a new owner's generation:
             // close it now so its space comes back with the last read still
@@ -2017,20 +2051,33 @@ impl Vfs {
     /// store (owned here, or a servable live copy) or an archive store it is
     /// a gateway for.
     fn local_source(&self, a: &FileAttr) -> Option<Arc<nest_store::ObjectStore>> {
+        self.local_store(a).map(|(_, st)| st)
+    }
+
+    /// `local_source`, with the store's id.
+    fn local_store(
+        &self,
+        a: &FileAttr,
+    ) -> Option<(nest_types::StoreId, Arc<nest_store::ObjectStore>)> {
         let key = ObjectKey::new(a.id, a.generation);
         match (a.gen_state, a.owner) {
-            (GenState::Owned, Some(o)) if o == self.me() => Some(self.d.store().clone()),
+            (GenState::Owned, Some(o)) if o == self.me() => {
+                Some((self.me().live_store(), self.d.store().clone()))
+            }
             (GenState::Stable, _) => {
                 // The live store, or one of this host's disks (ADR-073).
-                if let Some((_, st)) = self.d.servable_local(key) {
-                    return Some(st);
+                self.queries.fetch_add(1, Ordering::Relaxed);
+                if let Some(local) = self.d.servable_local(key) {
+                    return Some(local);
                 }
                 let replicas = self.q(|c| query::replicas(c, a.id)).ok()?;
                 replicas
                     .into_iter()
                     .filter(|r| r.generation == a.generation && crate::is_archive(r.store))
-                    .find_map(|r| self.d.servable_archive(r.store, key))
-                    .map(|arch| arch.store.clone())
+                    .find_map(|r| {
+                        let arch = self.d.servable_archive(r.store, key)?;
+                        Some((r.store, arch.store.clone()))
+                    })
             }
             _ => None,
         }
@@ -2041,12 +2088,69 @@ impl Vfs {
     /// over the fabric (5–15 GB/s) beats an archive disk (a SATA SSD or a
     /// NAS share); the archive stays the fallback when those holders fail.
     fn own_read_source(&self, a: &FileAttr) -> Option<Arc<nest_store::ObjectStore>> {
-        let src = self.local_source(a)?;
+        self.own_read_store(a).map(|(_, st)| st)
+    }
+
+    fn own_read_store(
+        &self,
+        a: &FileAttr,
+    ) -> Option<(nest_types::StoreId, Arc<nest_store::ObjectStore>)> {
+        let (id, src) = self.local_store(a)?;
         if self.is_own_disk(&src) || !self.live_elsewhere(a) {
-            Some(src)
+            Some((id, src))
         } else {
             None
         }
+    }
+
+    /// `own_read_source` for a read through `h`, without metadata queries
+    /// while nothing about any copy changed: the handle remembers the
+    /// answer per generation (`LocalPick`), and a remembered copy is
+    /// re-checked in memory (lease, fences, its disk still mounted) on
+    /// every read.
+    fn read_source(&self, h: &Handle, a: &FileAttr) -> Option<Arc<nest_store::ObjectStore>> {
+        if a.gen_state != GenState::Stable {
+            return self.own_read_source(a);
+        }
+        let key = ObjectKey::new(a.id, a.generation);
+        let epoch = self.replica_epoch.load(Ordering::SeqCst);
+        let remembered = h
+            .local
+            .lock()
+            .as_ref()
+            .filter(|p| {
+                p.generation == a.generation && p.epoch == epoch && p.at.elapsed() < ATTR_TTL
+            })
+            .map(|p| p.src.clone());
+        match remembered {
+            Some(None) => return None,
+            Some(Some((id, st))) if self.still_local(id, key) => return Some(st),
+            // Unmounted, fenced or the lease lapsed since: decide again.
+            _ => {}
+        }
+        // The epoch is read before the queries: a change committed while
+        // they run leaves this answer tagged with the older epoch.
+        let src = self.own_read_store(a);
+        *h.local.lock() = Some(LocalPick {
+            generation: a.generation,
+            epoch,
+            at: std::time::Instant::now(),
+            src: src.clone(),
+        });
+        src.map(|(_, st)| st)
+    }
+
+    /// A copy found servable may still be served: in memory only.
+    fn still_local(&self, store: nest_types::StoreId, key: ObjectKey) -> bool {
+        self.d.may_serve_now(store, key)
+            && (store == self.me().live_store()
+                || (store.is_disk() && self.d.disk(store).is_some())
+                || (crate::is_archive(store) && self.d.archive(store).is_some()))
+    }
+
+    /// Metadata queries this VFS has run so far.
+    pub fn metadata_queries(&self) -> u64 {
+        self.queries.load(Ordering::Relaxed)
     }
 
     /// Whether `src` is this host's live store or one of its disks (not an
@@ -2186,6 +2290,7 @@ impl Vfs {
             read_bytes: Default::default(),
             route: Mutex::new(None),
             stable_attr: Mutex::new(None),
+            local: Mutex::new(None),
         });
         self.handles.lock().insert(fh, h);
         self.d.handle_opened(file);
@@ -2440,7 +2545,7 @@ impl Vfs {
             }
             let a = self.raw_attr(h.file)?;
             let key = ObjectKey::new(h.file, a.generation);
-            if let Some(src) = self.own_read_source(&a) {
+            if let Some(src) = self.read_source(&h, &a) {
                 let _t = self.track(h.file);
                 let f = {
                     let mut r = h.reader.lock();
@@ -2644,7 +2749,7 @@ impl Vfs {
         let key = ObjectKey::new(h.file, a.generation);
         // A local copy answers at once; remote reads take the slow path or
         // `prepare_remote`.
-        if let Some(src) = self.own_read_source(&a) {
+        if let Some(src) = self.read_source(&h, &a) {
             let _t = self.track(h.file);
             let f = {
                 let mut r = h.reader.lock();

@@ -529,3 +529,88 @@ async fn remote_reads_through_the_mount() {
     }
     c.node(2).unmount();
 }
+
+/// Remote reads on the FUSE fast path run no metadata queries: the handle
+/// remembers that there is no copy here (each read once queried SQLite
+/// twice, and 64 FUSE queues serialised on its page-cache mutex). A copy
+/// arriving here, or leaving, is noticed at the next read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn remote_reads_run_no_metadata_queries() {
+    let Some(c) = fabric_cluster(2).await else {
+        return;
+    };
+    let v1 = &c.node(1).vfs;
+    let size = 8u64 << 20;
+    let (a, fh, _) = v1
+        .create(FileId::ROOT, b"table", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    let data: Vec<u8> = (0..size).map(pattern).collect();
+    v1.write(fh, 0, data.clone()).await.unwrap();
+    v1.release(fh, None).await;
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        c.attr(2, a.id)
+            .is_some_and(|x| x.gen_state == GenState::Stable)
+    })
+    .await;
+    let v2 = c.node(2).vfs.clone();
+    let (rfh, _) = v2.open(a.id, 0).await.unwrap();
+    // The first read makes the RDMA link (the fast path never waits).
+    assert_eq!(v2.read(rfh, 0, 4096).await.unwrap(), &data[..4096]);
+    // As the FUSE frontend reads a page: here if it can, else over the
+    // fabric from the completion thread. Returns where it came from.
+    let page = |off: u64| -> (bool, Vec<u8>) {
+        if let Some(r) = v2.try_read_now(rfh, off, 4096) {
+            return (true, r.unwrap());
+        }
+        let r = v2.prepare_remote(rfh, off, 4096).expect("fabric read");
+        let (tx, rx) = std::sync::mpsc::channel();
+        r.start(Box::new(move |b| {
+            let _ = tx.send(b.map(|b| b.to_vec()));
+        }));
+        (false, rx.recv().unwrap().unwrap())
+    };
+    let offsets: Vec<u64> = (0..2000u64)
+        .map(|i| (i.wrapping_mul(0x9E3779B97F4A7C15) % (size / 4096)) * 4096)
+        .collect();
+    let check = |off: u64, b: &[u8]| {
+        assert_eq!(b, &data[off as usize..off as usize + 4096], "at {off}");
+    };
+    // The first read decides; the rest ask nothing of SQLite.
+    let (local, b) = page(offsets[0]);
+    assert!(!local);
+    check(offsets[0], &b);
+    let before = v2.metadata_queries();
+    let t = std::time::Instant::now();
+    for &off in &offsets[1..] {
+        let (local, b) = page(off);
+        assert!(!local);
+        check(off, &b);
+    }
+    // Within a second (the remembered answer's lifetime).
+    if t.elapsed() < Duration::from_millis(900) {
+        assert_eq!(v2.metadata_queries() - before, 0, "queries per remote read");
+    }
+
+    // A copy here: the next reads are local.
+    v2.replicate_into(a.id, StoreId(2)).await.unwrap();
+    let (local, b) = page(offsets[1]);
+    assert!(local, "a new local copy is read at once");
+    check(offsets[1], &b);
+    let before = v2.metadata_queries();
+    for &off in &offsets[2..200] {
+        let (local, b) = page(off);
+        assert!(local);
+        check(off, &b);
+    }
+    assert!(
+        v2.metadata_queries() - before <= 2,
+        "local reads query at most once per second"
+    );
+    // Gone again: never read from the evicted copy.
+    assert!(v2.evict_from(a.id, StoreId(2)).await.unwrap());
+    let (local, b) = page(offsets[3]);
+    assert!(!local, "an evicted copy is not read");
+    check(offsets[3], &b);
+    v2.release(rfh, None).await;
+}
