@@ -3,6 +3,20 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-31 — 0.7.1: remote reads run no metadata queries
+
+- cuteafd's remote random 4 KiB gathers on raptor capped at ~58K reads/s
+  with sparknestd spinning on ~48 cores of system time. perf put it in
+  SQLite's shared page-cache mutex: each remote read ran about six
+  queries to learn there was no copy here. The open handle now remembers
+  that per generation until a copy anywhere changes (or 1 s), and a
+  remembered local copy is re-checked in memory on every read.
+- Trial (`benchmarks/M15-REMOTE-RANDREAD.md`): 64 reader CPUs, every read
+  async: 181K reads/s at 5,192% sys on 0.7.0; 1.84M at 21% with the fix.
+  A fabric test now requires zero metadata queries per remote read.
+- Rolls to every host but maxq tonight; maxq (Step-5 quant running)
+  follows when the quant ends.
+
 ## 2026-10-29 — 0.7.0: several disks per host (ADR-073, ADR-074)
 
 - For raptor's two new 8 TB PCIe 5 NVMe drives: each extra disk is a
