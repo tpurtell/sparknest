@@ -67,7 +67,8 @@
     mode = "multi";
     multi = [...hosts];
     picked = [];
-    factor = 1;
+    // One copy of each file to start: a spread (TJ almost always wants it).
+    factor = 1 / Math.max(1, hosts.length);
     bySpeed = false;
     spreadOff = true;
     plan = null;

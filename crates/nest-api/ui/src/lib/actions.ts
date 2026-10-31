@@ -44,6 +44,69 @@ export async function deleteModel(selector: string) {
   go("models");
 }
 
+type RepairStep = { repo: string; action: string; ref: string; to: string; why: string };
+
+/** Tidy the hub: make the refs hf ignores true again (`nest hf repair`),
+ *  then prune revisions no ref points at (`hf cache prune`). Each step is
+ *  shown before anything changes; model files are only ever removed by
+ *  prune, and only what no current snapshot links. */
+export async function tidyHub() {
+  let steps: RepairStep[];
+  try {
+    steps = (await post<{ steps: RepairStep[] }>("/v1/hf/repair", { dry_run: true })).steps ?? [];
+  } catch (e) {
+    toast((e as Error).message, true);
+    return;
+  }
+  const act = steps.filter((s) => s.action !== "report");
+  const name = (r: string) => r.replace(/^(models|datasets)--/, "").replace("--", "/");
+  const line = (s: RepairStep) =>
+    `${name(s.repo)}: ${
+      s.action === "point" ? `refs/${s.ref} → ${s.to.slice(0, 12)}` : s.action === "drop-ref" ? `drop refs/${s.ref}` : s.action === "remove-repo" ? "remove (only refs, nothing downloaded)" : `left alone: ${s.why}`
+    }`;
+  if (act.length) {
+    const ok = await confirm(
+      `Repair ${act.length} ref${act.length === 1 ? "" : "s"}?`,
+      `hf ignores these repos (it can neither list nor delete them). From what the hub holds:\n\n${steps.map(line).join("\n")}\n\nModel files are not touched.`,
+      "Repair",
+    );
+    if (!ok) return;
+    try {
+      await post("/v1/hf/repair", { dry_run: false });
+      toast(`Repaired ${act.length} ref${act.length === 1 ? "" : "s"}`);
+    } catch (e) {
+      toast((e as Error).message, true);
+      return;
+    }
+  } else if (steps.length) {
+    await inform("Refs left alone", steps.map(line).join("\n"));
+  }
+  let report: { revisions?: number; size?: string; incomplete?: number; output?: string };
+  try {
+    report = (await post<{ report: typeof report }>("/v1/hf/prune", { dry_run: true })).report ?? {};
+  } catch (e) {
+    toast((e as Error).message, true);
+    return;
+  }
+  if (!report.revisions && !report.incomplete) {
+    await inform("The hub is tidy", act.length ? "Refs repaired; no detached revisions or incomplete downloads." : "No refs to repair, no detached revisions or incomplete downloads.");
+    return;
+  }
+  const ok = await confirm(
+    `Prune ${report.revisions ?? 0} detached revision${report.revisions === 1 ? "" : "s"}?`,
+    `hf cache prune removes revisions no ref points at${report.incomplete ? ` and ${report.incomplete} incomplete download${report.incomplete === 1 ? "" : "s"}` : ""}, freeing ${report.size ?? "?"}. Blobs a current snapshot links stay. Anything that loads an old revision by its commit loses it. \`nest hf prune\` lists them.`,
+    "Prune",
+    true,
+  );
+  if (!ok) return;
+  try {
+    await post("/v1/hf/prune", { dry_run: false });
+    toast(`Pruned ${report.revisions ?? 0} revision${report.revisions === 1 ? "" : "s"}`);
+  } catch (e) {
+    toast((e as Error).message, true);
+  }
+}
+
 export async function removeFrom(selector: string, hosts?: string[]) {
   const from =
     hosts ??

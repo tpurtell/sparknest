@@ -1980,16 +1980,6 @@ impl Placer {
                     .join("refs")
                     .join(b)
             });
-            if let Some(r) = ref_path.clone() {
-                let sha = plan.sha.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Some(d) = r.parent() {
-                        let _ = std::fs::create_dir_all(d);
-                    }
-                    std::fs::write(&r, &sha)
-                })
-                .await;
-            }
             /// A fetch with no new bytes for this long is given up on
             /// (before its first byte, a shorter wait: the host may not
             /// reach the Hub at all).
@@ -2144,6 +2134,24 @@ impl Placer {
             for m in moves {
                 unmoved.extend(m.await.unwrap_or_default());
             }
+            // The branch's ref, once its snapshot exists: written up front, a
+            // download that fetched nothing (cancelled, every file failed)
+            // left a repo whose ref names a commit it does not have, which hf
+            // then ignores and cannot delete.
+            if let Some(r) = ref_path.clone() {
+                let sha = plan.sha.clone();
+                let snap = snap.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if !snap.is_dir() {
+                        return Ok(());
+                    }
+                    if let Some(d) = r.parent() {
+                        let _ = std::fs::create_dir_all(d);
+                    }
+                    std::fs::write(&r, &sha)
+                })
+                .await;
+            }
             let mut j = job.lock();
             j.notes.append(&mut sched.notes);
             if !unmoved.is_empty() {
@@ -2187,13 +2195,13 @@ impl Placer {
         let mut unmoved = Vec::new();
         match self.conn() {
             Ok(c) => {
+                // A snapshot entry is a link into blobs/: the blob moves.
                 for n in names {
-                    match selector::resolve_path(&c, &format!("{dir}/{n}"))
-                        .ok()
-                        .and_then(|(f, _)| Some((f, query::getattr(&c, f).ok()??.size)))
-                    {
-                        Some(f) => files.push(f),
-                        None => unmoved.push(n),
+                    match selector::resolve_tree(&c, &format!("{dir}/{n}")) {
+                        Ok(m) if !m.entries.is_empty() => {
+                            files.extend(m.entries.iter().map(|e| (e.file, e.size)))
+                        }
+                        _ => unmoved.push(n),
                     }
                 }
             }

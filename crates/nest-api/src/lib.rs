@@ -196,6 +196,8 @@ pub fn router(api: Api) -> Router {
         .route("/v1/hf/import", post(hf_import))
         .route("/v1/hf/remove", post(hf_remove))
         .route("/v1/hf/share", post(hf_share))
+        .route("/v1/hf/repair", post(hf_repair))
+        .route("/v1/hf/prune", post(hf_prune))
         .route("/v1/hf/refs", get(hf_refs))
         .route("/v1/hf/search", get(hf_search))
         .route("/v1/hf/size", get(hf_size))
@@ -974,6 +976,61 @@ async fn hf_share(State(api): State<Api>, Json(r): Json<HfShareReq>) -> R<serde_
     Ok(Json(
         json!({ "job": api.placer.hf_share(hf, hub, repos, r.verify) }),
     ))
+}
+
+#[derive(Deserialize, Default)]
+struct HfRepairReq {
+    /// Report what would change; change nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Make the hub's refs true again where hf ignores a repo (a ref naming a
+/// commit with no snapshot, or a repo of only refs), from what the hub
+/// holds, never the Hub. Model files are never touched.
+async fn hf_repair(
+    State(api): State<Api>,
+    body: Option<Json<HfRepairReq>>,
+) -> R<serde_json::Value> {
+    let r = body.map(|Json(b)| b).unwrap_or_default();
+    let hub = mount_hub(&api)?;
+    let apply = !r.dry_run;
+    let steps = tokio::task::spawn_blocking(move || nest_place::hfimport::repair(&hub, apply))
+        .await
+        .map_err(|e| NestError::Io(e.to_string()))??;
+    if apply {
+        tracing::info!(steps = steps.len(), "hf repair applied");
+    }
+    Ok(Json(json!({ "dry_run": r.dry_run, "steps": steps })))
+}
+
+#[derive(Deserialize, Default)]
+struct HfPruneReq {
+    /// hf's report of what would go; nothing is deleted.
+    #[serde(default)]
+    dry_run: bool,
+    hf: Option<String>,
+}
+
+/// `hf cache prune` on the hub: detached revisions and incomplete
+/// downloads, with blobs only they used.
+async fn hf_prune(State(api): State<Api>, body: Option<Json<HfPruneReq>>) -> R<serde_json::Value> {
+    let r = body.map(|Json(b)| b).unwrap_or_default();
+    let hub = mount_hub(&api)?;
+    let hf =
+        r.hf.map(std::path::PathBuf::from)
+            .or_else(nest_place::hfimport::find_hf)
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "hf is not installed on this node".into(),
+                )
+            })?;
+    let v = nest_place::hfimport::prune(&hf, &hub, r.dry_run).await?;
+    if !r.dry_run {
+        tracing::info!(report = %v, "hf cache prune applied");
+    }
+    Ok(Json(json!({ "dry_run": r.dry_run, "report": v })))
 }
 
 fn mount_hub(api: &Api) -> Result<std::path::PathBuf, ApiError> {

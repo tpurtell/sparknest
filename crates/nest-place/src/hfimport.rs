@@ -1083,6 +1083,14 @@ pub async fn download_size(
     revision: Option<&str>,
 ) -> NestResult<DownloadSize> {
     let revision = resolve_revision(mount_hub, repo, kind, revision);
+    // hf's dry run still writes refs/<branch> into the cache it reads, so
+    // looking at a model left a repo of nothing but a ref (hf then ignores
+    // it). Given a commit it writes nothing: resolve a branch on the Hub
+    // first (repo_plan reads no cache).
+    let commit = match revision.as_deref() {
+        Some(r) if is_commit(r) => r.to_string(),
+        r => repo_plan(None, mount_hub, repo, kind, r).await?.sha,
+    };
     let mut cmd = tokio::process::Command::new(hf);
     cmd.args([
         "download",
@@ -1091,12 +1099,11 @@ pub async fn download_size(
         repo_type(kind),
         "--dry-run",
         "--json",
+        "--revision",
+        &commit,
     ])
     .arg("--cache-dir")
     .arg(mount_hub);
-    if let Some(r) = &revision {
-        cmd.args(["--revision", r]);
-    }
     hf_env(&mut cmd, mount_hub);
     let v = hf_json(cmd, "hf download --dry-run").await?;
     let files = v.as_array().cloned().unwrap_or_default();
@@ -1336,6 +1343,322 @@ pub async fn share(
         return Err(NestError::Io(format!("sharing {repo}: {}", msg.trim())));
     }
     Ok(o)
+}
+
+/// `hf cache prune` on the hub: revisions no ref points at (detached) and
+/// incomplete downloads go, with any blob only they used; hf keeps what a
+/// current snapshot or another repo still links. With `dry_run`, hf's own
+/// report of what would go. Repos hf ignores (`repair`) are not seen.
+pub async fn prune(hf: &Path, mount_hub: &Path, dry_run: bool) -> NestResult<serde_json::Value> {
+    let mut cmd = tokio::process::Command::new(hf);
+    cmd.args(["cache", "prune", "--cache-dir"])
+        .arg(mount_hub)
+        .arg("--json")
+        .arg(if dry_run { "--dry-run" } else { "--yes" });
+    hf_env(&mut cmd, mount_hub);
+    let out = output(&mut cmd)
+        .await
+        .map_err(|e| NestError::Io(format!("running {}: {e}", hf.display())))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err
+            .lines()
+            .chain(stdout.lines())
+            .rfind(|l| !l.trim().is_empty())
+            .unwrap_or("failed");
+        return Err(NestError::Invalid(format!(
+            "hf cache prune: {}",
+            msg.trim()
+        )));
+    }
+    Ok(stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .unwrap_or_else(|| serde_json::json!({ "output": stdout.trim() })))
+}
+
+/// One change `repair` makes (or would make) to a repo hf ignores.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairStep {
+    /// `models--org--name`.
+    pub repo: String,
+    /// "point" (a ref to the repo's only snapshot), "drop-ref" (a ref to a
+    /// commit not held, beside a good one), "remove-repo" (no snapshot at
+    /// all: only refs) or "report" (left alone: someone must decide).
+    pub action: String,
+    /// The ref changed or dropped, if any.
+    #[serde(default)]
+    pub r#ref: String,
+    /// The commit it named, and the one it names after.
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    pub why: String,
+}
+
+/// Repos hf ignores because a ref names a commit the hub has no snapshot
+/// of, or the repo has no snapshots, and how to make each true again from
+/// what the hub holds: never from the Hub (its main may have moved on
+/// since the download). A ref to the repo's only snapshot when every ref
+/// is stale; a stale ref dropped beside a good one; a repo of nothing but
+/// refs removed; several snapshots and no good ref only reported. Model
+/// files are never touched. With `apply`, makes the changes.
+pub fn repair(mount_hub: &Path, apply: bool) -> NestResult<Vec<RepairStep>> {
+    let mut out = Vec::new();
+    let mut dirs: Vec<_> = std::fs::read_dir(mount_hub)
+        .map_err(|e| NestError::Io(e.to_string()))?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            (n.starts_with("models--") || n.starts_with("datasets--"))
+                && e.file_type().is_ok_and(|t| t.is_dir())
+        })
+        .collect();
+    dirs.sort_by_key(|e| e.file_name());
+    let io = |e: std::io::Error| NestError::Io(e.to_string());
+    for d in dirs {
+        let repo = d.file_name().to_string_lossy().into_owned();
+        let dir = d.path();
+        let snaps: Vec<String> = std::fs::read_dir(dir.join("snapshots"))
+            .map(|r| {
+                r.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut refs: Vec<(String, String)> = Vec::new();
+        refs_under(&dir.join("refs"), "", &mut refs);
+        refs.sort();
+        let stale: Vec<&(String, String)> =
+            refs.iter().filter(|(_, c)| !snaps.contains(c)).collect();
+        let step = |action: &str, r: &str, from: &str, to: &str, why: String| RepairStep {
+            repo: repo.clone(),
+            action: action.into(),
+            r#ref: r.into(),
+            from: from.into(),
+            to: to.into(),
+            why,
+        };
+        // Only refs and nothing else: what a look at a model (hf's dry run)
+        // or a download that fetched nothing left behind.
+        if snaps.is_empty() {
+            let only_refs = std::fs::read_dir(&dir).map_err(io)?.flatten().all(|e| {
+                matches!(
+                    e.file_name().to_str(),
+                    Some("refs" | "snapshots" | ".locks")
+                )
+            });
+            let blobs_empty = std::fs::read_dir(dir.join("blobs"))
+                .map(|mut r| r.next().is_none())
+                .unwrap_or(true);
+            if !refs.is_empty() && only_refs && blobs_empty {
+                out.push(step(
+                    "remove-repo",
+                    "",
+                    "",
+                    "",
+                    "no snapshot: only refs, nothing downloaded".into(),
+                ));
+                if apply {
+                    std::fs::remove_dir_all(&dir).map_err(io)?;
+                }
+            } else if !refs.is_empty() || !only_refs {
+                out.push(step(
+                    "report",
+                    "",
+                    "",
+                    "",
+                    "no snapshot, but more than refs: look at it".into(),
+                ));
+            }
+            continue;
+        }
+        if stale.is_empty() {
+            continue;
+        }
+        let good = refs.len() - stale.len();
+        for (r, c) in stale {
+            if good > 0 {
+                out.push(step(
+                    "drop-ref",
+                    r,
+                    c,
+                    "",
+                    format!("names {} which is not here; another ref is good", short(c)),
+                ));
+                if apply {
+                    std::fs::remove_file(dir.join("refs").join(r)).map_err(io)?;
+                }
+            } else if snaps.len() == 1 {
+                let to = &snaps[0];
+                out.push(step(
+                    "point",
+                    r,
+                    c,
+                    to,
+                    format!(
+                        "names {} which is not here; the only snapshot is {}",
+                        short(c),
+                        short(to)
+                    ),
+                ));
+                if apply {
+                    let path = dir.join("refs").join(r);
+                    let tmp = path.with_extension("repair.tmp");
+                    std::fs::write(&tmp, to).map_err(io)?;
+                    std::fs::rename(&tmp, &path).map_err(io)?;
+                }
+            } else {
+                out.push(step(
+                    "report",
+                    r,
+                    c,
+                    "",
+                    format!(
+                        "names {} which is not here; {} snapshots to choose from",
+                        short(c),
+                        snaps.len()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every ref under `refs/` (branch names may hold slashes): (name, commit).
+fn refs_under(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+        match e.file_type() {
+            Ok(t) if t.is_dir() => refs_under(&e.path(), &format!("{name}/"), out),
+            Ok(t) if t.is_file() => {
+                if let Ok(c) = std::fs::read_to_string(e.path()) {
+                    out.push((name, c.trim().to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn short(c: &str) -> &str {
+    &c[..c.len().min(12)]
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    fn repo(hub: &Path, name: &str, refs: &[(&str, &str)], snaps: &[&str]) -> PathBuf {
+        let d = hub.join(name);
+        std::fs::create_dir_all(d.join("refs")).unwrap();
+        for (r, c) in refs {
+            std::fs::write(d.join("refs").join(r), c).unwrap();
+        }
+        for s in snaps {
+            std::fs::create_dir_all(d.join("snapshots").join(s)).unwrap();
+            std::fs::write(d.join("snapshots").join(s).join("config.json"), "{}").unwrap();
+            std::fs::create_dir_all(d.join("blobs")).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn stale_refs_are_made_true_from_what_the_hub_holds() {
+        let t = tempfile::tempdir().unwrap();
+        let hub = t.path();
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        // Finish rewrote main to the Hub's newer commit.
+        let one = repo(hub, "models--o--one", &[("main", &b)], &[&a]);
+        // A later download's main beside a good branch.
+        let two = repo(hub, "models--o--two", &[("2bpw", &a), ("main", &b)], &[&a]);
+        // A look at a model: only a ref.
+        let three = repo(hub, "models--o--three", &[("main", &a)], &[]);
+        // Several snapshots and none is main's: someone decides.
+        let four = repo(hub, "models--o--four", &[("main", &c)], &[&a, &b]);
+        // Healthy.
+        repo(hub, "models--o--five", &[("main", &a)], &[&a]);
+        let plan = repair(hub, false).unwrap();
+        let got: Vec<(&str, &str, &str)> = plan
+            .iter()
+            .map(|s| (s.repo.as_str(), s.action.as_str(), s.r#ref.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("models--o--four", "report", "main"),
+                ("models--o--one", "point", "main"),
+                ("models--o--three", "remove-repo", ""),
+                ("models--o--two", "drop-ref", "main"),
+            ]
+        );
+        // A dry run changes nothing.
+        assert_eq!(std::fs::read_to_string(one.join("refs/main")).unwrap(), b);
+        assert!(three.exists());
+
+        repair(hub, true).unwrap();
+        assert_eq!(std::fs::read_to_string(one.join("refs/main")).unwrap(), a);
+        assert!(one.join("snapshots").join(&a).join("config.json").exists());
+        assert!(!two.join("refs/main").exists());
+        assert_eq!(std::fs::read_to_string(two.join("refs/2bpw")).unwrap(), a);
+        assert!(!three.exists());
+        assert_eq!(std::fs::read_to_string(four.join("refs/main")).unwrap(), c);
+        // Nothing left to do but the report.
+        let again = repair(hub, false).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].action, "report");
+    }
+
+    /// With hf and the Hub reachable: sizing a model by its branch (what
+    /// the Download dialog does on every pick) leaves the hub as it was.
+    /// hf's own dry run writes refs/<branch>, which left repos of nothing
+    /// but a ref that hf then ignores.
+    #[tokio::test]
+    async fn sizing_a_model_writes_nothing_into_the_hub() {
+        let Some(hf) = find_hf() else { return };
+        if fetch_driver().is_none() && std::env::var_os("SPARKNEST_HF_FETCH").is_none() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let r = download_size(
+            &hf,
+            t.path(),
+            "hf-internal-testing/tiny-random-gpt2",
+            "model",
+            Some("main"),
+        )
+        .await;
+        let Ok(s) = r else { return }; // offline
+        assert!(s.files > 0 && s.missing_files == s.files, "{s:?}");
+        let left: Vec<_> = std::fs::read_dir(t.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with("models--"))
+            .collect();
+        assert!(left.is_empty(), "sizing left {left:?} in the hub");
+    }
+
+    #[test]
+    fn a_repo_without_snapshots_but_with_files_is_only_reported() {
+        let t = tempfile::tempdir().unwrap();
+        let d = repo(t.path(), "models--o--m", &[("main", &"a".repeat(40))], &[]);
+        std::fs::create_dir_all(d.join("blobs")).unwrap();
+        std::fs::write(d.join("blobs/x"), "data").unwrap();
+        let plan = repair(t.path(), true).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, "report");
+        assert!(d.join("blobs/x").exists());
+    }
 }
 
 #[cfg(test)]

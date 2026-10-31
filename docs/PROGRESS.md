@@ -3,6 +3,17 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-31 — The hub's refs stay true; repair and prune (ADR-076)
+
+hf ignored nine repos whose refs named commits with no snapshot, so they
+could not be deleted. Sizing a repo (every pick in the Download dialog)
+no longer writes a ref, a download writes its ref only once files arrive,
+`nest hf repair` makes the refs true from what the hub holds (dry run on
+production: five refs pointed, one dropped, two ref-only repos removed,
+one dataset reported), and `nest hf prune` runs `hf cache prune` (17
+detached revisions, 3.7 GiB). The Models view's "Tidy hub…" runs both.
+The Place dialog now opens at one copy of each file.
+
 ## 2026-10-31 — Hub downloads onto disks and off-grid hosts (ADR-075)
 
 The Download dialog now has Place's modes (Multi host, Single host,

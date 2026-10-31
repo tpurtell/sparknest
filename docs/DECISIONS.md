@@ -2606,3 +2606,39 @@ for the same options as Place, without replicas.
 
 **Alternatives.** Writing straight into the chosen disk: faster, but it
 changes where writes land (ADR-073 §4), so not for this.
+
+## ADR-076 — The hub's refs stay true: sizing writes nothing, downloads write refs last, `hf repair` and `hf prune` (2026-10-31)
+
+**Context.** TJ could not delete GLM-5.3-Flash-NVFP4: hf skipped the
+repo ("not found"), and removing it host by host is refused (last
+copies). hf ignores any repo whose ref names a commit with no snapshot,
+and nine did. Three causes: (1) before ADR-043, Finish ran `hf download`
+at the Hub's newest main, which rewrote `refs/main` though no file came
+(five repos, all 2026-09-28 07:06–07:24); (2) hf's dry run, which the
+Download dialog runs to size every repo picked, writes `refs/<branch>`
+into the cache it reads, so searching for a model left a repo of nothing
+but a ref (Muse-Spark, never downloaded); (3) a spread download wrote its
+ref before fetching, so one that fetched nothing left the same.
+
+**Decision.**
+1. **Sizing resolves a branch to its commit on the Hub first** (no cache
+   read) and gives hf the commit, where it writes nothing. A test checks
+   sizing leaves an empty hub empty.
+2. **A download writes its ref last,** and only once its snapshot exists.
+3. **`nest hf repair`** (`POST /v1/hf/repair`) makes refs true from what
+   the hub holds, never the Hub (whose main may have moved on): a ref to
+   the repo's only snapshot when every ref is stale; a stale ref dropped
+   beside a good one; a repo of nothing but refs removed; anything else
+   (several snapshots, files without a snapshot) only reported. Model
+   files are never touched. It shows the changes; `--apply` makes them.
+4. **`nest hf prune`** (`POST /v1/hf/prune`) runs `hf cache prune`:
+   revisions no ref points at and incomplete downloads go, with blobs only
+   they used. hf decides what is still linked; sparknest removes each
+   deleted file's copies at once, as for any deletion (no GC of its own,
+   PROPOSAL §11). The Models view's "Tidy hub…" runs repair then prune,
+   each shown and confirmed first.
+
+**Alternatives.** Taking refs from the Hub: claims a commit whose files
+the hub may not have. A delete that falls back to removing folders when
+hf cannot see a repo: once repair makes refs true, hf sees and deletes it,
+keeping the shared store's bookkeeping; a fallback would bypass that.

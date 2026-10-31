@@ -297,21 +297,26 @@ async fn a_download_for_a_disk_moves_onto_it() {
     let p = c.node(1).placer.clone();
     let d = disk_dir(&c, 2, "nvme1");
     let s = p.add_disk("n2", &d, None).await.unwrap();
-    // As a Hub fetch on n2 leaves them: written through n2's mount, so on
-    // its primary disk, under the snapshot.
+    // As a Hub fetch on n2 leaves them: blobs written through n2's mount,
+    // so on its primary disk, and snapshot entries linking to them.
     let v2 = &c.node(2).vfs;
-    let mut dir = FileId::ROOT;
-    for name in ["hub", "models--o--m", "snapshots", "abc"] {
-        dir = v2.mkdir(dir, name.as_bytes(), 0o755).await.unwrap().id;
-    }
+    let hub = v2.mkdir(FileId::ROOT, b"hub", 0o755).await.unwrap().id;
+    let repo = v2.mkdir(hub, b"models--o--m", 0o755).await.unwrap().id;
+    let blobs = v2.mkdir(repo, b"blobs", 0o755).await.unwrap().id;
+    let snaps = v2.mkdir(repo, b"snapshots", 0o755).await.unwrap().id;
+    let snap = v2.mkdir(snaps, b"abc", 0o755).await.unwrap().id;
     let mut files = Vec::new();
     for (i, n) in ["a.safetensors", "b.safetensors"].iter().enumerate() {
+        let blob = format!("e{i}");
         let (a, fh, _) = v2
-            .create(dir, n.as_bytes(), 0o644, oflags::WRONLY)
+            .create(blobs, blob.as_bytes(), 0o644, oflags::WRONLY)
             .await
             .unwrap();
         v2.write(fh, 0, vec![i as u8 + 1; 1 << 20]).await.unwrap();
         v2.release(fh, None).await;
+        v2.symlink(snap, n.as_bytes(), format!("../../blobs/{blob}").as_bytes())
+            .await
+            .unwrap();
         files.push(a.id);
     }
     for f in &files {

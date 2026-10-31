@@ -9,7 +9,7 @@
   import { get, type Repo, type Readiness } from "../lib/api";
   import { app, route, go, targets, runningJobs, startJob, singleFlight } from "../lib/state.svelte";
   import { human, ago, selLabel, splitRepo } from "../lib/format";
-  import { removeFrom } from "../lib/actions";
+  import { removeFrom, tidyHub } from "../lib/actions";
   import JobStrip from "../components/JobStrip.svelte";
   import Drawer from "../components/Drawer.svelte";
   import ModelDetail from "./ModelDetail.svelte";
@@ -150,6 +150,7 @@
       <span class="small muted">{shown.length} repo{shown.length === 1 ? "" : "s"} in {hub}</span>
       <span class="spacer"></span>
       <input type="search" placeholder="filter…" bind:value={q} style="width:200px" />
+      <button class="btn ghost" onclick={tidyHub} title="Repair refs hf ignores, then prune revisions no ref points at (each shown first)">Tidy hub…</button>
       <button class="btn primary" onclick={() => (downloading = true)}><Icon name="download" size={15} /> Download…</button>
     </div>
     <div class="row">

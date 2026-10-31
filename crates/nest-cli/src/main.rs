@@ -496,6 +496,28 @@ enum HfCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// Make the hub's refs true where hf ignores a repo (shows the changes)
+    ///
+    /// hf skips a repo whose ref names a commit the hub has no snapshot of,
+    /// or that has no snapshots, so it can neither list nor delete it. From
+    /// what the hub holds (never the Hub): a ref is pointed at the repo's
+    /// only snapshot, a stale ref beside a good one is dropped, a repo of
+    /// nothing but refs is removed; anything else is reported. Model files
+    /// are never touched. Shows the changes; --apply makes them.
+    Repair {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Remove revisions no ref points at, and incomplete downloads (shows them)
+    ///
+    /// `hf cache prune` on the hub: blobs only those revisions used go too;
+    /// anything a current snapshot or another repo links stays. Run `nest hf
+    /// repair` first: repos hf ignores are not seen. Shows what would go;
+    /// --apply deletes it on every host.
+    Prune {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Delete Hugging Face repos from sparknest's hub (every copy, every host)
     ///
     /// Runs `hf cache rm` on the hub through this host's mount, so hf decides
@@ -2494,6 +2516,72 @@ async fn main() -> Result<()> {
                 let jid = v["job"].as_u64().unwrap_or(0);
                 if *wait { wait_job(&c, jid).await? } else { v }
             }
+        }
+        Cmd::Hf {
+            cmd: HfCmd::Repair { apply },
+        } => {
+            let v = c
+                .post("/v1/hf/repair", json!({ "dry_run": !apply }))
+                .await?;
+            if !cli.json {
+                let steps = v["steps"].as_array().cloned().unwrap_or_default();
+                if steps.is_empty() {
+                    println!("every repo's refs are true: nothing to repair");
+                    return Ok(());
+                }
+                for s in &steps {
+                    let what = match s["action"].as_str().unwrap_or("") {
+                        "point" => {
+                            let to = s["to"].as_str().unwrap_or("");
+                            format!(
+                                "refs/{} → {}",
+                                s["ref"].as_str().unwrap_or(""),
+                                &to[..to.len().min(12)]
+                            )
+                        }
+                        "drop-ref" => format!("drop refs/{}", s["ref"].as_str().unwrap_or("")),
+                        "remove-repo" => "remove the repo (only refs)".to_string(),
+                        _ => "left alone".to_string(),
+                    };
+                    println!(
+                        "  {:<60} {:<32} {}",
+                        s["repo"].as_str().unwrap_or("?"),
+                        what,
+                        s["why"].as_str().unwrap_or("")
+                    );
+                }
+                let act = steps.iter().filter(|s| s["action"] != "report").count();
+                if *apply {
+                    println!("repaired {act} repo change(s)");
+                } else {
+                    println!("would make {act} change(s); `nest hf repair --apply` makes them");
+                }
+                return Ok(());
+            }
+            v
+        }
+        Cmd::Hf {
+            cmd: HfCmd::Prune { apply },
+        } => {
+            let v = c
+                .post(
+                    "/v1/hf/prune",
+                    json!({ "dry_run": !apply, "hf": which("hf") }),
+                )
+                .await?;
+            if !cli.json {
+                let r = &v["report"];
+                if let Some(o) = r["output"].as_str() {
+                    println!("{o}");
+                } else {
+                    println!("{}", serde_json::to_string_pretty(r)?);
+                }
+                if !*apply {
+                    println!("`nest hf prune --apply` deletes it");
+                }
+                return Ok(());
+            }
+            v
         }
         Cmd::Hf {
             cmd:

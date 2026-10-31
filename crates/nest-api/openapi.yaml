@@ -1391,6 +1391,83 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/hf/repair:
+    post:
+      tags: [hf]
+      summary: Make the hub's refs true where hf ignores a repo
+      description: >-
+        hf skips a repo whose ref names a commit with no snapshot, or that has
+        no snapshots (so it can neither list nor delete it). From what the hub
+        holds, never the Hub: a ref to the repo's only snapshot when every ref
+        is stale (`point`), a stale ref beside a good one dropped
+        (`drop-ref`), a repo of nothing but refs removed (`remove-repo`),
+        anything else left for a person (`report`). Model files are never
+        touched (ADR-076).
+      operationId: hfRepair
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: Report what would change; change nothing.
+      responses:
+        "200":
+          description: Each change made, or that would be.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dry_run: { type: boolean }
+                  steps:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        repo: { type: string }
+                        action: { type: string, enum: [point, drop-ref, remove-repo, report] }
+                        ref: { type: string }
+                        from: { type: string }
+                        to: { type: string }
+                        why: { type: string }
+  /v1/hf/prune:
+    post:
+      tags: [hf]
+      summary: Remove detached revisions and incomplete downloads from the hub
+      description: >-
+        `hf cache prune` on sparknest's hub, through this node's mount:
+        revisions no ref points at and incomplete downloads go, with blobs
+        only they used; hf keeps anything a current snapshot or another repo
+        links. Repos hf ignores are not seen (repair them first).
+      operationId: hfPrune
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: hf's report of what would go; nothing is deleted.
+                hf:
+                  type: [string, "null"]
+      responses:
+        "200":
+          description: hf's report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dry_run: { type: boolean }
+                  report: { type: object }
   /v1/hf/share:
     post:
       tags: [hf]

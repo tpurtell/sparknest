@@ -17,7 +17,7 @@
   <div class="bg" onclick={(e) => e.target === e.currentTarget && finish(null)}>
     <div class="dlg panel glowline" role="dialog" aria-modal="true" aria-label={d.title}>
       <h3>{d.title}</h3>
-      {#if d.body}<p class="muted">{d.body}</p>{/if}
+      {#if d.body}<p class="muted body">{d.body}</p>{/if}
       {#if d.kind === "pick"}
         <div class="opts">
           {#each d.options as o}
@@ -43,6 +43,7 @@
 {/if}
 
 <style>
+  .body { white-space: pre-line; overflow-wrap: anywhere; max-height: 50vh; overflow: auto; }
   .bg { position: fixed; inset: 0; z-index: 85; grid-template-columns: minmax(0, 1fr); background: rgba(1, 4, 12, 0.6); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(3px); }
   /* min-width 0: a long unbroken title (a blob path) must not widen the
      dialog past the screen; it wraps instead. */
