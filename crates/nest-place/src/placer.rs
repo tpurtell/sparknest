@@ -1778,9 +1778,12 @@ impl Placer {
         }
     }
 
-    /// Download a Hugging Face repo spread over `hosts` (every serving host
-    /// when empty; one host for a single-host download): the files no host
-    /// has, each on the host assigned to it, so its first copy lands there.
+    /// Download a Hugging Face repo spread over `hosts`, places as in Place
+    /// (every serving fabric host when empty; one for a single-place
+    /// download): the files no host has, each on the place assigned to it,
+    /// so its only copy lands there. A file for a host's extra disk is
+    /// fetched through that host's mount and then moved onto the disk
+    /// (ADR-075).
     /// At most `in_flight` files download at once across the cluster; a
     /// fetch that stalls is given up on, and a host that fails twice in a
     /// row hands its files to the others (`hfimport::Schedule`). Without
@@ -1810,37 +1813,64 @@ impl Placer {
             (Some(r), _) if !is_sha(r) => Some(r.clone()),
             _ => None,
         };
-        // Where: the hosts named, else every serving fabric host (off-grid
-        // hosts only when named); room is free space above the margin
-        // spread imports keep.
+        // Where: the places named (hosts, a host's disks, off-grid hosts;
+        // ADR-075), else every serving fabric host; room is free space
+        // above the margin spread imports keep.
         let status = self.status().await?;
         let offgrid = self.vfs.offgrid_hosts();
-        let wanted: Vec<NodeId> = if hosts.is_empty() {
-            status
-                .iter()
-                .filter(|s| s.info.as_ref().is_some_and(|i| i.serving))
-                .map(|s| s.node)
-                .filter(|n| !offgrid.contains(n))
+        let wanted: Vec<HostRef> = if hosts.is_empty() {
+            self.nodes()?
+                .into_iter()
+                .filter(|h| !offgrid.contains(&h.node))
+                .filter(|h| {
+                    status
+                        .iter()
+                        .any(|s| s.node == h.node && s.info.as_ref().is_some_and(|i| i.serving))
+                })
                 .collect()
         } else {
-            self.resolve_hosts(&hosts)?
-                .into_iter()
-                .map(|h| h.node)
-                .collect()
+            self.resolve_places(&hosts)?
         };
-        // A host named alone gets what fits in its free space; hosts the
+        let disks: HashMap<StoreId, admin::DiskInfo> =
+            if wanted.iter().any(|p| p.node.0 >= StoreId::DISK_BASE) {
+                self.disks()
+                    .await?
+                    .into_iter()
+                    .filter_map(|(_, r)| r.ok())
+                    .flatten()
+                    .map(|d| (d.store, d))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+        // A place named alone gets what fits in its free space; places the
         // planner chooses among keep the margin.
         let named_one = hosts.len() == 1 && wanted.len() == 1;
         let mut nodes = Vec::new();
         let mut fhosts = Vec::new();
-        for s in status.iter().filter(|s| wanted.contains(&s.node)) {
-            let (free, total) = s
-                .info
-                .as_ref()
-                .map_or((0, 0), |i| (i.free_bytes, i.total_bytes));
-            nodes.push(s.node);
+        // Per place, the disk its files move to once fetched (None: they
+        // stay where the mount wrote them, the host's primary disk).
+        let mut onto: Vec<Option<StoreId>> = Vec::new();
+        for p in &wanted {
+            let node = crate::plan::host_of(p.node);
+            let store = crate::plan::store_of(p.node);
+            let serving = status
+                .iter()
+                .find(|s| s.node == node)
+                .and_then(|s| s.info.as_ref())
+                .filter(|i| i.serving);
+            let (free, total) = if store == node.live_store() {
+                serving.map_or((0, 0), |i| (i.free_bytes, i.total_bytes))
+            } else {
+                match (serving, disks.get(&store).filter(|d| d.healthy)) {
+                    (Some(_), Some(d)) => (d.free_bytes, d.total_bytes),
+                    _ => (0, 0),
+                }
+            };
+            nodes.push(node);
+            onto.push((store != node.live_store()).then_some(store));
             fhosts.push(FetchHost {
-                name: s.name.clone(),
+                name: p.name.clone(),
                 room: if named_one {
                     free
                 } else {
@@ -1975,6 +2005,14 @@ impl Placer {
                 moved: std::time::Instant,
             }
             let mut running: Vec<Running> = Vec::new();
+            // Moves onto disks, each one fetch's files (ADR-075).
+            let mut moves: Vec<tokio::task::JoinHandle<Vec<String>>> = Vec::new();
+            let snap_ns = format!(
+                "{}/{}/snapshots/{}",
+                hub.trim_end_matches('/'),
+                crate::hfimport::repo_dir(&kind, &repo),
+                plan.sha
+            );
             let n = sched.hosts.len();
             let mut done_bytes = vec![0u64; n];
             let mut done_files = vec![0u64; n];
@@ -2047,11 +2085,13 @@ impl Placer {
                         still.push(r);
                         continue;
                     }
+                    let mut landed = Vec::new();
                     for f in &r.last.files {
                         if f.state == FetchState::Done {
                             done_bytes[r.host] += f.size;
                             done_files[r.host] += 1;
                             sched.done(r.host);
+                            landed.push(f.name.clone());
                         } else {
                             let why = if f.error.is_empty() {
                                 r.last.error.clone().unwrap_or_else(|| "not fetched".into())
@@ -2061,6 +2101,16 @@ impl Placer {
                             tracing::warn!(file = %f.name, host = %name, error = %why, "hf fetch failed");
                             sched.failed(r.host, (f.name.clone(), f.size), &why);
                         }
+                    }
+                    // Fetched for one of the host's disks: the mount wrote
+                    // them to its primary; move them over (ADR-075).
+                    if let Some(to) = onto[r.host]
+                        && !landed.is_empty()
+                    {
+                        let (me, node, dir) = (me.clone(), nodes[r.host], snap_ns.clone());
+                        moves.push(tokio::spawn(async move {
+                            me.settle_onto(node, &dir, landed, to).await
+                        }));
                     }
                 }
                 running = still;
@@ -2090,8 +2140,19 @@ impl Placer {
                     p.total_files = sched.given_files[i].max(done_files[i]);
                 }
             }
+            let mut unmoved = Vec::new();
+            for m in moves {
+                unmoved.extend(m.await.unwrap_or_default());
+            }
             let mut j = job.lock();
             j.notes.append(&mut sched.notes);
+            if !unmoved.is_empty() {
+                j.notes.push(format!(
+                    "{} files stayed on their host's primary disk, not the disk picked (e.g. {}); `nest replicate` them there",
+                    unmoved.len(),
+                    unmoved[0]
+                ));
+            }
             for p in j.hosts.values_mut() {
                 p.finished = true;
             }
@@ -2110,6 +2171,76 @@ impl Placer {
             me.downloads.lock().release(&key, id);
         });
         Ok((id, false))
+    }
+
+    /// Move freshly fetched files of a snapshot (`dir`, a namespace path)
+    /// from `node`'s primary disk onto its disk `to` (ADR-075). Returns the
+    /// files that could not be moved (they stay on the primary).
+    pub async fn settle_onto(
+        self: &Arc<Self>,
+        node: NodeId,
+        dir: &str,
+        names: Vec<String>,
+        to: StoreId,
+    ) -> Vec<String> {
+        let mut files = Vec::new();
+        let mut unmoved = Vec::new();
+        match self.conn() {
+            Ok(c) => {
+                for n in names {
+                    match selector::resolve_path(&c, &format!("{dir}/{n}"))
+                        .ok()
+                        .and_then(|(f, _)| Some((f, query::getattr(&c, f).ok()??.size)))
+                    {
+                        Some(f) => files.push(f),
+                        None => unmoved.push(n),
+                    }
+                }
+            }
+            Err(_) => return names,
+        }
+        if files.is_empty() {
+            return unmoved;
+        }
+        let hid = rand::random::<u64>();
+        let started = admin::call(
+            self.rpc(),
+            node,
+            &AdminReq::MoveLocal {
+                job: hid,
+                files: files.clone(),
+                from: node.live_store(),
+                to: vec![to],
+            },
+            Duration::from_secs(30),
+        )
+        .await;
+        if let Err(e) = started {
+            tracing::warn!(error = %e, store = to.0, "moving downloaded files onto the disk");
+            unmoved.extend(files.iter().map(|(f, _)| format!("file {}", f.0)));
+            return unmoved;
+        }
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match admin::call(
+                self.rpc(),
+                node,
+                &AdminReq::JobStatus { job: hid },
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                Ok(AdminResp::Job(p)) if p.finished => {
+                    for (f, why) in p.failed {
+                        tracing::warn!(file = f.0, error = %why, "downloaded file not moved onto its disk");
+                        unmoved.push(format!("file {}", f.0));
+                    }
+                    return unmoved;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "polling a move onto a disk"),
+            }
+        }
     }
 
     /// Download a Hugging Face repo into an archive store (ADR-055), on

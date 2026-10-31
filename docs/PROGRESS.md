@@ -3,6 +3,15 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-31 — Hub downloads onto disks and off-grid hosts (ADR-075)
+
+The Download dialog now has Place's modes (Multi host, Single host,
+Off-grid, Archive) over places, so a model can go straight to
+`raptor (D2)`/`(D3)` or be spread over off-grid hosts; one copy of each
+file, no replicas. Files for an extra disk are fetched through the
+host's mount and moved onto the disk as each fetch finishes. Test:
+`a_download_for_a_disk_moves_onto_it` (nest-testkit `disks`).
+
 ## 2026-10-31 — 0.7.1: remote reads run no metadata queries
 
 - cuteafd's remote random 4 KiB gathers on raptor capped at ~58K reads/s

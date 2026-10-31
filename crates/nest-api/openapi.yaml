@@ -1592,10 +1592,10 @@ paths:
                 host:
                   type: string
                   default: ""
-                  description: One host to download everything to.
+                  description: One place to download everything to (a host, a host's disk such as `raptor (D2)`, or an off-grid host).
                 hosts:
                   type: array
-                  description: Hosts or @groups to spread over; every serving host when empty and no `host`.
+                  description: Places or @groups to spread over (hosts, a host's disks, off-grid hosts; ADR-075); every serving fabric host when empty and no `host`.
                   items:
                     type: string
                 revision:

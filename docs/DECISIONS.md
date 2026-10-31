@@ -2579,3 +2579,30 @@ released.
 
 **Alternatives.** One copy per host with an automatic disk (ADR-073 as
 first built): see Context.
+
+## ADR-075 — Hub downloads pick places as Place does (2026-10-31; amends ADR-049 §4)
+
+**Context.** After raptor's two 8 TB disks were added, TJ found the
+Download dialog could not put a model on `raptor (D2)`, and its spread
+left the off-grid hosts out. The request took host names only, and
+ADR-049 §4 kept spreads fabric-only from when off-grid hosts were
+dial-in only (since ADR-071 they are dialled like any member). TJ asked
+for the same options as Place, without replicas.
+
+**Decision.**
+1. **Places, as in Place.** A download's `host`/`hosts` take places:
+   hosts, a host's disks (`raptor (D2)`), off-grid hosts and `@groups`.
+   Empty still means every serving fabric host. Each file is downloaded
+   once and gets one copy: there is no replica factor.
+2. **The dialog matches Place.** Multi host (fabric places, the hosts'
+   own disks picked to start), Single host, Off-grid (a spread over the
+   off-grid hosts picked) and Archive, as tiles with free space.
+3. **Onto a disk by moving.** The Hub is fetched through the host's
+   mount, so a file lands on its primary disk. A file for one of its
+   extra disks is moved there (`MoveLocal`, as a drain) once its fetch
+   finishes; only fetches in flight take room on the primary. A file
+   that cannot be moved stays on the primary and the job says so.
+4. **Room is the place's own:** a disk's free space, not its host's.
+
+**Alternatives.** Writing straight into the chosen disk: faster, but it
+changes where writes land (ADR-073 §4), so not for this.

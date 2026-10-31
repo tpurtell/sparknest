@@ -290,3 +290,58 @@ async fn a_disk_is_drained_and_removed_and_an_unmounted_one_is_never_used() {
     p.remove_disk("n2 (D2)", false).await.unwrap();
     assert!(p.find_disk("n2 (D2)").is_err());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_download_for_a_disk_moves_onto_it() {
+    let c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    let d = disk_dir(&c, 2, "nvme1");
+    let s = p.add_disk("n2", &d, None).await.unwrap();
+    // As a Hub fetch on n2 leaves them: written through n2's mount, so on
+    // its primary disk, under the snapshot.
+    let v2 = &c.node(2).vfs;
+    let mut dir = FileId::ROOT;
+    for name in ["hub", "models--o--m", "snapshots", "abc"] {
+        dir = v2.mkdir(dir, name.as_bytes(), 0o755).await.unwrap().id;
+    }
+    let mut files = Vec::new();
+    for (i, n) in ["a.safetensors", "b.safetensors"].iter().enumerate() {
+        let (a, fh, _) = v2
+            .create(dir, n.as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v2.write(fh, 0, vec![i as u8 + 1; 1 << 20]).await.unwrap();
+        v2.release(fh, None).await;
+        files.push(a.id);
+    }
+    for f in &files {
+        c.eventually("stable", Duration::from_secs(5), |c| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+        .await;
+        assert_eq!(stores_of(&c, *f), vec![StoreId(2)]);
+    }
+    let unmoved = p
+        .settle_onto(
+            NodeId(2),
+            "/hub/models--o--m/snapshots/abc",
+            vec![
+                "a.safetensors".into(),
+                "b.safetensors".into(),
+                "gone".into(),
+            ],
+            s,
+        )
+        .await;
+    // The one that is not there is reported; the others are on the disk only.
+    assert_eq!(unmoved, vec!["gone".to_string()]);
+    c.converge().await;
+    for (i, f) in files.iter().enumerate() {
+        assert_eq!(stores_of(&c, *f), vec![s]);
+        assert_eq!(
+            read_all(&c.node(3).vfs, *f).await,
+            vec![i as u8 + 1; 1 << 20]
+        );
+    }
+}

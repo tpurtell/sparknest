@@ -1164,11 +1164,12 @@ struct HfDownloadReq {
     repo: String,
     #[serde(default)]
     kind: String,
-    /// One host to download everything to.
+    /// One place to download everything to: a host, one of its disks, or
+    /// an off-grid host (ADR-075).
     #[serde(default)]
     host: String,
-    /// Hosts or @groups to spread the files over (default: every serving
-    /// host, unless `host` is given).
+    /// Places or @groups to spread the files over (default: every serving
+    /// fabric host, unless `host` is given).
     #[serde(default)]
     hosts: Vec<String>,
     revision: Option<String>,
