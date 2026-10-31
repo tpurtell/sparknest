@@ -3,6 +3,11 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-10-31 — 0.7.2 released
+
+ADR-075 and ADR-076 below. Rolled to every host but maxq (a quant running);
+maxq follows when it ends.
+
 ## 2026-10-31 — The hub's refs stay true; repair and prune (ADR-076)
 
 hf ignored nine repos whose refs named commits with no snapshot, so they
