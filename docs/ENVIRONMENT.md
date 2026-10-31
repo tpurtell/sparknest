@@ -69,6 +69,23 @@ switch ports allow jumbo; a host at 9000 talking TCP to it would hang.
   196 Gb/s, rdmasync 168 Gb/s, one rail 94 Gb/s; raptor two-flow raw 160 Gb/s.
 - Management/LAN: 172.22.x.x (raptor 172.22.2.12, ostrich 172.22.2.1). NAS
   `aviary` at 172.22.1.10 over 10G.
+- raptor's 10.55.0.22 comes from DHCP; 10.55.1.22 is static. At 100G a
+  Spark offers only rail 0 (10.55.0.N), so a daemon started before the DHCP
+  address arrives has no rail in common with any Spark and every RDMA link
+  is refused until a restart (2026-10-31, after the NVMe install reboot).
+  `/etc/systemd/system/sparknestd@sparknest.service.d/wait-fabric.conf` on
+  raptor makes the daemon wait up to 60 s for both addresses, then start
+  anyway.
+- raptor's 10G LAN port is the Aquantia (`atlantic`) one. Adding PCIe
+  devices renames it (`enp172s0` became `enp174s0` with the two 8 TB NVMe
+  drives): its MAC is unchanged, but systemd-networkd's DHCP client ID
+  follows the name, so the 172.22.2.12 reservation missed and it came up
+  on 172.22.220.3 until TJ rebound it at the switch. The off-grid hosts
+  reach raptor at 172.22.2.12, so their sessions fail while it is wrong.
+- raptor's extra disks (ADR-074): `raptor (D2)` = `/mnt/fast8t/srv/sparknest`
+  (Samsung 9100 PRO 8 TB, PCIe 5 x4), `raptor (D3)` =
+  `/mnt/slow8t/srv/sparknest` (same model in a PCIe 4 slot, 16 GT/s). Both
+  btrfs, `nofail` in fstab, added 2026-10-31.
 
 ### LAN standby for the fabric hosts (ADR-057, 0.5.0)
 
