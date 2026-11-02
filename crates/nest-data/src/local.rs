@@ -99,6 +99,9 @@ pub(crate) struct State {
     pub(crate) fenced: HashSet<(StoreId, ObjectKey)>,
     /// Working objects ready for writes.
     pub(crate) ready: HashSet<ObjectKey>,
+    /// Working objects kept on one of this host's disks instead of its
+    /// primary (ADR-077); metadata knows only the owner, not the disk.
+    pub(crate) working_on: HashMap<ObjectKey, StoreId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -330,6 +333,123 @@ impl DataNode {
         });
         self.disks.lock().insert(id, a.clone());
         Some(a)
+    }
+
+    /// The store holding this host's working object `key` (ADR-077): one
+    /// of its disks for a new file placed there, else its primary.
+    pub fn working_store(&self, key: ObjectKey) -> Arc<ObjectStore> {
+        self.working_store_id(key).1
+    }
+
+    /// `working_store` with the store's id.
+    pub fn working_store_id(&self, key: ObjectKey) -> (StoreId, Arc<ObjectStore>) {
+        let on = self.st.lock().working_on.get(&key).copied();
+        if let Some(s) = on
+            && let Some(d) = self.disk(s)
+        {
+            return (s, d.store.clone());
+        }
+        (self.id.live_store(), self.store.clone())
+    }
+
+    /// Look for working object `key` on this host's disks (after a crash
+    /// nothing in memory says where it was) and remember where it is.
+    pub fn find_working(&self, key: ObjectKey) -> bool {
+        match self.disks().into_iter().find(|d| d.store.exists(key)) {
+            Some(d) => {
+                self.st.lock().working_on.insert(key, d.id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget where working object `key` was (its ownership ended).
+    pub fn working_done(&self, key: ObjectKey) {
+        self.st.lock().working_on.remove(&key);
+    }
+
+    /// The command ending a write epoch of `generation` whose working
+    /// object is in store `on`: `Finalize` records the copy on this host's
+    /// primary, so one on a disk (ADR-077) has that record moved to the
+    /// disk in the same step, with commands every host already applies.
+    pub fn finalize_on(
+        &self,
+        file: FileId,
+        epoch: nest_types::Epoch,
+        generation: Generation,
+        size: u64,
+        mtime: nest_types::Timestamp,
+        on: StoreId,
+    ) -> nest_meta::Command {
+        let fin = nest_meta::Command::Finalize {
+            file,
+            epoch,
+            size,
+            mtime,
+            now: nest_types::Timestamp::now(),
+        };
+        let mine = self.id.live_store();
+        if on == mine {
+            return fin;
+        }
+        nest_meta::Command::Batch(vec![
+            fin,
+            nest_meta::Command::PublishReplica {
+                file,
+                generation,
+                store: on,
+            },
+            nest_meta::Command::RetireReplica {
+                file,
+                generation,
+                store: mine,
+                allow_last: true,
+            },
+        ])
+    }
+
+    /// Where a new file written through this host goes (ADR-077): by the
+    /// host's `new-files` policy among its primary and usable disks, a
+    /// disk that cannot take it falling back to the primary.
+    pub fn pick_new_store(&self) -> StoreId {
+        let mine = self.id.live_store();
+        let disks = self.disks();
+        if disks.is_empty() {
+            return mine;
+        }
+        let policy = self
+            .with_reader(|c| {
+                c.query_row(
+                    "SELECT v FROM kv WHERE k = ?1",
+                    [format!("setting:{}", nest_types::NewFiles::key(self.id))],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .map(|v| nest_types::NewFiles::decode(v as u64))
+            .unwrap_or_default();
+        if let Some(s) = policy.fixed_store(self.id) {
+            return if s == mine || disks.iter().any(|d| d.id == s) {
+                s
+            } else {
+                mine
+            };
+        }
+        // Room each could still take: the primary keeps its data reserve
+        // for the metadata and Raft log (ADR-024).
+        let mut room: Vec<(StoreId, u64)> = vec![(
+            mine,
+            self.store
+                .capacity()
+                .map(|c| c.free.saturating_sub(self.store.reserve()))
+                .unwrap_or(0),
+        )];
+        room.extend(
+            disks
+                .iter()
+                .filter_map(|d| Some((d.id, d.store.capacity().ok()?.free))),
+        );
+        pick_by_room(&room, policy, rand::random::<f64>())
     }
 
     /// This host's disks that are usable now.
@@ -598,10 +718,12 @@ impl DataNode {
             } if *owner == self.id => {
                 let key = ObjectKey::new(*file, *generation);
                 let mut st = self.st.lock();
-                st.fenced.insert((mine, key));
+                // Wherever it was being written (ADR-077).
+                let on = st.working_on.remove(&key).unwrap_or(mine);
+                st.fenced.insert((on, key));
                 st.ready.remove(&key);
                 drop(st);
-                self.submit(ObjOp::Delete(mine, key));
+                self.submit(ObjOp::Delete(on, key));
             }
             Effect::OwnershipGranted {
                 file,
@@ -668,12 +790,22 @@ impl DataNode {
                 }
             }
             ObjOp::Prepare { key, from } => {
-                let r = if self.store.exists(key) {
+                // A new file goes where the host's policy says (ADR-077),
+                // chosen here off the apply path; a rewrite converts the
+                // copy it has, on the primary, in place.
+                if from.is_none() && key.generation.0 == 1 && !self.store.exists(key) {
+                    let on = self.pick_new_store();
+                    if on != self.id.live_store() {
+                        self.st.lock().working_on.insert(key, on);
+                    }
+                }
+                let st = self.working_store(key);
+                let r = if st.exists(key) {
                     Ok(())
-                } else if let Some(from) = from.filter(|f| self.store.exists(*f)) {
-                    self.store.rekey(from, key)
+                } else if let Some(from) = from.filter(|f| st.exists(*f)) {
+                    st.rekey(from, key)
                 } else {
-                    self.store.create(key).map(|_| ())
+                    st.create(key).map(|_| ())
                 };
                 match r {
                     Ok(()) => {
@@ -732,27 +864,37 @@ impl DataNode {
         let me = self.id;
         let disks: Vec<Arc<Archive>> = self.disks();
         let m2 = meta.clone();
-        let mut report =
-            tokio::task::spawn_blocking(move || reconcile_blocking(&meta, &store, me)).await??;
-        // Each usable disk the same way (ADR-073); copies on a disk that is
-        // not mounted stay listed and unread until it is back.
+        // Each usable disk first (ADR-073); copies on a disk that is not
+        // mounted stay listed and unread until it is back. A disk keeps the
+        // working objects of files written there (ADR-077), so the
+        // primary's pass knows not to recreate them.
         let mut disk_missing = Vec::new();
+        let mut on_disks: HashMap<ObjectKey, StoreId> = HashMap::new();
+        let mut disk_report = ReconcileReport::default();
         for d in disks {
             let (m, st, id) = (m2.clone(), d.store.clone(), d.id);
-            match tokio::task::spawn_blocking(move || reconcile_disk(&m, &st, id)).await? {
-                Ok(r) => {
-                    report.kept += r.kept;
-                    report.deleted.extend(r.deleted.iter().copied());
+            match tokio::task::spawn_blocking(move || reconcile_disk(&m, &st, id, me)).await? {
+                Ok((r, working)) => {
+                    disk_report.kept += r.kept;
+                    disk_report.deleted.extend(r.deleted.iter().copied());
                     disk_missing.extend(r.missing.into_iter().map(|k| (id, k)));
+                    on_disks.extend(working.into_iter().map(|k| (k, id)));
                 }
                 Err(e) => tracing::error!(disk = %d.name, error = %e, "reconciling a disk failed"),
             }
         }
+        let elsewhere: HashSet<ObjectKey> = on_disks.keys().copied().collect();
+        let mut report =
+            tokio::task::spawn_blocking(move || reconcile_blocking(&meta, &store, me, &elsewhere))
+                .await??;
+        report.kept += disk_report.kept;
+        report.deleted.extend(disk_report.deleted);
         self.retire_disk_missing(disk_missing);
         let mut st = self.st.lock();
         let mine = me.live_store();
         st.fenced
             .retain(|(s, k)| *s != mine || !report.deleted.contains(k));
+        st.working_on.extend(on_disks);
         let owned = {
             let c = self.meta().open_reader()?;
             query::owned_by(&c, me)?
@@ -875,23 +1017,50 @@ impl DataNode {
             };
             for a in owned {
                 let key = ObjectKey::new(a.id, a.generation);
-                let (size, mtime) = match self.store.stat(key) {
+                let (on, st) = self.working_store_id(key);
+                let (size, mtime) = match st.stat(key) {
                     Ok(s) => s,
                     Err(_) => (a.size, a.mtime),
                 };
-                let now = nest_types::Timestamp::now();
                 let r = meta
-                    .propose(nest_meta::Command::Finalize {
-                        file: a.id,
-                        epoch: a.epoch,
-                        size,
-                        mtime,
-                        now,
-                    })
+                    .propose(self.finalize_on(a.id, a.epoch, a.generation, size, mtime, on))
                     .await;
+                self.working_done(key);
                 tracing::info!(file = %a.id, ?r, "finalized ownership left by previous run");
             }
         });
+    }
+}
+
+/// The store `policy` (weighted or most free) picks from `room` (bytes each
+/// could still take), `roll` in `[0, 1)`. A store with no room is never
+/// picked unless none has any: then the first (the primary).
+pub fn pick_by_room(room: &[(StoreId, u64)], policy: nest_types::NewFiles, roll: f64) -> StoreId {
+    let total: u64 = room.iter().map(|(_, r)| r).sum();
+    if total == 0 {
+        return room[0].0;
+    }
+    match policy {
+        nest_types::NewFiles::MostFree => {
+            room.iter()
+                .max_by_key(|(s, r)| (*r, std::cmp::Reverse(*s)))
+                .expect("non-empty")
+                .0
+        }
+        _ => {
+            let mut at = (roll * total as f64) as u64;
+            for (s, r) in room {
+                if at < *r {
+                    return *s;
+                }
+                at -= r;
+            }
+            room.iter()
+                .rev()
+                .find(|(_, r)| *r > 0)
+                .expect("some room")
+                .0
+        }
     }
 }
 
@@ -899,6 +1068,7 @@ fn reconcile_blocking(
     meta: &MetaNode,
     store: &ObjectStore,
     me: NodeId,
+    elsewhere: &HashSet<ObjectKey>,
 ) -> anyhow::Result<ReconcileReport> {
     let c = meta.open_reader()?;
     let expected: HashSet<ObjectKey> = query::store_inventory(&c, me.live_store())?
@@ -913,7 +1083,7 @@ fn reconcile_blocking(
     for a in &owned {
         let key = ObjectKey::new(a.id, a.generation);
         keep.insert(key);
-        if disk.contains(&key) {
+        if disk.contains(&key) || elsewhere.contains(&key) {
             continue;
         }
         // Crash between committing ownership and converting the object:
@@ -955,24 +1125,35 @@ fn reconcile_blocking(
     Ok(report)
 }
 
-/// A disk holds copies only (never working objects): keep what metadata
-/// lists, remove the rest, report what is missing.
+/// A disk holds copies and the working objects of new files written to
+/// it (ADR-077): keep what metadata lists and what this host still owns,
+/// remove the rest, report what is missing. Returns the working objects
+/// found too.
 fn reconcile_disk(
     meta: &MetaNode,
     store: &ObjectStore,
     id: StoreId,
-) -> anyhow::Result<ReconcileReport> {
+    me: NodeId,
+) -> anyhow::Result<(ReconcileReport, Vec<ObjectKey>)> {
     let c = meta.open_reader()?;
     let expected: HashSet<ObjectKey> = query::store_inventory(&c, id)?
         .into_iter()
         .map(|(f, g)| ObjectKey::new(f, g))
         .collect();
+    let owned: HashSet<ObjectKey> = query::owned_by(&c, me)?
+        .into_iter()
+        .map(|a| ObjectKey::new(a.id, a.generation))
+        .collect();
     drop(c);
     let disk: HashSet<ObjectKey> = store.scan()?.into_iter().map(|o| o.key).collect();
     let mut report = ReconcileReport::default();
+    let mut working = Vec::new();
     for k in &disk {
         if expected.contains(k) {
             report.kept += 1;
+        } else if owned.contains(k) {
+            report.kept += 1;
+            working.push(*k);
         } else {
             store.delete(*k)?;
             report.deleted.push(*k);
@@ -980,7 +1161,7 @@ fn reconcile_disk(
     }
     report.missing = expected.difference(&disk).copied().collect();
     report.missing.sort();
-    Ok(report)
+    Ok((report, working))
 }
 
 async fn worker(
@@ -1000,5 +1181,51 @@ async fn worker(
         {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_by_room;
+    use nest_types::{NewFiles, StoreId};
+
+    #[test]
+    fn new_files_pick_by_room() {
+        let room = [(StoreId(1), 100), (StoreId(2), 300), (StoreId(3), 0)];
+        assert_eq!(pick_by_room(&room, NewFiles::MostFree, 0.0), StoreId(2));
+        // Weighted: the roll walks the room in order; an empty disk never.
+        assert_eq!(pick_by_room(&room, NewFiles::Weighted, 0.0), StoreId(1));
+        assert_eq!(pick_by_room(&room, NewFiles::Weighted, 0.24), StoreId(1));
+        assert_eq!(pick_by_room(&room, NewFiles::Weighted, 0.26), StoreId(2));
+        assert_eq!(
+            pick_by_room(&room, NewFiles::Weighted, 0.999_999),
+            StoreId(2)
+        );
+        // About a quarter on the first over many rolls.
+        let n = (0..1000)
+            .filter(|i| pick_by_room(&room, NewFiles::Weighted, *i as f64 / 1000.0) == StoreId(1))
+            .count();
+        assert_eq!(n, 250);
+        // Nothing has room: the primary, where ENOSPC is reported.
+        assert_eq!(
+            pick_by_room(&[(StoreId(1), 0), (StoreId(2), 0)], NewFiles::Weighted, 0.5),
+            StoreId(1)
+        );
+    }
+
+    #[test]
+    fn new_files_encoding_round_trips() {
+        for p in [
+            NewFiles::Weighted,
+            NewFiles::MostFree,
+            NewFiles::Disk(0),
+            NewFiles::Disk(2),
+        ] {
+            assert_eq!(NewFiles::decode(p.encode()), p);
+        }
+        let n = nest_types::NodeId(1);
+        assert_eq!(NewFiles::Disk(0).fixed_store(n), Some(StoreId(1)));
+        assert_eq!(NewFiles::Disk(1).fixed_store(n), Some(n.disk_store(1)));
+        assert_eq!(NewFiles::Weighted.fixed_store(n), None);
     }
 }

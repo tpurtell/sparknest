@@ -3,6 +3,22 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-02 — New files spread over a host's disks; disk-aware import; quiet rules (ADR-077, ADR-078)
+
+- New files written through a mount go to a host's disks by its
+  `new-files` policy: weighted by free space (default), most free, or one
+  disk. Written there directly, finalized there, found again after a
+  crash (`new_files_go_where_their_host_says_and_survive_a_crash_mid_write`).
+- Imports hard-link into the store on the source's filesystem, clone
+  across btrfs subvolumes, and copy only as a last resort, so a quant in
+  `~/Developer` on fast8t links into D2 with nothing copied
+  (`an_import_links_into_the_disk_its_files_are_on`,
+  `link_from_another_subvolume_clones`).
+- Satisfied automatic rules no longer start empty jobs (eight every 17 s
+  on production while maxq quantized); hosts keep 200 finished jobs.
+- Rules and Jobs show the model, file count and size; full paths in a
+  Details dialog.
+
 ## 2026-10-31 — 0.7.2 released
 
 ADR-075 and ADR-076 below. Rolled to every host but maxq (a quant running);

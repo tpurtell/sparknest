@@ -21,7 +21,7 @@
 use nest_data::{Archive, Vfs};
 use nest_meta::{Command, Reply, SealPolicy, query};
 use nest_store::ObjectKey;
-use nest_types::{FileId, NestError, NestResult, Timestamp};
+use nest_types::{FileId, NestError, NestResult, StoreId, Timestamp};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::os::unix::ffi::OsStrExt;
@@ -349,6 +349,44 @@ fn full(pending: &[Pending]) -> bool {
     pending.len() >= BATCH || pending.iter().map(|p| p.size).sum::<u64>() >= COPY_BATCH_BYTES
 }
 
+/// One file into whichever of `stores` (a host's own: primary, then its
+/// disks) can link it, else with `copy` a copy into `stores[copy_into]`.
+/// Returns the index of the store that took it and whether it was copied.
+fn place_any(
+    stores: &[Arc<nest_store::ObjectStore>],
+    copy_into: usize,
+    src: &std::path::Path,
+    key: ObjectKey,
+    copy: bool,
+    progress: &Mutex<ImportProgress>,
+) -> Result<(usize, bool), String> {
+    // A hard link where one can be made (the store on the source's own
+    // filesystem), then a clone (another subvolume of the same btrfs).
+    for clone in [false, true] {
+        for (i, st) in stores.iter().enumerate() {
+            let r = if clone {
+                st.reflink_from(src, key)
+            } else {
+                st.hard_link_from(src, key)
+            };
+            match r {
+                Ok(_) => return Ok((i, false)),
+                // Another filesystem, or one that does not clone.
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::EINVAL)
+                    ) && (clone || e.raw_os_error() == Some(libc::EXDEV)) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(format!("{}: {e}", src.display())),
+            }
+        }
+    }
+    place(&stores[copy_into], src, key, copy, progress).map(|c| (copy_into, c))
+}
+
 /// One file into the store under `key`: a hard link, or with `copy` (and
 /// only when linking is impossible across filesystems) a copy. Returns
 /// whether it was copied.
@@ -443,21 +481,39 @@ async fn flush(
         Reply::FileIds(f) => f,
         other => return Err(NestError::Io(format!("unexpected {other:?}"))),
     };
-    let store = match archive {
-        Some(a) => a.store.clone(),
-        None => vfs.data().store().clone(),
-    };
     let me = vfs.data().id();
+    // Where the files can go: an archive's objects, or this host's own
+    // stores, each file linked into whichever shares its filesystem (a
+    // quant written on a disk links into that disk's store, ADR-077).
+    let (stores, ids): (Vec<Arc<nest_store::ObjectStore>>, Vec<StoreId>) = match archive {
+        Some(a) => (vec![a.store.clone()], vec![a.id]),
+        None => {
+            let d = vfs.data();
+            std::iter::once((d.store().clone(), me.live_store()))
+                .chain(d.disks().into_iter().map(|x| (x.store.clone(), x.id)))
+                .unzip()
+        }
+    };
+    // Files that must be copied go where new files go.
+    let copy_into = match archive {
+        Some(_) => 0,
+        None => {
+            let d = vfs.data().clone();
+            let pick = tokio::task::spawn_blocking(move || d.pick_new_store())
+                .await
+                .expect("blocking task");
+            ids.iter().position(|s| *s == pick).unwrap_or(0)
+        }
+    };
     let srcs: Vec<PathBuf> = batch.iter().map(|p| p.src.clone()).collect();
     let pr = progress.clone();
-    let st = store.clone();
-    let linked: Vec<Result<bool, String>> = tokio::task::spawn_blocking(move || {
-        let store = st;
+    let sts = stores.clone();
+    let linked: Vec<Result<(usize, bool), String>> = tokio::task::spawn_blocking(move || {
         srcs.iter()
             .enumerate()
             .map(|(i, s)| {
                 let key = ObjectKey::new(FileId(first.0 + i as u64), nest_types::Generation(1));
-                place(&store, s, key, copy, &pr)
+                place_any(&sts, copy_into, s, key, copy, &pr)
             })
             .collect()
     })
@@ -468,8 +524,9 @@ async fn flush(
     let mut idx = Vec::new();
     for (i, (p, l)) in batch.iter().zip(&linked).enumerate() {
         match l {
-            Ok(_) => {
+            Ok((into, _)) => {
                 let file = FileId(first.0 + i as u64);
+                let into = ids[*into];
                 let import = Command::Import {
                     parent: p.parent,
                     name: p.name.clone(),
@@ -481,18 +538,21 @@ async fn flush(
                     sealed: p.seal,
                     now,
                 };
-                cmds.push(match archive {
-                    None => import,
-                    // Import records a copy on this host's store; in the
-                    // same step the archive's copy replaces it, so the
-                    // entry is never without its one real copy. Existing
-                    // commands only: hosts of any version apply it.
-                    Some(a) => Command::Batch(vec![
+                cmds.push(if into == me.live_store() {
+                    import
+                } else {
+                    // Import records a copy on this host's primary; in the
+                    // same step the copy where the file really is (an
+                    // archive's objects, or one of this host's disks)
+                    // replaces it, so the entry is never without its one
+                    // real copy. Existing commands only: hosts of any
+                    // version apply it.
+                    Command::Batch(vec![
                         import,
                         Command::PublishReplica {
                             file,
                             generation: nest_types::Generation(1),
-                            store: a.id,
+                            store: into,
                         },
                         Command::RetireReplica {
                             file,
@@ -500,7 +560,7 @@ async fn flush(
                             store: me.live_store(),
                             allow_last: false,
                         },
-                    ]),
+                    ])
                 });
                 idx.push(i);
             }
@@ -532,7 +592,8 @@ async fn flush(
         for (r, i) in results.into_iter().zip(idx) {
             let p = &batch[i];
             let key = ObjectKey::new(FileId(first.0 + i as u64), nest_types::Generation(1));
-            let copied = matches!(linked[i], Ok(true));
+            let copied = matches!(linked[i], Ok((_, true)));
+            let into = linked[i].as_ref().map_or(0, |(x, _)| *x);
             match r {
                 Ok(_) => {
                     pr.files += 1;
@@ -546,18 +607,18 @@ async fn flush(
                 }
                 Err(NestError::Exists) => {
                     pr.skipped += 1;
-                    to_drop.push(key);
+                    to_drop.push((into, key));
                 }
                 Err(e) => {
                     pr.errors.push(format!("{}: {e}", p.src.display()));
-                    to_drop.push(key);
+                    to_drop.push((into, key));
                 }
             }
         }
     }
     tokio::task::spawn_blocking(move || {
-        for k in to_drop {
-            let _ = store.delete(k);
+        for (into, k) in to_drop {
+            let _ = stores[into].delete(k);
         }
         for s in to_unlink {
             let _ = std::fs::remove_file(s);

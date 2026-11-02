@@ -59,6 +59,18 @@ async fn snapshot(api: &Api) -> Option<String> {
     let status = crate::status_json_live(api).await.ok()?;
     let stores = api.placer.stores_listing().await.unwrap_or_default();
     let disks = api.placer.disks_listing().await;
+    // Where each host with several disks puts new files (ADR-077).
+    let new_files: serde_json::Map<String, serde_json::Value> = api
+        .placer
+        .nodes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|h| disks.get(&h.name).is_some_and(|d| d.len() > 1))
+        .filter_map(|h| {
+            let p = api.placer.new_files(h.node).ok()?;
+            Some((h.name.clone(), crate::new_files_json(&h.name, p)))
+        })
+        .collect();
     let groups: Vec<_> = api
         .placer
         .groups()
@@ -72,6 +84,7 @@ async fn snapshot(api: &Api) -> Option<String> {
             "jobs": api.placer.all_jobs().await,
             "stores": stores,
             "disks": disks,
+            "new_files": new_files,
             "groups": groups,
             "ui": crate::ui_id(),
         })

@@ -1,8 +1,14 @@
 <script lang="ts">
   import { get, api, post, type Rule } from "../lib/api";
   import { app, toast, targets } from "../lib/state.svelte";
-  import { confirm } from "../lib/ui.svelte";
-  import { selLabel } from "../lib/format";
+  import { confirm, showPaths } from "../lib/ui.svelte";
+  import { selSummary } from "../lib/format";
+
+  function details(r: Rule) {
+    const s = r.summary;
+    const head = `${r.selector}\n→ ${r.hosts.join(", ")}${s?.models?.length ? `\nmodels: ${s.models.join(", ")}` : ""}${s?.error ? `\n${s.error}` : ""}`;
+    showPaths(r.name, head, s?.paths ?? []);
+  }
 
   let rules = $state<Rule[]>([]);
   const load = async () => (rules = (await get<{ rules: Rule[] }>("/v1/rules")).rules);
@@ -44,12 +50,17 @@
   <div class="row"><h2>Rules</h2><span class="small muted">where things must be; plans never remove what a rule requires</span></div>
   <div class="grid list">
     {#each rules as r (r.name)}
+      {@const sum = selSummary(r.selector, r.summary)}
       <div class="rule panel">
-        <div class="row"><b>{r.name}</b>{#if r.auto}<span class="badge spark">automatic</span>{/if}<span class="spacer"></span>
+        <div class="row"><b class="title" title={r.selector}>{sum.title}</b>{#if r.auto}<span class="badge spark">automatic</span>{/if}</div>
+        <div class="small muted">{r.name}{sum.detail ? ` · ${sum.detail}` : ""}</div>
+        <div class="row">
+          <div class="chips">{#each r.hosts as h}<span class="badge">{h}</span>{/each}</div>
+          <span class="spacer"></span>
+          <button class="btn sm ghost" onclick={() => details(r)}>Details</button>
           <button class="btn sm" onclick={() => apply(r)}>Apply now</button>
-          <button class="btn sm danger" onclick={() => remove(r)}>Delete</button></div>
-        <div class="mono small">{selLabel(r.selector)}</div>
-        <div class="chips">{#each r.hosts as h}<span class="badge">{h}</span>{/each}</div>
+          <button class="btn sm danger" onclick={() => remove(r)}>Delete</button>
+        </div>
       </div>
     {:else}<div class="panel empty">No rules yet.</div>{/each}
   </div>
@@ -71,5 +82,6 @@
 
 <style>
   .list { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-  .rule { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .rule { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 </style>

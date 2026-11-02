@@ -307,6 +307,10 @@ impl Handle {
 struct Owned {
     key: ObjectKey,
     epoch: Epoch,
+    /// The store holding the working object: the primary, or for a new
+    /// file one of this host's disks (ADR-077).
+    store: Arc<nest_store::ObjectStore>,
+    store_id: nest_types::StoreId,
     file: Arc<std::fs::File>,
     participants: Mutex<HashSet<Writer>>,
     /// Writes hold this shared while they run; finalize takes it exclusive
@@ -1015,7 +1019,8 @@ impl Vfs {
         if owner != self.me() {
             return false;
         }
-        if let Ok((size, mtime)) = self.d.store().stat(ObjectKey::new(a.id, a.generation)) {
+        let key = ObjectKey::new(a.id, a.generation);
+        if let Ok((size, mtime)) = self.d.working_store(key).stat(key) {
             a.size = size;
             a.mtime = mtime;
         }
@@ -1361,7 +1366,7 @@ impl Vfs {
             let a = self.raw_attr(file)?;
             if a.gen_state == GenState::Owned && a.owner == Some(self.me()) {
                 let key = ObjectKey::new(file, a.generation);
-                let f = self.d.store().open_write(key).map_err(io)?;
+                let f = self.d.working_store(key).open_write(key).map_err(io)?;
                 f.set_times(std::fs::FileTimes::new().set_modified(mtime.as_system_time()))
                     .map_err(io)?;
             }
@@ -1400,8 +1405,9 @@ impl Vfs {
         tokio::time::timeout(Duration::from_secs(10), self.d.wait_ready(key))
             .await
             .map_err(|_| NestError::Unavailable("working object not ready".into()))?;
-        let store = self.d.store().clone();
-        let f = tokio::task::spawn_blocking(move || store.open_write(key))
+        let (store_id, store) = self.d.working_store_id(key);
+        let st = store.clone();
+        let f = tokio::task::spawn_blocking(move || st.open_write(key))
             .await
             .expect("blocking task")
             .map_err(io)?;
@@ -1416,6 +1422,8 @@ impl Vfs {
         let o = Arc::new(Owned {
             key,
             epoch,
+            store,
+            store_id,
             file: Arc::new(f),
             participants: Mutex::new(HashSet::new()),
             open: tokio::sync::RwLock::new(true),
@@ -1788,7 +1796,7 @@ impl Vfs {
                 *open = true;
                 return;
             }
-            let (size, mtime) = match me.d.store().stat(o.key) {
+            let (size, mtime) = match o.store.stat(o.key) {
                 Ok(s) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     drop_state(&me); // deleted while lingering
@@ -1801,15 +1809,10 @@ impl Vfs {
                 }
             };
             let r = me
-                .propose(Command::Finalize {
-                    file,
-                    epoch: o.epoch,
-                    size,
-                    mtime,
-                    now: Timestamp::now(),
-                })
+                .propose(me.d.finalize_on(file, o.epoch, o.key.generation, size, mtime, o.store_id))
                 .await;
             drop_state(&me);
+            me.d.working_done(o.key);
             if let Err(e) = r
                 && !matches!(e, NestError::NotFound | NestError::Stale)
             {
@@ -1846,7 +1849,7 @@ impl Vfs {
             return Err(NestError::Stale); // finalized under us
         }
         if let OwnerOp::Write { data, .. } = &op {
-            self.d.store().reserve_room(data.len() as u64).map_err(io)?;
+            o.store.reserve_room(data.len() as u64).map_err(io)?;
         }
         o.activity.fetch_add(1, Ordering::SeqCst);
         let f = o.file.clone();
@@ -1930,7 +1933,7 @@ impl Vfs {
             .get(&file)
             .cloned()
             .ok_or(NestError::Stale)?;
-        let (size, mtime) = self.d.store().stat(o.key).map_err(io)?;
+        let (size, mtime) = o.store.stat(o.key).map_err(io)?;
         match self
             .propose(Command::SyncOwned {
                 file,
@@ -2028,11 +2031,8 @@ impl Vfs {
         if a.gen_state != GenState::Owned || a.owner != Some(self.me()) {
             return Err(NestError::Stale);
         }
-        let (size, mtime) = self
-            .d
-            .store()
-            .stat(ObjectKey::new(file, a.generation))
-            .map_err(io)?;
+        let key = ObjectKey::new(file, a.generation);
+        let (size, mtime) = self.d.working_store(key).stat(key).map_err(io)?;
         Ok(DataResp::Stat {
             generation: a.generation,
             size,
@@ -2061,9 +2061,7 @@ impl Vfs {
     ) -> Option<(nest_types::StoreId, Arc<nest_store::ObjectStore>)> {
         let key = ObjectKey::new(a.id, a.generation);
         match (a.gen_state, a.owner) {
-            (GenState::Owned, Some(o)) if o == self.me() => {
-                Some((self.me().live_store(), self.d.store().clone()))
-            }
+            (GenState::Owned, Some(o)) if o == self.me() => Some(self.d.working_store_id(key)),
             (GenState::Stable, _) => {
                 // The live store, or one of this host's disks (ADR-073).
                 self.queries.fetch_add(1, Ordering::Relaxed);
@@ -2804,7 +2802,7 @@ impl Vfs {
         if !*guard {
             return None;
         }
-        if let Err(e) = self.d.store().reserve_room(data.len() as u64) {
+        if let Err(e) = o.store.reserve_room(data.len() as u64) {
             return Some(Err(io(e)));
         }
         o.participants.lock().insert((self.me(), fh));
@@ -3218,17 +3216,34 @@ impl Vfs {
                 size, a.size
             )));
         }
-        let me_store = self.me().live_store();
-        if self.q(|c| query::has_live_replica(c, file, a.generation, me_store))? {
+        // This host already has it on any of its own stores: nothing to do.
+        let mine = self.q(|c| query::replicas(c, file))?.into_iter().any(|r| {
+            r.generation == a.generation
+                && r.state == nest_types::ReplicaState::Live
+                && r.store.host() == Some(self.me())
+        });
+        if mine {
             return Ok(false);
         }
         let key = ObjectKey::new(file, a.generation);
-        let store = self.d.store().clone();
+        // Linked into whichever of this host's stores shares the source's
+        // filesystem: its primary, or one of its disks (ADR-077).
+        let d = self.d.clone();
         let src = src.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            // An unpublished leftover under this key is never served.
-            let _ = store.delete(key);
-            store.link_from(&src, key)
+        let (store_id, store) = tokio::task::spawn_blocking(move || {
+            let stores = std::iter::once((d.id().live_store(), d.store().clone()))
+                .chain(d.disks().into_iter().map(|x| (x.id, x.store.clone())));
+            let mut last = std::io::Error::from_raw_os_error(libc::EXDEV);
+            for (id, st) in stores {
+                // An unpublished leftover under this key is never served.
+                let _ = st.delete(key);
+                match st.link_from(&src, key) {
+                    Ok(_) => return Ok((id, st)),
+                    Err(e) if e.raw_os_error() == Some(libc::EXDEV) => last = e,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(last)
         })
         .await
         .map_err(|e| NestError::Io(e.to_string()))?
@@ -3237,13 +3252,13 @@ impl Vfs {
             .propose(Command::PublishReplica {
                 file,
                 generation: a.generation,
-                store: me_store,
+                store: store_id,
             })
             .await
         {
             Ok(_) => Ok(true),
             Err(e) => {
-                let _ = self.d.store().delete(key);
+                let _ = store.delete(key);
                 Err(e)
             }
         }

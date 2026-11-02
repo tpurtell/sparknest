@@ -2,8 +2,8 @@
   import Constellation from "../components/Constellation.svelte";
   import JobStrip from "../components/JobStrip.svelte";
   import Icon from "../components/Icon.svelte";
-  import { app, go, extraDisks } from "../lib/state.svelte";
-  import type { DiskInfo } from "../lib/api";
+  import { app, go, extraDisks, toast } from "../lib/state.svelte";
+  import { api, type DiskInfo } from "../lib/api";
   import { human, pct, rate } from "../lib/format";
 
   const hosts = $derived(app.status?.nodes ?? []);
@@ -15,6 +15,20 @@
   const flow = $derived(Object.values(app.rates).reduce((a, r) => a + r.read, 0));
   const direct = $derived(Object.values(app.rates).reduce((a, r) => a + r.local, 0));
   // Spread-read rates a host measured: from its disk and from other hosts.
+  /** The select's value for a host's new-file policy: a mode, or a disk's name. */
+  const nfValue = (host: string) => {
+    const p = app.newFiles[host];
+    return !p || p.mode === "weighted" ? "weighted" : p.mode === "most-free" ? "most-free" : (p.disk ?? host);
+  };
+  async function setNewFiles(host: string, mode: string) {
+    try {
+      const r = await api("PUT", `/v1/disks/${encodeURIComponent(host)}/new-files`, { mode });
+      app.newFiles[host] = r.new_files;
+      toast(`New files on ${host}: ${mode === "weighted" ? "weighted by free space" : mode === "most-free" ? "most free space" : mode}`);
+    } catch (e) {
+      toast((e as Error).message, true);
+    }
+  }
   const spread = (i: NonNullable<(typeof hosts)[number]["info"]>) => ({
     disk: (i.io ?? []).filter((s) => s.source === "Local").reduce((a, s) => a + s.bytes_per_s, 0),
     net: (i.io ?? []).filter((s) => s.source !== "Local").reduce((a, s) => a + s.bytes_per_s, 0),
@@ -59,6 +73,20 @@
       {#each extraDisks(h.name) as d (d.store)}
         {@render diskCard(h.name, d)}
       {/each}
+      {#if extraDisks(h.name).length}
+        <div class="panel newfiles">
+          <span class="small"><b>New files</b> on {h.name}</span>
+          <select value={nfValue(h.name)} onchange={(e) => setNewFiles(h.name, e.currentTarget.value)}
+            title="Where files written through {h.name}'s mount go. Placing and downloads aimed at a disk ignore this.">
+            <option value="weighted">Spread, weighted by free space</option>
+            <option value="most-free">Disk with the most free space</option>
+            {#each app.disks[h.name] ?? [] as d (d.store)}
+              {#if d.healthy}<option value={d.name}>Always {d.name}{d.primary ? " (primary)" : ""}</option>{/if}
+            {/each}
+          </select>
+          <span class="tiny muted">placing and targeted downloads ignore this</span>
+        </div>
+      {/if}
     {/each}
   </div>
 
@@ -115,6 +143,8 @@
   .cap .ours { background: linear-gradient(90deg, var(--spark-2), var(--spark)); box-shadow: 0 0 10px rgba(56, 232, 255, 0.7); }
   .live { color: var(--spark); }
   .host.disk { border-style: dashed; }
+  .newfiles { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; justify-content: center; border-style: dashed; }
+  .newfiles select { max-width: 100%; }
   .sec { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
   .ell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @media (max-width: 899px) {

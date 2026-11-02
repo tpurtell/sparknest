@@ -283,17 +283,50 @@ impl ObjectStore {
 
     /// Adopt an existing file by hard-linking it into place: no data moves
     /// and the source stays until the caller removes it (import commits the
-    /// metadata in between, so a crash never loses the source). Fails with
+    /// metadata in between, so a crash never loses the source). Another
+    /// btrfs subvolume on the same disk refuses hard links but shares
+    /// extents, so it is cloned instead, moving no data either. Fails with
     /// EXDEV across filesystems and EEXIST if the object exists.
     pub fn link_from(&self, src: &Path, k: ObjectKey) -> io::Result<u64> {
-        let md = fs::symlink_metadata(src)?;
-        if !md.file_type().is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
+        match self.hard_link_from(src, k) {
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                self.reflink_from(src, k).map_err(|_| e)
+            }
+            r => r,
         }
+    }
+
+    /// `link_from` with a hard link only (no clone).
+    pub fn hard_link_from(&self, src: &Path, k: ObjectKey) -> io::Result<u64> {
+        let md = regular(src)?;
         fs::hard_link(src, self.path(k))?;
+        Ok(md.len())
+    }
+
+    /// `src` cloned into place as `k` (FICLONE): a new inode sharing the
+    /// source's extents, no data copied. Fails where the filesystems differ
+    /// or do not clone (EXDEV, EOPNOTSUPP); nothing is left behind then.
+    pub fn reflink_from(&self, src: &Path, k: ObjectKey) -> io::Result<u64> {
+        use std::os::fd::AsRawFd;
+        let md = regular(src)?;
+        let from = File::open(src)?;
+        let path = self.path(k);
+        let to = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        // SAFETY: FICLONE takes the source descriptor as its integer
+        // argument and reads no memory; both descriptors are open files
+        // owned by this frame for the whole call.
+        let r = unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) };
+        if r != 0 {
+            let e = io::Error::last_os_error();
+            drop(to);
+            let _ = fs::remove_file(&path);
+            return Err(e);
+        }
+        to.sync_all()?;
         Ok(md.len())
     }
 
@@ -598,6 +631,18 @@ pub fn marker_ok(root: &Path, identity: &str) -> bool {
     fs::read_to_string(root.join(MARKER)).is_ok_and(|s| s.trim() == identity.trim())
 }
 
+/// `src`'s metadata, if it is a regular file (not a link to one).
+fn regular(src: &Path) -> io::Result<fs::Metadata> {
+    let md = fs::symlink_metadata(src)?;
+    if !md.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(md)
+}
+
 fn sync_dir(child: &Path) -> io::Result<()> {
     if let Some(d) = child.parent() {
         File::open(d)?.sync_all()?;
@@ -651,6 +696,38 @@ mod tests {
         s.open_read(k(3, 2)).unwrap().read_to_end(&mut got).unwrap();
         assert_eq!(got.len(), data.len());
         assert_eq!(got, data);
+    }
+
+    /// A source on another btrfs subvolume (here: the system temp dir
+    /// against the crate's, where they differ) refuses a hard link with
+    /// EXDEV; `link_from` clones it instead, sharing its extents. Skipped
+    /// where the two are one filesystem or cannot clone.
+    #[test]
+    fn link_from_another_subvolume_clones() {
+        let store = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let s = ObjectStore::open(store.path()).unwrap();
+        let src = other.path().join("shard");
+        std::fs::write(&src, vec![7u8; 1 << 20]).unwrap();
+        if fs::hard_link(&src, store.path().join("probe")).is_ok() {
+            eprintln!("skipped: the temp dir shares the store's filesystem");
+            return;
+        }
+        match s.link_from(&src, k(9, 1)) {
+            Ok(n) => assert_eq!(n, 1 << 20),
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                eprintln!("skipped: no reflinks between these filesystems");
+                assert!(!s.exists(k(9, 1)), "a failed clone leaves nothing");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        }
+        let mut got = Vec::new();
+        s.open_read(k(9, 1)).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, vec![7u8; 1 << 20]);
+        // Its own inode: removing the source leaves the object whole.
+        std::fs::remove_file(&src).unwrap();
+        assert_eq!(s.size(k(9, 1)).unwrap(), 1 << 20);
     }
 
     #[test]

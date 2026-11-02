@@ -21,7 +21,8 @@ export const closeMenu = () => (menu.open = false);
 type Dialog =
   | { kind: "info"; title: string; body: string }
   | { kind: "confirm"; title: string; body: string; ok: string; danger: boolean }
-  | { kind: "pick"; title: string; body: string; options: { name: string; kind: string; note?: string }[]; multi: boolean };
+  | { kind: "pick"; title: string; body: string; options: { name: string; kind: string; note?: string }[]; multi: boolean }
+  | { kind: "paths"; title: string; body: string; paths: string[] };
 
 export const dialog = $state<{ open: boolean; d: Dialog | null; resolve: ((v: any) => void) | null }>({
   open: false,
@@ -61,3 +62,7 @@ export const pick = (
   multi = true,
   body = "",
 ) => show<string[]>({ kind: "pick", title, body, options, multi });
+
+/** A selection's full paths, one per line, with copy. */
+export const showPaths = (title: string, body: string, paths: string[]) =>
+  show<boolean>({ kind: "paths", title, body, paths }).then(() => undefined);

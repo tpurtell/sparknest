@@ -208,6 +208,9 @@ async fn share_capacity(p: std::sync::Weak<Placer>) {
 /// host.
 const SPREAD_MARGIN: u64 = 64 << 30;
 
+/// Finished jobs a host remembers (in memory; the log keeps the rest).
+const KEEP_FINISHED_JOBS: usize = 200;
+
 /// Quiet period after the last change before automatic rules are applied.
 const AUTO_DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -235,6 +238,17 @@ async fn auto_reconcile(p: std::sync::Weak<Placer>) {
             let what = format!("replicate {}", spec.selector.describe());
             if p.jobs().iter().any(|j| !j.finished && j.what == what) {
                 continue;
+            }
+            // Any file settling anywhere wakes every rule: start a job only
+            // for a rule that is missing a copy (an idle cluster with a
+            // busy writer once ran eight empty jobs every 17 s).
+            match p.rule_satisfied(&spec).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!(rule = %name, error = %e, "automatic rule not checked");
+                    continue;
+                }
             }
             match p
                 .replicate(spec.selector.clone(), spec.hosts.clone(), 8)
@@ -757,6 +771,27 @@ impl Placer {
         Ok(out)
     }
 
+    /// Whether every stable file `spec` selects has a live copy in each of
+    /// its places (files being written are left to their next pass).
+    pub async fn rule_satisfied(&self, spec: &RuleSpec) -> NestResult<bool> {
+        let m = self.manifest(&spec.selector).await?;
+        let places: Vec<StoreId> = self
+            .resolve_targets(&spec.hosts)
+            .await?
+            .into_iter()
+            .map(|t| t.store)
+            .collect();
+        let c = self.conn()?;
+        for e in m.entries.iter().filter(|e| e.stable) {
+            for s in &places {
+                if !query::has_live_replica(&c, e.file, e.generation, *s).map_err(sql)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn manifest(&self, sel: &Selector) -> NestResult<Manifest> {
         let vfs = self.vfs.clone();
         selector::resolve(
@@ -835,6 +870,65 @@ impl Placer {
     /// Every host's stores (`nest disk ls`, ADR-073): its live store and
     /// each extra disk. A host older than 0.7 answers with its live store
     /// only, built from its info.
+    /// Where host `node` puts new files written through its mount (ADR-077).
+    pub fn new_files(&self, node: NodeId) -> NestResult<nest_types::NewFiles> {
+        let key = format!("setting:{}", nest_types::NewFiles::key(node));
+        let v = self
+            .conn()?
+            .query_row("SELECT v FROM kv WHERE k = ?1", [key], |r| {
+                r.get::<_, i64>(0)
+            });
+        let v = match v {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(sql(e)),
+        };
+        Ok(v.map(|v| nest_types::NewFiles::decode(v as u64))
+            .unwrap_or_default())
+    }
+
+    /// Set where `host` puts new files: `weighted`, `most-free`, or one of
+    /// its places by name (`raptor` for its primary, `raptor (D2)`).
+    /// Only that host reads it, so only it must run a version that does.
+    pub async fn set_new_files(&self, host: &str, mode: &str) -> NestResult<nest_types::NewFiles> {
+        let h = self
+            .nodes()?
+            .into_iter()
+            .find(|h| h.name == host)
+            .ok_or_else(|| NestError::Invalid(format!("no host {host:?}")))?;
+        let policy = match mode {
+            "weighted" => nest_types::NewFiles::Weighted,
+            "most-free" => nest_types::NewFiles::MostFree,
+            place => {
+                let p = self
+                    .resolve_places(&[place.to_string()])?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| NestError::Invalid(format!("no place {place:?}")))?;
+                let store = crate::plan::store_of(p.node);
+                if store.host() != Some(h.node) {
+                    return Err(NestError::Invalid(format!(
+                        "{place} is not one of {host}'s disks"
+                    )));
+                }
+                if store == h.node.live_store() {
+                    nest_types::NewFiles::Disk(0)
+                } else {
+                    nest_types::NewFiles::Disk((store.0 & 0xff) as u8)
+                }
+            }
+        };
+        self.vfs
+            .data()
+            .meta()
+            .propose(Command::SetSetting {
+                name: nest_types::NewFiles::key(h.node),
+                value: (policy != nest_types::NewFiles::Weighted).then(|| policy.encode()),
+            })
+            .await?;
+        Ok(policy)
+    }
+
     pub async fn disks(&self) -> NestResult<Vec<(HostRef, Result<Vec<admin::DiskInfo>, String>)>> {
         let nodes = self.nodes()?;
         let out = futures::future::join_all(nodes.into_iter().map(|h| async move {
@@ -1227,7 +1321,7 @@ impl Placer {
             started_ms: now_ms(),
             ..Default::default()
         }));
-        self.jobs.lock().insert(id, job.clone());
+        self.add_job(id, job.clone());
         // Jobs live in memory only; the log is what outlives a restart.
         tracing::info!(
             job = id,
@@ -1831,25 +1925,25 @@ impl Placer {
         } else {
             self.resolve_places(&hosts)?
         };
-        let disks: HashMap<StoreId, admin::DiskInfo> =
-            if wanted.iter().any(|p| p.node.0 >= StoreId::DISK_BASE) {
-                self.disks()
-                    .await?
-                    .into_iter()
-                    .filter_map(|(_, r)| r.ok())
-                    .flatten()
-                    .map(|d| (d.store, d))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+        // Every host's stores: a disk's room, and which hosts have several
+        // (their files may land on another than the one asked for).
+        let disks: HashMap<StoreId, admin::DiskInfo> = self
+            .disks()
+            .await?
+            .into_iter()
+            .filter_map(|(_, r)| r.ok())
+            .flatten()
+            .map(|d| (d.store, d))
+            .collect();
         // A place named alone gets what fits in its free space; places the
         // planner chooses among keep the margin.
         let named_one = hosts.len() == 1 && wanted.len() == 1;
         let mut nodes = Vec::new();
         let mut fhosts = Vec::new();
-        // Per place, the disk its files move to once fetched (None: they
-        // stay where the mount wrote them, the host's primary disk).
+        // Per place, the store its files must end on once fetched: the
+        // mount writes them where the host puts new files (ADR-077), so on
+        // a host with several disks they are moved if they landed on
+        // another (None: a one-disk host, where they always land right).
         let mut onto: Vec<Option<StoreId>> = Vec::new();
         for p in &wanted {
             let node = crate::plan::host_of(p.node);
@@ -1868,7 +1962,11 @@ impl Placer {
                 }
             };
             nodes.push(node);
-            onto.push((store != node.live_store()).then_some(store));
+            let several = store != node.live_store()
+                || disks
+                    .values()
+                    .any(|d| d.store.host() == Some(node) && !d.primary);
+            onto.push(several.then_some(store));
             fhosts.push(FetchHost {
                 name: p.name.clone(),
                 room: if named_one {
@@ -1967,7 +2065,7 @@ impl Placer {
                 ));
             }
         }
-        self.jobs.lock().insert(id, job.clone());
+        self.add_job(id, job.clone());
         tracing::info!(job = id, %repo, sha = %plan.sha, files = missing.len(), hosts = fhosts.len(), in_flight, "hf download started");
 
         let mut sched = crate::hfimport::Schedule::new(fhosts, &missing, &assigned);
@@ -2092,8 +2190,8 @@ impl Placer {
                             sched.failed(r.host, (f.name.clone(), f.size), &why);
                         }
                     }
-                    // Fetched for one of the host's disks: the mount wrote
-                    // them to its primary; move them over (ADR-075).
+                    // Onto the place's own store, from wherever the mount
+                    // put them (ADR-075, ADR-077).
                     if let Some(to) = onto[r.host]
                         && !landed.is_empty()
                     {
@@ -2182,8 +2280,9 @@ impl Placer {
     }
 
     /// Move freshly fetched files of a snapshot (`dir`, a namespace path)
-    /// from `node`'s primary disk onto its disk `to` (ADR-075). Returns the
-    /// files that could not be moved (they stay on the primary).
+    /// onto `node`'s store `to` from whichever of its other stores they
+    /// landed on (ADR-075, ADR-077). Returns the files that could not be
+    /// moved (they stay where they are).
     pub async fn settle_onto(
         self: &Arc<Self>,
         node: NodeId,
@@ -2207,9 +2306,42 @@ impl Placer {
             }
             Err(_) => return names,
         }
-        if files.is_empty() {
-            return unmoved;
+        // By the store of the host's that holds each now; those on `to`
+        // already stay.
+        let mut by_from: BTreeMap<StoreId, Vec<(FileId, u64)>> = BTreeMap::new();
+        if let Ok(c) = self.conn() {
+            for (f, size) in files {
+                let at = query::replicas(&c, f)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| r.state == nest_types::ReplicaState::Live)
+                    .map(|r| r.store)
+                    .filter(|s| s.host() == Some(node))
+                    .collect::<Vec<_>>();
+                if at.contains(&to) {
+                    continue;
+                }
+                by_from
+                    .entry(at.first().copied().unwrap_or(node.live_store()))
+                    .or_default()
+                    .push((f, size));
+            }
         }
+        for (from, files) in by_from {
+            unmoved.extend(self.move_on(node, files, from, to).await);
+        }
+        unmoved
+    }
+
+    /// One `MoveLocal` on `node`, waited for; the files not moved.
+    async fn move_on(
+        &self,
+        node: NodeId,
+        files: Vec<(FileId, u64)>,
+        from: StoreId,
+        to: StoreId,
+    ) -> Vec<String> {
+        let mut unmoved = Vec::new();
         let hid = rand::random::<u64>();
         let started = admin::call(
             self.rpc(),
@@ -2217,7 +2349,7 @@ impl Placer {
             &AdminReq::MoveLocal {
                 job: hid,
                 files: files.clone(),
-                from: node.live_store(),
+                from,
                 to: vec![to],
             },
             Duration::from_secs(30),
@@ -2588,7 +2720,7 @@ impl Placer {
             started_ms: now_ms(),
             ..Default::default()
         }));
-        self.jobs.lock().insert(id, job.clone());
+        self.add_job(id, job.clone());
         let progress = Arc::new(Mutex::new(crate::import::ImportProgress::default()));
         self.imports.lock().insert(id, progress.clone());
         let vfs = self.vfs.clone();
@@ -2750,6 +2882,25 @@ impl Placer {
     }
 
     /// The jobs started on this node.
+    /// Record a job, keeping the newest `KEEP_FINISHED_JOBS` finished ones.
+    fn add_job(&self, id: u64, job: Arc<Mutex<ClusterJob>>) {
+        let mut jobs = self.jobs.lock();
+        jobs.insert(id, job);
+        let mut done: Vec<(u64, u64)> = jobs
+            .iter()
+            .filter_map(|(id, j)| {
+                let j = j.lock();
+                j.finished.then(|| (j.finished_ms.unwrap_or(0), *id))
+            })
+            .collect();
+        if done.len() > KEEP_FINISHED_JOBS {
+            done.sort_unstable();
+            for (_, id) in &done[..done.len() - KEEP_FINISHED_JOBS] {
+                jobs.remove(id);
+            }
+        }
+    }
+
     pub fn jobs(&self) -> Vec<ClusterJob> {
         let mut v: Vec<ClusterJob> = self
             .jobs
@@ -2848,7 +2999,7 @@ impl Placer {
             started_ms: now_ms(),
             ..Default::default()
         }));
-        self.jobs.lock().insert(id, job.clone());
+        self.add_job(id, job.clone());
         tracing::info!(job = id, selector = %sel.describe(), %store, files = m.entries.len(), bytes = m.bytes(), "offload started");
         let me = self.clone();
         tokio::spawn(async move {
@@ -3135,7 +3286,7 @@ impl Placer {
             started_ms: now_ms(),
             ..Default::default()
         }));
-        self.jobs.lock().insert(jid, job.clone());
+        self.add_job(jid, job.clone());
         tracing::info!(
             job = jid,
             plan = id,
@@ -3326,7 +3477,7 @@ impl Placer {
             started_ms: now_ms(),
             ..Default::default()
         }));
-        self.jobs.lock().insert(id, job.clone());
+        self.add_job(id, job.clone());
         let me = self.clone();
         tokio::spawn(async move {
             loop {

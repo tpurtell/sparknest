@@ -554,6 +554,24 @@ pub fn path_of(c: &Connection, file: FileId) -> rusqlite::Result<Option<Vec<u8>>
 /// name of 64 hex characters: in a Hugging Face hub, a repo's
 /// `blobs/<sha256>` linking to the shared store's `blobs/xx/<xet hash>`.
 /// Returns (link name, target name), lowercase.
+/// Symlinks whose target ends in `/<name>`, by the link's own file id
+/// (the snapshot entries naming a shared-store blob).
+pub fn links_ending_in(c: &Connection, name: &str) -> rusqlite::Result<Vec<FileId>> {
+    let mut st = c.prepare_cached(
+        "SELECT id FROM files WHERE kind = 3 AND target LIKE ?1 ESCAPE '\\' LIMIT 64",
+    )?;
+    let pat = format!(
+        "%/{}",
+        name.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let rows = st.query_map(params![pat.as_bytes()], |r| {
+        Ok(FileId(r.get::<_, i64>(0)? as u64))
+    })?;
+    rows.collect()
+}
+
 pub fn hex64_links(c: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
     let mut st = c.prepare(
         "SELECT d.name, f.target FROM files f JOIN dentries d ON d.child = f.id \

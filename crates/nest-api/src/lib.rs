@@ -175,6 +175,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/disks", get(disks).post(add_disk))
         .route("/v1/disks/{name}", delete(remove_disk))
         .route("/v1/disks/{name}/drain", post(drain_disk))
+        .route("/v1/disks/{host}/new-files", put(set_new_files))
         .route("/v1/offload", post(offload))
         .route("/v1/plans", post(make_plan))
         .route("/v1/plans/{id}", get(get_plan))
@@ -723,13 +724,49 @@ async fn evict(State(api): State<Api>, Json(r): Json<PlaceReq>) -> R<serde_json:
 }
 
 async fn rules(State(api): State<Api>) -> R<serde_json::Value> {
-    let rules: Vec<_> = api
-        .placer
-        .rules()?
-        .into_iter()
-        .map(|(name, spec, rev)| json!({ "name": name, "selector": spec.selector.describe(), "hosts": spec.hosts, "auto": spec.auto, "revision": rev }))
-        .collect();
+    let mut rules = Vec::new();
+    for (name, spec, rev) in api.placer.rules()? {
+        // What it covers, for people: the models, files and bytes (a rule
+        // on one shared-store blob names the models linking to it).
+        let summary = selection_summary(&api, &spec.selector.describe())
+            .await
+            .unwrap_or_else(|| json!({ "error": "selection not found" }));
+        rules.push(json!({ "name": name, "selector": spec.selector.describe(), "hosts": spec.hosts, "auto": spec.auto, "revision": rev, "summary": summary }));
+    }
     Ok(Json(json!({ "rules": rules })))
+}
+
+/// The repos (`org/name`) these namespace paths belong to: from a
+/// `models--org--name` component, or for a shared-store blob
+/// (`.../blobs/xx/<hash>`) the repos whose snapshots link to it.
+fn models_of<'a>(c: &rusqlite::Connection, paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let repo_in = |p: &str| {
+        p.split('/').find_map(|seg| {
+            seg.strip_prefix("models--")
+                .or_else(|| seg.strip_prefix("datasets--"))
+                .map(|r| r.replacen("--", "/", 1))
+        })
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for p in paths {
+        if let Some(r) = repo_in(p) {
+            out.insert(r);
+            continue;
+        }
+        let Some(blob) = p.rsplit('/').next().filter(|b| b.len() >= 40) else {
+            continue;
+        };
+        for link in query::links_ending_in(c, blob).unwrap_or_default() {
+            if let Some(r) = query::path_of(c, link)
+                .ok()
+                .flatten()
+                .and_then(|lp| repo_in(&String::from_utf8_lossy(&lp)))
+            {
+                out.insert(r);
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 #[derive(Deserialize)]
@@ -773,7 +810,47 @@ async fn reconcile(State(api): State<Api>, Json(r): Json<ReconcileReq>) -> R<ser
 }
 
 async fn jobs(State(api): State<Api>) -> R<serde_json::Value> {
-    Ok(Json(json!({ "jobs": api.placer.all_jobs().await })))
+    let jobs = api.placer.all_jobs().await;
+    let mut out = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        let mut v = serde_json::to_value(&j).map_err(|e| bad(e.to_string()))?;
+        if let Some(sel) = j.what.strip_prefix("replicate ")
+            && let Some(sum) = selection_summary(&api, sel).await
+        {
+            v["summary"] = sum;
+        }
+        out.push(v);
+    }
+    Ok(Json(json!({ "jobs": out })))
+}
+
+/// What a selection covers, for people (`models`, `files`, `bytes`, and
+/// every `paths`), remembered by its text: jobs ask for the same ones every
+/// few seconds and a finished job's selection is what it was.
+async fn selection_summary(api: &Api, sel: &str) -> Option<serde_json::Value> {
+    type Cache = std::sync::Mutex<HashMap<String, (std::time::Instant, serde_json::Value)>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((at, v)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(sel)
+        && at.elapsed() < std::time::Duration::from_secs(300)
+    {
+        return Some(v.clone());
+    }
+    let parsed = api.selector(sel).ok()?;
+    let m = api.placer.manifest(&parsed).await.ok()?;
+    let c = api.conn().ok()?;
+    let v = json!({
+        "files": m.entries.len(),
+        "bytes": m.bytes(),
+        "models": models_of(&c, m.entries.iter().map(|e| e.path.as_str())),
+        "paths": m.entries.iter().map(|e| &e.path).collect::<Vec<_>>(),
+    });
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() > 512 {
+        g.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(300));
+    }
+    g.insert(sel.to_string(), (std::time::Instant::now(), v.clone()));
+    Some(v)
 }
 
 async fn job(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_json::Value> {
@@ -1436,12 +1513,72 @@ async fn disks(State(api): State<Api>) -> R<serde_json::Value> {
         .disks()
         .await?
         .into_iter()
-        .map(|(h, r)| match r {
-            Ok(d) => json!({ "host": h.name, "offgrid": h.offgrid, "disks": d, "error": null }),
-            Err(e) => json!({ "host": h.name, "offgrid": h.offgrid, "disks": [], "error": e }),
+        .map(|(h, r)| {
+            let nf = api
+                .placer
+                .new_files(h.node)
+                .map(|p| new_files_json(&h.name, p))
+                .unwrap_or(serde_json::Value::Null);
+            match r {
+                Ok(d) => json!({ "host": h.name, "offgrid": h.offgrid, "disks": d, "new_files": nf, "error": null }),
+                Err(e) => json!({ "host": h.name, "offgrid": h.offgrid, "disks": [], "new_files": nf, "error": e }),
+            }
         })
         .collect();
     Ok(Json(json!({ "hosts": hosts })))
+}
+
+/// A host's new-file policy (ADR-077) as the API shows it: a mode and,
+/// for a fixed disk, its place name.
+pub(crate) fn new_files_json(host: &str, p: nest_types::NewFiles) -> serde_json::Value {
+    match p {
+        nest_types::NewFiles::Weighted => json!({ "mode": "weighted" }),
+        nest_types::NewFiles::MostFree => json!({ "mode": "most-free" }),
+        nest_types::NewFiles::Disk(0) => json!({ "mode": "disk", "disk": host }),
+        nest_types::NewFiles::Disk(k) => {
+            json!({ "mode": "disk", "disk": nest_place::placer::disk_label(host, k as u64) })
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NewFilesReq {
+    /// `weighted`, `most-free`, or a place of the host's (`raptor`,
+    /// `raptor (D2)`).
+    mode: String,
+}
+
+/// Where a host puts files written through its mount (ADR-077). Only that
+/// host reads it, so only it must run this version.
+async fn set_new_files(
+    State(api): State<Api>,
+    Path(host): Path<String>,
+    Json(r): Json<NewFilesReq>,
+) -> R<serde_json::Value> {
+    let mine = env!("CARGO_PKG_VERSION");
+    let st = api.placer.status().await?;
+    match st.iter().find(|n| n.name == host) {
+        Some(n) => match &n.info {
+            Some(i) if semver(&i.version) >= semver(mine) => {}
+            Some(i) => {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    format!("{host} runs {}; it reads this from {mine}", i.version),
+                ));
+            }
+            None => {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    format!("{host} does not answer"),
+                ));
+            }
+        },
+        None => return Err(bad(format!("no host {host:?}"))),
+    }
+    let p = api.placer.set_new_files(&host, &r.mode).await?;
+    Ok(Json(
+        json!({ "host": host, "new_files": new_files_json(&host, p) }),
+    ))
 }
 
 #[derive(Deserialize)]

@@ -288,6 +288,35 @@ async fn automatic_rules_follow_new_content() {
             .unwrap_or(false)
     })
     .await;
+    // Satisfied, it starts no more jobs, however much else is written.
+    let jobs = |c: &TestCluster| {
+        c.node(1)
+            .placer
+            .jobs()
+            .iter()
+            .filter(|j| j.what.starts_with("replicate /data"))
+            .count()
+    };
+    c.eventually("first pass done", Duration::from_secs(10), |c| {
+        c.node(1).placer.jobs().iter().all(|j| j.finished)
+    })
+    .await;
+    let before = jobs(&c);
+    for i in 0..3u8 {
+        let (_, fh, _) = v2
+            .create(
+                FileId::ROOT,
+                format!("elsewhere-{i}").as_bytes(),
+                0o644,
+                oflags::WRONLY,
+            )
+            .await
+            .unwrap();
+        v2.write(fh, 0, vec![i; 4096]).await.unwrap();
+        v2.release(fh, None).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    }
+    assert_eq!(jobs(&c), before, "a satisfied rule started a job");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

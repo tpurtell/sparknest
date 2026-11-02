@@ -15,9 +15,12 @@
   {@const d = dialog.d}
   <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
   <div class="bg" onclick={(e) => e.target === e.currentTarget && finish(null)}>
-    <div class="dlg panel glowline" role="dialog" aria-modal="true" aria-label={d.title}>
+    <div class="dlg panel glowline" style:--w={d.kind === "paths" ? "720px" : null} role="dialog" aria-modal="true" aria-label={d.title}>
       <h3>{d.title}</h3>
       {#if d.body}<p class="muted body">{d.body}</p>{/if}
+      {#if d.kind === "paths"}
+        <div class="paths mono tiny">{#each d.paths as p}<div>{p}</div>{/each}</div>
+      {/if}
       {#if d.kind === "pick"}
         <div class="opts">
           {#each d.options as o}
@@ -29,7 +32,10 @@
         </div>
       {/if}
       <div class="row end">
-        {#if d.kind === "info"}
+        {#if d.kind === "paths"}
+          <button class="btn ghost" onclick={() => navigator.clipboard?.writeText(d.paths.join("\n"))}>Copy</button>
+          <button class="btn primary" onclick={() => finish(true)}>Close</button>
+        {:else if d.kind === "info"}
           <button class="btn primary" onclick={() => finish(true)}>OK</button>
         {:else}<button class="btn ghost" onclick={() => finish(null)}>Cancel</button>{/if}
         {#if d.kind === "confirm"}
@@ -47,7 +53,7 @@
   .bg { position: fixed; inset: 0; z-index: 85; grid-template-columns: minmax(0, 1fr); background: rgba(1, 4, 12, 0.6); display: grid; place-items: center; padding: 16px; backdrop-filter: blur(3px); }
   /* min-width 0: a long unbroken title (a blob path) must not widen the
      dialog past the screen; it wraps instead. */
-  .dlg { width: min(460px, 100%); min-width: 0; max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; animation: rise 0.2s ease-out; background: rgba(8, 16, 34, 0.94); }
+  .dlg { width: min(var(--w, 460px), 100%); min-width: 0; max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; animation: rise 0.2s ease-out; background: rgba(8, 16, 34, 0.94); }
   h3, p { overflow-wrap: anywhere; }
   p { margin: 8px 0 0; }
   .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-top: 14px; max-height: 50vh; overflow: auto; scrollbar-gutter: stable; }
@@ -56,4 +62,6 @@
   .opt.on { border-color: var(--spark); box-shadow: var(--glow); background: rgba(56, 232, 255, 0.1); }
   .k { color: var(--faint); text-transform: uppercase; letter-spacing: 0.1em; }
   .end { justify-content: flex-end; margin-top: 18px; }
+  .paths { margin-top: 14px; max-height: 50vh; overflow: auto; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: rgba(2, 8, 20, 0.5); }
+  .paths div { overflow-wrap: anywhere; padding: 2px 0; }
 </style>

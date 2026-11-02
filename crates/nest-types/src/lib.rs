@@ -407,6 +407,55 @@ impl Setting {
     }
 }
 
+/// Where a host puts the files written through its mount when it has
+/// several disks (ADR-077). Stored as a per-host setting (`new-files@<node>`)
+/// whose value is this encoding: 0 weighted, 1 most free, `2 + k` disk `k`
+/// (0 the primary, `k` the disk store `node.disk_store(k)`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "mode", content = "disk")]
+pub enum NewFiles {
+    /// Each new file picks a disk at random, weighted by free space.
+    #[default]
+    Weighted,
+    /// Each new file goes to the disk with the most free space.
+    MostFree,
+    /// Every new file goes to one disk: 0 is the primary, else the host's
+    /// disk store number.
+    Disk(u8),
+}
+
+impl NewFiles {
+    /// The per-host setting's name.
+    pub fn key(node: NodeId) -> String {
+        format!("new-files@{}", node.0)
+    }
+
+    pub fn encode(self) -> u64 {
+        match self {
+            NewFiles::Weighted => 0,
+            NewFiles::MostFree => 1,
+            NewFiles::Disk(k) => 2 + k as u64,
+        }
+    }
+
+    pub fn decode(v: u64) -> NewFiles {
+        match v {
+            0 => NewFiles::Weighted,
+            1 => NewFiles::MostFree,
+            v => NewFiles::Disk(u8::try_from(v - 2).unwrap_or(0)),
+        }
+    }
+
+    /// The store this names on `node`, for a fixed disk.
+    pub fn fixed_store(self, node: NodeId) -> Option<StoreId> {
+        match self {
+            NewFiles::Disk(0) => Some(node.live_store()),
+            NewFiles::Disk(k) => Some(node.disk_store(k)),
+            _ => None,
+        }
+    }
+}
+
 /// Round trips of one kind of Raft request to one peer, as this host's Raft
 /// network measured them (ADR-057). Times in microseconds.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

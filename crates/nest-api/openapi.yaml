@@ -445,6 +445,8 @@ paths:
                           type: boolean
                         revision:
                           type: integer
+                        summary:
+                          $ref: "#/components/schemas/SelectionSummary"
         default:
           $ref: "#/components/responses/Error"
 
@@ -655,7 +657,7 @@ paths:
                     type: array
                     items:
                       type: object
-                      required: [host, offgrid, disks, error]
+                      required: [host, offgrid, disks, new_files, error]
                       properties:
                         host:
                           type: string
@@ -665,6 +667,8 @@ paths:
                           type: array
                           items:
                             $ref: "#/components/schemas/DiskInfo"
+                        new_files:
+                          $ref: "#/components/schemas/NewFiles"
                         error:
                           type: [string, "null"]
         default:
@@ -738,6 +742,50 @@ paths:
                     type: string
                   forgot:
                     type: integer
+        default:
+          $ref: "#/components/responses/Error"
+  /v1/disks/{host}/new-files:
+    put:
+      tags: [stores]
+      summary: Where a host puts the files written through its mount (ADR-077)
+      description: >-
+        For a host with several disks. `weighted` picks a disk for each new
+        file at random, weighted by free space; `most-free` the disk with
+        the most; a place of the host's (`raptor`, `raptor (D2)`) always
+        that disk. Placing, downloads aimed at a disk and rewrites of an
+        existing file are not affected. 409 unless that host runs this
+        version or later (only it reads the setting).
+      operationId: setNewFiles
+      parameters:
+        - name: host
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode:
+                  type: string
+                  description: "`weighted`, `most-free`, or one of the host's places."
+      responses:
+        "200":
+          description: The policy stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [host, new_files]
+                properties:
+                  host:
+                    type: string
+                  new_files:
+                    $ref: "#/components/schemas/NewFiles"
         default:
           $ref: "#/components/responses/Error"
   /v1/disks/{name}/drain:
@@ -2849,6 +2897,32 @@ components:
         node:
           type: string
           description: The host that runs it.
+        summary:
+          $ref: "#/components/schemas/SelectionSummary"
+
+    SelectionSummary:
+      type: object
+      description: >-
+        What a rule's or replicate job's selection covers, for people; on a
+        job only for replicate jobs whose selection still resolves.
+      properties:
+        files:
+          type: integer
+        bytes:
+          type: integer
+        models:
+          type: array
+          description: >-
+            The repos (`org/name`) it belongs to; for a shared-store blob,
+            the repos whose snapshots link to it.
+          items:
+            type: string
+        paths:
+          type: array
+          items:
+            type: string
+        error:
+          type: string
 
     JobProgress:
       type: object
@@ -2935,6 +3009,17 @@ components:
             minItems: 2
             maxItems: 2
 
+    NewFiles:
+      type: object
+      description: Where a host puts the files written through its mount (ADR-077).
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [weighted, most-free, disk]
+        disk:
+          type: string
+          description: "For `disk`: the place (`raptor` for its primary, `raptor (D2)`)."
     DiskInfo:
       type: object
       required: [store, name, path, healthy, total_bytes, free_bytes, objects, object_bytes, read_bps, primary]

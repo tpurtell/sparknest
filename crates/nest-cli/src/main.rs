@@ -809,6 +809,11 @@ enum DiskCmd {
         #[arg(long)]
         forget_copies: bool,
     },
+    /// Where a host puts files written through its mount: `weighted` (a
+    /// disk per file at random, by free space; the default), `most-free`,
+    /// or one of its places (`raptor`, `raptor (D2)`). Placing and
+    /// downloads aimed at a disk ignore it.
+    NewFiles { host: String, mode: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1989,7 +1994,16 @@ async fn main() -> Result<()> {
                             println!("{host}: {e}");
                             continue;
                         }
-                        println!("{host}");
+                        let disks = h["disks"].as_array().map_or(0, Vec::len);
+                        let nf = &h["new_files"];
+                        match (disks > 1, nf["mode"].as_str()) {
+                            (true, Some("disk")) => println!(
+                                "{host}  (new files: {})",
+                                nf["disk"].as_str().unwrap_or("")
+                            ),
+                            (true, Some(m)) => println!("{host}  (new files: {m})"),
+                            _ => println!("{host}"),
+                        }
                         for d in h["disks"].as_array().into_iter().flatten() {
                             let rate = d["read_bps"].as_u64().unwrap_or(0);
                             println!(
@@ -2033,6 +2047,14 @@ async fn main() -> Result<()> {
                     .await?;
                 let id = v["job"].as_u64().unwrap_or(0);
                 if *wait { wait_job(&c, id).await? } else { v }
+            }
+            DiskCmd::NewFiles { host, mode } => {
+                c.call(
+                    Method::PUT,
+                    &format!("/v1/disks/{}/new-files", enc(host)),
+                    Some(json!({ "mode": mode })),
+                )
+                .await?
             }
             DiskCmd::Rm {
                 name,

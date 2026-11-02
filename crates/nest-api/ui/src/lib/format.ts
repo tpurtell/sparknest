@@ -51,3 +51,15 @@ export function splitRepo(repo: string): [string, string] {
   const i = repo.indexOf("/");
   return i < 0 ? ["", repo] : [repo.slice(0, i + 1), repo.slice(i + 1)];
 }
+
+/** A selection for people: its models (short names) or, without any, the
+ *  last part of its path; then file count and size. "" without a summary. */
+export function selSummary(sel: string, s?: { files?: number; bytes?: number; models?: string[] }): { title: string; detail: string } {
+  const models = (s?.models ?? []).map((m) => splitRepo(m)[1]);
+  const tail = selLabel(sel).replace(/\/+$/, "").split("/").pop() || sel;
+  const short = tail.length > 24 && /^[0-9a-f]{40,}$/i.test(tail) ? tail.slice(0, 12) + "…" : tail;
+  const title = models.length === 0 ? short : models.length <= 2 ? models.join(", ") : `${models.slice(0, 2).join(", ")} +${models.length - 2}`;
+  if (s?.files == null) return { title, detail: "" };
+  const kind = sel.startsWith("hf") ? "" : /\/blobs\//.test(sel) ? "shared blob · " : models.length && tail !== title ? `${short} · ` : "";
+  return { title, detail: `${kind}${s.files} file${s.files === 1 ? "" : "s"} · ${human(s.bytes ?? 0)}` };
+}

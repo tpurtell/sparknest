@@ -1,7 +1,18 @@
 <script lang="ts">
   import { app, cancelJob, go, jobDone, jobTotal } from "../lib/state.svelte";
-  import { human, duration, selLabel } from "../lib/format";
+  import { human, duration, selLabel, selSummary } from "../lib/format";
+  import { showPaths } from "../lib/ui.svelte";
+  import type { Job } from "../lib/api";
   import Icon from "../components/Icon.svelte";
+
+  /** "replicate <selector>": the verb and the selection, summarized. */
+  function label(j: Job) {
+    const m = /^(replicate|offload) (.*)$/.exec(j.what);
+    if (!m) return { verb: "", title: selLabel(j.what), detail: "", sel: "" };
+    return { verb: m[1], sel: m[2], ...selSummary(m[2], j.summary) };
+  }
+  const details = (j: Job, sel: string) =>
+    showPaths(j.what.split(" ")[0] + " · job " + j.id, `${sel}${j.summary?.models?.length ? `\nmodels: ${j.summary.models.join(", ")}` : ""}`, j.summary?.paths ?? []);
   const jobs = $derived(app.jobs.slice().sort((a, b) => b.started_ms - a.started_ms || b.id - a.id));
 </script>
 
@@ -11,13 +22,17 @@
     {@const done = jobDone(j)}
     {@const total = jobTotal(j)}
     {@const secs = ((j.finished_ms ?? Date.now()) - j.started_ms) / 1000}
+    {@const l = label(j)}
     <div class="job panel" class:live={!j.finished}>
       <div class="row">
         <span class="state" class:run={!j.finished} class:bad={j.finished && j.error && !j.cancelled}>
           {!j.finished ? (j.cancelled ? "cancelling" : "running") : j.cancelled ? "cancelled" : j.error ? "failed" : "done"}
         </span>
-        <b class="what">{selLabel(j.what)}</b>
+        {#if l.verb}<span class="tiny muted">{l.verb}</span>{/if}
+        <b class="what" title={j.what}>{l.title}</b>
+        {#if l.detail}<span class="tiny muted">{l.detail}</span>{/if}
         {#if j.node}<span class="tiny muted">on {j.node}</span>{/if}
+        {#if l.sel}<button class="btn sm ghost" onclick={() => details(j, l.sel)}>Details</button>{/if}
         <span class="spacer"></span>
         {#if j.started_ms}<span class="tiny muted mono">{new Date(j.started_ms).toLocaleTimeString()} · {duration(secs * 1000)}{j.finished ? (done && secs > 0.5 ? ` · ${human(done / secs)}/s` : "") : (app.jobRates[j.id] ?? 0) >= 1 ? ` · ${human(app.jobRates[j.id])}/s` : ""}</span>{/if}
         {#if !j.finished && !j.cancelled}<button class="btn sm danger" onclick={() => cancelJob(j.id)}><Icon name="stop" size={13} /> Cancel</button>{/if}

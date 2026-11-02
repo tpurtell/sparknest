@@ -2642,3 +2642,82 @@ ref before fetching, so one that fetched nothing left the same.
 the hub may not have. A delete that falls back to removing folders when
 hf cannot see a repo: once repair makes refs true, hf sees and deletes it,
 keeping the shared store's bookkeeping; a fallback would bypass that.
+
+## ADR-077 — New files spread over a host's disks; imports link into the disk they sit on (2026-11-02; amends ADR-073 §3 and ADR-074 §2)
+
+**Context.** With raptor's two 8 TB disks added, everything written
+through its mount still landed on its 3.7 TB system disk (78% full):
+ADR-073 kept writes on the primary and ADR-074 placed nothing by itself.
+TJ asked for new files (not ones a Place or targeted download directs) to
+go by free space, weighted at random by default so a model's shards
+spread over the disks and read in parallel, with most-free and a fixed
+disk (any of the host's, the primary included) as options, chosen in the
+UI. Separately, a no-copy import of a quant on fast8t was refused: import
+only linked into the primary, and `~/Developer` is its own btrfs
+subvolume, which refuses hard links even into a store on the same disk.
+
+**Decision.**
+1. **A host's policy, `new-files`,** stored as a per-host setting
+   (`new-files@<node>` in the settings table, through the existing
+   `SetSetting`: older hosts store it and ignore it). `weighted` (the
+   default): each new file picks one of the host's usable stores at
+   random, weighted by free space (the primary's net of its data
+   reserve); `most-free`: the one with the most; or one store named as a
+   place (`raptor`, `raptor (D2)`). A fixed disk that is not usable falls
+   back to the primary. `nest disk new-files HOST MODE`,
+   `PUT /v1/disks/{host}/new-files` (refused unless that host runs 0.7.3;
+   only it reads the policy) and a "New files" selector under the host's
+   disk cards.
+2. **A new file's working object is created on the chosen store**, chosen
+   off the apply path when the host prepares it. Only new files (first
+   generation, no previous content): a rewrite converts its copy where it
+   is, as before. The host remembers, in memory, which disk holds each
+   working object. Metadata is unchanged: ownership names the host, and
+   finalize records the copy on the primary and, in the same batch, moves
+   that record to the disk (`Finalize`, `PublishReplica`, `RetireReplica`):
+   commands every version applies, so the cluster need not upgrade
+   together.
+3. **Crash recovery finds them.** Startup reconciliation keeps a disk's
+   objects that the host still owns and remembers where they are; after
+   an unclean stop, the recovery fsck looks for an owned file's object on
+   the host's disks before treating it as lost. Either way it is finalized
+   on the disk that has it. A Hub download for a place moves its files
+   there from whichever of the host's stores the mount put them on.
+4. **Imports link into the disk the files sit on.** Each file is
+   hard-linked into whichever of the host's stores shares its filesystem,
+   else cloned (`FICLONE`) into one that shares its btrfs (another
+   subvolume), else, with `--copy`, copied to where the policy puts new
+   files. A link into a disk is recorded with the same batch as an
+   archive import. Adopting an existing blob tries every store the same
+   way.
+5. **Unchanged:** placing, rules, plans and downloads aimed at a place go
+   where they are told; the metadata database, Raft log and data reserve
+   stay on the primary; a host with one disk behaves as before.
+
+**Alternatives.** Writing on the primary and moving each file to its disk
+once finalized (as ADR-075 does for downloads): a second full write of
+every file, and the primary still fills while a large quant is written.
+A new lifecycle command naming the store: every host would need it at
+once, and maxq could not upgrade mid-quant. A path rule (the hub to D2):
+possible later on top of the policy.
+
+## ADR-078 — Automatic rules start jobs only when a copy is missing; hosts keep 200 finished jobs (2026-11-02)
+
+**Context.** Any file settling anywhere marks every automatic rule dirty;
+after five quiet seconds the leader started a replicate job per rule
+whether or not it was satisfied. With TJ's quant writing on maxq, the
+eight StridedPLE rules started eight empty jobs about every 17 s, about
+1,450 by the time it was noticed, and jobs were never forgotten.
+
+**Decision.** A pass first checks each rule against metadata (every
+stable file it selects has a live copy in each of its places) and starts
+nothing for a rule that holds. Each host keeps its 200 newest finished
+jobs in memory (running ones always); the log keeps the rest. The Rules
+and Jobs views show a selection by its model, file count and size, the
+full paths behind a Details dialog; `GET /v1/rules` and `GET /v1/jobs`
+carry that summary (models from `models--` path parts, or for a
+shared-store blob the repos whose snapshots link to it).
+
+**Alternatives.** Waking only the rules whose selection changed: needs a
+map from every file to the rules covering it; the check is a few queries
+per rule per pass.

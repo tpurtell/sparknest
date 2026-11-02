@@ -4,6 +4,7 @@
 use nest_data::vfs::oflags;
 use nest_place::Selector;
 use nest_testkit::TestCluster;
+use nest_types::NewFiles;
 use nest_types::*;
 use std::time::Duration;
 
@@ -298,7 +299,9 @@ async fn a_download_for_a_disk_moves_onto_it() {
     let d = disk_dir(&c, 2, "nvme1");
     let s = p.add_disk("n2", &d, None).await.unwrap();
     // As a Hub fetch on n2 leaves them: blobs written through n2's mount,
-    // so on its primary disk, and snapshot entries linking to them.
+    // here on its primary disk (its policy says so), and snapshot entries
+    // linking to them.
+    set_new_files(&c, "n2").await;
     let v2 = &c.node(2).vfs;
     let hub = v2.mkdir(FileId::ROOT, b"hub", 0o755).await.unwrap().id;
     let repo = v2.mkdir(hub, b"models--o--m", 0o755).await.unwrap().id;
@@ -348,5 +351,215 @@ async fn a_download_for_a_disk_moves_onto_it() {
             read_all(&c.node(3).vfs, *f).await,
             vec![i as u8 + 1; 1 << 20]
         );
+    }
+    // A download for the primary whose files the mount put on the disk
+    // (ADR-077) ends on the primary; one already there is left alone.
+    let unmoved = p
+        .settle_onto(
+            NodeId(2),
+            "/hub/models--o--m/snapshots/abc",
+            vec!["a.safetensors".into(), "b.safetensors".into()],
+            StoreId(2),
+        )
+        .await;
+    assert!(unmoved.is_empty(), "{unmoved:?}");
+    let again = p
+        .settle_onto(
+            NodeId(2),
+            "/hub/models--o--m/snapshots/abc",
+            vec!["a.safetensors".into()],
+            StoreId(2),
+        )
+        .await;
+    assert!(again.is_empty(), "{again:?}");
+    c.converge().await;
+    for (i, f) in files.iter().enumerate() {
+        assert_eq!(stores_of(&c, *f), vec![StoreId(2)]);
+        assert_eq!(
+            read_all(&c.node(3).vfs, *f).await,
+            vec![i as u8 + 1; 1 << 20]
+        );
+    }
+}
+
+/// Where n2 puts new files (ADR-077), as the API stores it.
+async fn set_new_files(c: &TestCluster, mode: &str) {
+    c.node(1).placer.set_new_files("n2", mode).await.unwrap();
+    c.eventually("policy applied on n2", Duration::from_secs(5), |c| {
+        c.node(2).placer.new_files(NodeId(2)).ok() == c.node(1).placer.new_files(NodeId(2)).ok()
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn new_files_go_where_their_host_says_and_survive_a_crash_mid_write() {
+    let mut c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    let s2 = p
+        .add_disk("n2", &disk_dir(&c, 2, "nvme1"), None)
+        .await
+        .unwrap();
+    let s3 = p
+        .add_disk("n2", &disk_dir(&c, 2, "nvme2"), None)
+        .await
+        .unwrap();
+
+    // Fixed on D2: every new file is written there and its copy is D2's.
+    set_new_files(&c, "n2 (D2)").await;
+    assert_eq!(p.new_files(NodeId(2)).unwrap(), NewFiles::Disk(1));
+    let mut on_d2 = Vec::new();
+    for i in 0..4u8 {
+        on_d2.push(write_file(&c, 2, &format!("d2-{i}"), i + 1, 1 << 20).await);
+    }
+    for f in &on_d2 {
+        assert_eq!(stores_of(&c, *f), vec![s2], "{f}");
+        assert_eq!(
+            read_all(&c.node(3).vfs, *f).await,
+            vec![1 + (f.0 - on_d2[0].0) as u8; 1 << 20]
+        );
+    }
+    let d2 = c.node(2).data.disk(s2).unwrap();
+    assert!(on_d2.iter().all(|f| {
+        d2.store
+            .exists(nest_store::ObjectKey::new(*f, Generation(1)))
+    }));
+    assert!(on_d2.iter().all(|f| {
+        !c.node(2)
+            .data
+            .store()
+            .exists(nest_store::ObjectKey::new(*f, Generation(1)))
+    }));
+    // Hosts with one disk, and other hosts' writes, are unaffected.
+    let n1 = write_file(&c, 1, "n1-file", 9, 4096).await;
+    assert_eq!(stores_of(&c, n1), vec![StoreId(1)]);
+
+    // The primary, named by the host's own name.
+    set_new_files(&c, "n2").await;
+    let f = write_file(&c, 2, "primary", 7, 4096).await;
+    assert_eq!(stores_of(&c, f), vec![StoreId(2)]);
+
+    // Most free: the emptiest of the three, each time.
+    for n in 1..=3 {
+        c.node(n).data.store().set_free(Some(1 << 30));
+    }
+    c.node(2)
+        .data
+        .disk(s2)
+        .unwrap()
+        .store
+        .set_free(Some(2 << 30));
+    c.node(2)
+        .data
+        .disk(s3)
+        .unwrap()
+        .store
+        .set_free(Some(5 << 30));
+    set_new_files(&c, "most-free").await;
+    let f = write_file(&c, 2, "most-free", 3, 4096).await;
+    assert_eq!(stores_of(&c, f), vec![s3]);
+
+    // Weighted: every store with room gets some.
+    set_new_files(&c, "weighted").await;
+    c.node(2)
+        .data
+        .disk(s3)
+        .unwrap()
+        .store
+        .set_free(Some(1 << 30));
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..24u8 {
+        let f = write_file(&c, 2, &format!("w-{i}"), i, 4096).await;
+        seen.extend(stores_of(&c, f));
+    }
+    assert_eq!(seen.len(), 3, "{seen:?}");
+
+    // A file half written on D2 when its host loses power keeps what it
+    // had: found on D2 and finalized there, not recreated empty.
+    set_new_files(&c, "n2 (D2)").await;
+    let v2 = &c.node(2).vfs;
+    let (a, fh, _) = v2
+        .create(FileId::ROOT, b"interrupted", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    v2.write(fh, 0, vec![0x5a; 3 << 20]).await.unwrap();
+    v2.fsync(fh, false).await.unwrap();
+    assert!(
+        d2.store
+            .exists(nest_store::ObjectKey::new(a.id, a.generation))
+    );
+    drop(d2);
+    c.power_loss(2, None).await;
+    c.restart(2).await;
+    c.eventually("n2 serving", Duration::from_secs(15), |c| {
+        c.node(2).data.caught_up() && c.node(2).data.session().is_some()
+    })
+    .await;
+    c.eventually("finalized on D2", Duration::from_secs(15), |c| {
+        c.attr(1, a.id)
+            .is_some_and(|x| x.gen_state == GenState::Stable)
+    })
+    .await;
+    assert_eq!(stores_of(&c, a.id), vec![s2]);
+    assert_eq!(read_all(&c.node(3).vfs, a.id).await, vec![0x5a; 3 << 20]);
+    // A clean restart reconciles the disk and keeps every copy on it.
+    c.stop(2).await;
+    c.restart(2).await;
+    c.eventually("n2 back", Duration::from_secs(10), |c| {
+        c.node(2).data.caught_up()
+    })
+    .await;
+    for f in on_d2.iter().chain([&a.id]) {
+        assert_eq!(stores_of(&c, *f), vec![s2]);
+        assert!(!read_all(&c.node(2).vfs, *f).await.is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_import_links_into_the_disk_its_files_are_on() {
+    let c = ready(3).await;
+    let p = c.node(1).placer.clone();
+    // A disk and a quant beside it on a filesystem other than the hosts'
+    // primaries (the crate's directory, against the system temp dir the
+    // cluster runs in), where it differs; else every store shares one and
+    // any of them could link it.
+    let base = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let dir = base.path().join("disk");
+    std::fs::create_dir_all(&dir).unwrap();
+    let s2 = p.add_disk("n2", dir.to_str().unwrap(), None).await.unwrap();
+    let src = base.path().join("n2-quant");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..3u8 {
+        std::fs::write(src.join(format!("shard-{i}.bin")), vec![i + 1; 1 << 20]).unwrap();
+    }
+    let apart = std::fs::hard_link(src.join("shard-0.bin"), c.state_dir(2).join("probe")).is_err();
+    let job = c.node(2).placer.import(nest_place::import::ImportOptions {
+        src: src.clone(),
+        dst: "/quant".into(),
+        r#move: false,
+        seal: nest_place::import::SealMode::All,
+        copy: false,
+    });
+    c.eventually("import done", Duration::from_secs(20), |c| {
+        c.node(2).placer.job(job).is_some_and(|j| j.finished)
+    })
+    .await;
+    let j = c.node(2).placer.job(job).unwrap();
+    assert!(j.error.is_none(), "{j:?}");
+    let r = c.node(1).meta.open_reader().unwrap();
+    for i in 0..3u8 {
+        let f = nest_meta::query::resolve_follow(&r, format!("/quant/shard-{i}.bin").as_bytes())
+            .unwrap()
+            .unwrap();
+        let st = stores_of(&c, f);
+        if apart {
+            // Linked into the disk it sits on, the only store that can.
+            assert_eq!(st, vec![s2], "shard {i}");
+        } else {
+            assert!(st == vec![StoreId(2)] || st == vec![s2], "{st:?}");
+        }
+        assert_eq!(read_all(&c.node(3).vfs, f).await, vec![i + 1; 1 << 20]);
+    }
+    if !apart {
+        eprintln!("one filesystem here: linking into the matching disk not exercised");
     }
 }

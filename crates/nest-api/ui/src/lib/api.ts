@@ -207,6 +207,7 @@ export interface Job {
   notes?: string[];
   /** The host that runs it. */
   node?: string;
+  summary?: SelectionSummary;
 }
 export interface IoClass {
   kind: "Disk" | "Fabric" | "Served";
@@ -310,12 +311,22 @@ export interface Plan {
   notes: string[];
   feasible: boolean;
 }
+/** What a rule's or replicate job's selection covers (absent on older hosts). */
+export interface SelectionSummary {
+  files?: number;
+  bytes?: number;
+  /** Repos (`org/name`) it belongs to. */
+  models?: string[];
+  paths?: string[];
+  error?: string;
+}
 export interface Rule {
   name: string;
   selector: string;
   hosts: string[];
   auto: boolean;
   revision: number;
+  summary?: SelectionSummary;
 }
 export interface LogLine {
   host: string;

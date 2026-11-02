@@ -44,6 +44,8 @@ export const app = $state({
   stores: [] as Store[],
   /** Hosts with extra disks: their stores, by host name (ADR-073). */
   disks: {} as Record<string, DiskInfo[]>,
+  /** Where each host with several disks puts new files (ADR-077). */
+  newFiles: {} as Record<string, { mode: "weighted" | "most-free" | "disk"; disk?: string }>,
   jobs: [] as Job[],
   groups: [] as { name: string; members: string[] }[],
   /** Fabric bytes/s per host, from counter differences between polls. */
@@ -186,6 +188,7 @@ function connect() {
       app.error = "";
       apply(m.data.status, m.data.stores, m.data.jobs, m.data.groups);
       app.disks = m.data.disks ?? {};
+      app.newFiles = m.data.new_files ?? {};
     } else if (m.type === "changed") app.changed++;
     else if (m.type === "lines") onLines?.(m.lines);
   };

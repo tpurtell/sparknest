@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
 nest-types.workspace = true
 nest-meta.workspace = true
 nest-data.workspace = true

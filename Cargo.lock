@@ -1129,6 +1129,7 @@ version = "0.7.2"
 dependencies = [
  "bytes",
  "futures",
+ "libc",
  "nest-data",
  "nest-fabric",
  "nest-meta",

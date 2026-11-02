@@ -349,8 +349,12 @@ impl Vfs {
             if !opts.settle_owned {
                 continue;
             }
+            // A new file may have been written on one of the disks
+            // (ADR-077): it is there, not lost.
+            let on_disk = !disk.contains_key(&key) && self.data().find_working(key);
             let (size, lost) = match disk.get(&key) {
                 Some(s) => (*s, false),
+                None if on_disk => (self.data().working_store(key).size(key).unwrap_or(0), false),
                 None => (0, a.size > 0),
             };
             let issue = Issue::Unfinished {
@@ -576,21 +580,20 @@ impl Vfs {
         key: ObjectKey,
         present: bool,
     ) -> NestResult<u64> {
-        let store = self.data().store().clone();
+        let (on, store) = self.data().working_store_id(key);
+        let present = present || on != self.me().live_store();
         let (size, mtime) = if present {
             store.stat(key).map_err(io)?
         } else {
             store.create(key).map_err(io)?;
             (0, a.mtime)
         };
-        self.propose(Command::Finalize {
-            file: a.id,
-            epoch: a.epoch,
-            size,
-            mtime,
-            now: Timestamp::now(),
-        })
+        self.propose(
+            self.data()
+                .finalize_on(a.id, a.epoch, a.generation, size, mtime, on),
+        )
         .await?;
+        self.data().working_done(key);
         Ok(size)
     }
 
