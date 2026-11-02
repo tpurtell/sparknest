@@ -870,6 +870,44 @@ impl Placer {
     /// Every host's stores (`nest disk ls`, ADR-073): its live store and
     /// each extra disk. A host older than 0.7 answers with its live store
     /// only, built from its info.
+    /// Bytes read so far from each store of every host with several disks,
+    /// by store name (hosts too old to say are left out).
+    pub async fn store_reads(&self, disks: &DisksByHost) -> HashMap<String, u64> {
+        let me = self.vfs.data().id();
+        let hosts: Vec<HostRef> = self
+            .nodes()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| disks.contains_key(&h.name))
+            .collect();
+        let answers = futures::future::join_all(hosts.iter().map(|h| async move {
+            if h.node == me {
+                return self.vfs.store_reads();
+            }
+            match admin::call(
+                self.rpc(),
+                h.node,
+                &AdminReq::StoreReads,
+                Duration::from_millis(900),
+            )
+            .await
+            {
+                Ok(AdminResp::StoreReads(v)) => v,
+                _ => Vec::new(),
+            }
+        }))
+        .await;
+        let mut out = HashMap::new();
+        for (h, reads) in hosts.iter().zip(answers) {
+            for (store, b) in reads {
+                if let Some(d) = disks[&h.name].iter().find(|d| d.store == store) {
+                    out.insert(d.name.clone(), b);
+                }
+            }
+        }
+        out
+    }
+
     /// Where host `node` puts new files written through its mount (ADR-077).
     pub fn new_files(&self, node: NodeId) -> NestResult<nest_types::NewFiles> {
         let key = format!("setting:{}", nest_types::NewFiles::key(node));

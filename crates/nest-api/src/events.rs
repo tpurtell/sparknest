@@ -85,6 +85,7 @@ async fn snapshot(api: &Api) -> Option<String> {
             "stores": stores,
             "disks": disks,
             "new_files": new_files,
+            "store_reads": api.placer.store_reads(&disks).await,
             "groups": groups,
             "ui": crate::ui_id(),
         })

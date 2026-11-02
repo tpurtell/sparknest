@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app } from "../lib/state.svelte";
+  import { app, extraDisks } from "../lib/state.svelte";
   import { human, rate } from "../lib/format";
   import type { IoWindow, SourceReport } from "../lib/api";
 
@@ -12,7 +12,14 @@
     for (const n of nodes) for (const s of n.info?.io ?? []) m.set(n.name + "→" + srcName(s.source, n.name), s);
     return m;
   });
-  const peak = $derived(Math.max(1, ...[...matrix.values()].map((s) => s.bytes_per_s)));
+  // Source columns: every host, each followed by its extra disks (whose
+  // cells are their host's own reads of them; other hosts reading a
+  // host's copy are counted under the host).
+  const cols = $derived(nodes.flatMap((n) => [{ name: n.name, host: n.name, disk: false }, ...extraDisks(n.name).map((d) => ({ name: d.name, host: n.name, disk: true }))]));
+  const several = (host: string) => extraDisks(host).length > 0;
+  /** A host's own read rate of one of its stores (its primary by its name). */
+  const storeRate = (name: string) => app.storeRates[name];
+  const peak = $derived(Math.max(1, ...[...matrix.values()].map((s) => s.bytes_per_s), ...Object.values(app.storeRates)));
   const fromDisk = $derived([...nodes].reduce((a, n) => a + (n.info?.io ?? []).filter((s) => s.source === "Local").reduce((b, s) => b + s.bytes_per_s, 0), 0));
   const fromNet = $derived([...nodes].reduce((a, n) => a + (n.info?.io ?? []).filter((s) => s.source !== "Local").reduce((b, s) => b + s.bytes_per_s, 0), 0));
   const ms = (us: number) => (us / 1000).toFixed(us < 10_000 ? 2 : 1) + " ms";
@@ -63,15 +70,22 @@
     <h3 class="sec">Who reads from whom</h3>
     <div class="scroll-x">
       <table class="mx">
-        <thead><tr><th class="corner"><span>reader ↓ · source →</span></th>{#each nodes as s}<th class="col"><span>{s.name}</span></th>{/each}</tr></thead>
+        <thead><tr><th class="corner"><span>reader ↓ · source →</span></th>{#each cols as s}<th class="col" class:dcol={s.disk}><span>{s.name}</span></th>{/each}</tr></thead>
         <tbody>
           {#each nodes as r}
             <tr>
               <th class="rowh">{r.name}</th>
-              {#each nodes as s}
-                {@const x = matrix.get(r.name + "→" + s.name)}
+              {#each cols as s}
+                {@const x = matrix.get(r.name + "→" + s.host)}
+                {@const own = r.name === s.host && several(s.host) ? storeRate(s.name) : undefined}
                 <td>
-                  {#if x}
+                  {#if own !== undefined}
+                    <div class="cellx self" style="--k:{Math.min(1, own / peak)}"
+                      title="{r.name} reads {s.disk ? s.name : 'its primary disk'}: {rate(own)}{!s.disk && x ? ` · ${ms(x.latency_us)}/chunk on its disks` : ''}">
+                      {#if own > 0}<span class="mono">{human(own, 0)}</span>{:else}<span class="faint">·</span>{/if}
+                    </div>
+                  {:else if s.disk}<div class="cellx none"></div>
+                  {:else if x}
                     <div class="cellx" class:self={r.name === s.name} style="--k:{Math.min(1, x.bytes_per_s / peak)}"
                       title="{r.name} reads {r.name === s.name ? 'its disk' : 'from ' + s.name}: {rate(x.bytes_per_s)} · {ms(x.latency_us)}/chunk{x.measured ? '' : ' (not measured yet)'} · {x.in_flight} in flight · {human(x.bytes_total)} total{x.errors ? ` · ${x.errors} errors` : ''}">
                       {#if x.bytes_per_s > 0}<span class="mono">{human(x.bytes_per_s, 0)}</span>{:else}<span class="faint">·</span>{/if}
@@ -94,6 +108,16 @@
         <div class="tiny muted mono" title="measured disk read rate (idle, direct I/O) and RDMA link rate: a stripe uses only as many holders as fill the links, with 25% headroom">
           disk {n.info?.disk_read_bps ? rate(n.info.disk_read_bps) : "not measured yet"} · links {n.info?.link_bps ? rate(n.info.link_bps) : "?"}
         </div>
+        {#if several(n.name)}
+          {#each app.disks[n.name] ?? [] as d (d.store)}
+            <div class="src" title="{d.path} · measured {d.read_bps ? rate(d.read_bps) : 'not yet'}">
+              <span class="sn">{d.primary ? "primary" : d.name.replace(n.name + " ", "")}</span>
+              <span class="lat mono guess">{d.read_bps ? rate(d.read_bps) : "?"}</span>
+              <span class="fl"></span>
+              <span class="rt mono" class:live={(storeRate(d.name) ?? 0) > 0}>{storeRate(d.name) === undefined ? "—" : rate(storeRate(d.name))}</span>
+            </div>
+          {/each}
+        {/if}
         {#each io as s}
           <div class="src">
             <span class="sn">{s.source === "Local" ? "disk" : srcName(s.source, n.name)}</span>
@@ -126,6 +150,7 @@
   .mx th { font-weight: 500; font-size: 11px; color: var(--muted); }
   .col { height: 60px; position: relative; min-width: 56px; }
   .col span { position: absolute; left: 50%; bottom: 4px; transform-origin: left bottom; transform: rotate(-45deg); white-space: nowrap; }
+  .dcol span { color: var(--muted); font-style: italic; }
   .corner span { font-size: 10px; color: var(--faint); }
   .rowh { text-align: right; padding-right: 6px; }
   .cellx { width: 64px; height: 34px; border-radius: 8px; display: grid; place-items: center; font-size: 11px; border: 1px solid rgba(90, 170, 255, 0.15);

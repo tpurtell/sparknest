@@ -38,6 +38,19 @@ export interface Rates {
   local: number;
 }
 
+/** Per-store read rates from the counters in each state push. */
+let prevStore: { t: number; b: Record<string, number> } | null = null;
+function storeRates(b: Record<string, number>) {
+  const now = performance.now();
+  if (prevStore && now > prevStore.t) {
+    const dt = (now - prevStore.t) / 1000;
+    const r: Record<string, number> = {};
+    for (const [k, v] of Object.entries(b)) r[k] = Math.max(0, (v - (prevStore.b[k] ?? v)) / dt);
+    app.storeRates = r;
+  }
+  prevStore = { t: now, b };
+}
+
 export const app = $state({
   authed: hasToken(),
   status: null as Status | null,
@@ -46,6 +59,9 @@ export const app = $state({
   disks: {} as Record<string, DiskInfo[]>,
   /** Where each host with several disks puts new files (ADR-077). */
   newFiles: {} as Record<string, { mode: "weighted" | "most-free" | "disk"; disk?: string }>,
+  /** Bytes/s each store of a host with several disks is read at, by
+   *  store name (its host's own reads of it). */
+  storeRates: {} as Record<string, number>,
   jobs: [] as Job[],
   groups: [] as { name: string; members: string[] }[],
   /** Fabric bytes/s per host, from counter differences between polls. */
@@ -189,6 +205,7 @@ function connect() {
       apply(m.data.status, m.data.stores, m.data.jobs, m.data.groups);
       app.disks = m.data.disks ?? {};
       app.newFiles = m.data.new_files ?? {};
+      storeRates(m.data.store_reads ?? {});
     } else if (m.type === "changed") app.changed++;
     else if (m.type === "lines") onLines?.(m.lines);
   };

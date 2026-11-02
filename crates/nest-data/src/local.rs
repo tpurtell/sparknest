@@ -319,7 +319,8 @@ impl DataNode {
         // A local NVMe, written like the host's own store.
         let store = ObjectStore::open(std::path::Path::new(&path))
             .ok()?
-            .window(4);
+            .window(4)
+            .own_disk();
         let a = Arc::new(Archive {
             id,
             name,

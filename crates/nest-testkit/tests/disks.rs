@@ -430,6 +430,16 @@ async fn new_files_go_where_their_host_says_and_survive_a_crash_mid_write() {
             .exists(nest_store::ObjectKey::new(*f, Generation(1)))
     }));
     // Hosts with one disk, and other hosts' writes, are unaffected.
+    // Reading them on n2 is a local read of D2, counted for D2 (not the
+    // primary, not an archive).
+    let before = c.node(2).vfs.store_reads();
+    let local0 = c.node(2).vfs.local_read_bytes();
+    assert_eq!(read_all(&c.node(2).vfs, on_d2[0]).await.len(), 1 << 20);
+    let after = c.node(2).vfs.store_reads();
+    let got = |v: &[(StoreId, u64)], s: StoreId| v.iter().find(|x| x.0 == s).unwrap().1;
+    assert_eq!(got(&after, s2) - got(&before, s2), 1 << 20);
+    assert_eq!(got(&after, StoreId(2)), got(&before, StoreId(2)));
+    assert_eq!(c.node(2).vfs.local_read_bytes() - local0, 1 << 20);
     let n1 = write_file(&c, 1, "n1-file", 9, 4096).await;
     assert_eq!(stores_of(&c, n1), vec![StoreId(1)]);
 

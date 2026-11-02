@@ -63,6 +63,11 @@ pub struct ObjectStore {
     /// Free bytes to report instead of statvfs's (tests on a shared disk,
     /// whose real free space moves under them). 0: statvfs.
     fixed_free: std::sync::atomic::AtomicU64,
+    /// Bytes read from this store's objects through sparknest (local reads
+    /// a host makes of its own disks; rates from differences).
+    read_bytes: std::sync::atomic::AtomicU64,
+    /// One of a host's own disks (not an archive): reads from it are local.
+    own_disk: bool,
 }
 
 /// Direct writes a transfer keeps in flight unless a store says otherwise.
@@ -106,6 +111,8 @@ impl ObjectStore {
             staging: root.join("staging"),
             reserve: std::sync::atomic::AtomicU64::new(0),
             fixed_free: std::sync::atomic::AtomicU64::new(0),
+            read_bytes: std::sync::atomic::AtomicU64::new(0),
+            own_disk: false,
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
             window: DEFAULT_WINDOW,
         })
@@ -133,9 +140,33 @@ impl ObjectStore {
             staging,
             reserve: std::sync::atomic::AtomicU64::new(0),
             fixed_free: std::sync::atomic::AtomicU64::new(0),
+            read_bytes: std::sync::atomic::AtomicU64::new(0),
+            own_disk: false,
             room: std::sync::Mutex::new((std::time::Instant::now(), 0)),
             window: DEFAULT_WINDOW,
         })
+    }
+
+    /// Mark this store as one of its host's own disks (ADR-073).
+    pub fn own_disk(mut self) -> Self {
+        self.own_disk = true;
+        self
+    }
+
+    /// Whether this is one of its host's own disks.
+    pub fn is_own_disk(&self) -> bool {
+        self.own_disk
+    }
+
+    /// Count `n` bytes read from this store.
+    pub fn count_read(&self, n: u64) {
+        self.read_bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bytes read from this store so far.
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn root(&self) -> &Path {

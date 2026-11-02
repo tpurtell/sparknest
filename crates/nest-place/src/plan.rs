@@ -952,11 +952,14 @@ fn make_speedup(
                 .push(format!("{host}: usage unknown (did not answer)"));
             continue;
         };
+        // On any of the host's disks: already local (reads from its other
+        // disks were once counted as archive reads, ADR-077).
         let have: HashSet<(FileId, Generation)> = w
             .copies_on
-            .get(&node)
-            .map(|v| v.iter().map(|c| (c.file, c.generation)).collect())
-            .unwrap_or_default();
+            .iter()
+            .filter(|(slot, _)| host_of(**slot) == node)
+            .flat_map(|(_, v)| v.iter().map(|c| (c.file, c.generation)))
+            .collect();
         let mut wanted: Vec<(u64, Copy)> = Vec::new();
         for u in used.values() {
             let net = u.remote_bytes + u.archive_bytes;

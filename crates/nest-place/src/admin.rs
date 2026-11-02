@@ -247,6 +247,9 @@ pub(crate) enum AdminReq {
         from: StoreId,
         to: Vec<StoreId>,
     },
+    /// Bytes read so far from each of this host's stores (ADR-077), for
+    /// per-disk rates. Answers `StoreReads`; older hosts with an error.
+    StoreReads,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -289,6 +292,7 @@ pub(crate) enum AdminResp {
     Net(Box<nest_types::NetReport>),
     PushLoads(Vec<nest_data::push_record::Record>),
     Disks(Vec<DiskInfo>),
+    StoreReads(Vec<(StoreId, u64)>),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -788,6 +792,7 @@ impl Handler for AdminService {
                 AdminReq::Info => AdminResp::Info(Box::new(a.info())),
                 AdminReq::Net => AdminResp::Net(Box::new(a.net())),
                 AdminReq::PushLoads { group } => AdminResp::PushLoads(a.push_loads(group)),
+                AdminReq::StoreReads => AdminResp::StoreReads(a.vfs.store_reads()),
                 AdminReq::Disks => {
                     let a = a.clone();
                     match tokio::task::spawn_blocking(move || a.disks()).await {

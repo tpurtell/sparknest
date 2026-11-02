@@ -2690,7 +2690,16 @@ subvolume, which refuses hard links even into a store on the same disk.
    files. A link into a disk is recorded with the same batch as an
    archive import. Adopting an existing blob tries every store the same
    way.
-5. **Unchanged:** placing, rules, plans and downloads aimed at a place go
+5. **A host's disks are local in its statistics.** Reads from its extra
+   disks had counted as archive reads (per-file usage, so a speed-up plan
+   could propose copying a file to the host that already held it on D2)
+   and were missing from its disk latencies and local read rate. They now
+   count as local, each store keeps a read counter (`StoreReads`, an
+   appended admin request older hosts refuse), and the I/O view shows a
+   column and a row per disk. A speed-up plan treats a copy on any of a
+   host's disks as already there, since older usage records still say
+   archive.
+6. **Unchanged:** placing, rules, plans and downloads aimed at a place go
    where they are told; the metadata database, Raft log and data reserve
    stay on the primary; a host with one disk behaves as before.
 

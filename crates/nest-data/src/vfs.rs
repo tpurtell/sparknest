@@ -544,6 +544,14 @@ impl Vfs {
         self.disk_bps.load(Ordering::Relaxed)
     }
 
+    /// Bytes read from each of this host's stores through sparknest: its
+    /// primary, then each usable extra disk.
+    pub fn store_reads(&self) -> Vec<(nest_types::StoreId, u64)> {
+        std::iter::once((self.me().live_store(), self.d.store().read_bytes()))
+            .chain(self.d.disks().iter().map(|d| (d.id, d.store.read_bytes())))
+            .collect()
+    }
+
     /// Each of this host's extra disks with its measured read rate
     /// (bytes/s, 0 until measured; ADR-073), kept beside its objects.
     pub fn disk_store_rates(&self) -> Vec<(nest_types::StoreId, u64)> {
@@ -694,13 +702,15 @@ impl Vfs {
         self.io.windows()
     }
 
-    /// Bytes read from this host's own disk through sparknest so far.
+    /// Bytes read from this host's own disks (its primary and extra
+    /// disks) through sparknest so far.
     pub fn local_read_bytes(&self) -> u64 {
         self.local_read_bytes.load(Ordering::Relaxed)
     }
 
+    /// A host's own disks (ADR-073) are local reads; archives are not.
     fn source_kind(&self, src: &Arc<nest_store::ObjectStore>) -> crate::usage::Source {
-        if Arc::ptr_eq(src, self.d.store()) {
+        if Arc::ptr_eq(src, self.d.store()) || src.is_own_disk() {
             crate::usage::Source::Local
         } else {
             crate::usage::Source::Archive
@@ -2576,6 +2586,7 @@ impl Vfs {
                     if kind == crate::usage::Source::Local {
                         self.io
                             .record(nest_fabric::iostats::Kind::Disk, size as u64, took);
+                        src.count_read(b.len() as u64);
                     }
                     self.count_read(&h, kind, b.len() as u64);
                 }
@@ -2769,14 +2780,16 @@ impl Vfs {
             let t = std::time::Instant::now();
             let r = from_file(&f);
             if r.is_ok() {
-                if self.source_kind(&src) == crate::usage::Source::Local {
-                    self.io
-                        .record(nest_fabric::iostats::Kind::Disk, size as u64, t.elapsed());
-                }
+                let kind = self.source_kind(&src);
                 // The bytes a read at `offset` can return, without asking
                 // the caller's result type for its length.
                 let n = a.size.saturating_sub(offset).min(size as u64);
-                self.count_read(&h, self.source_kind(&src), n);
+                if kind == crate::usage::Source::Local {
+                    self.io
+                        .record(nest_fabric::iostats::Kind::Disk, size as u64, t.elapsed());
+                    src.count_read(n);
+                }
+                self.count_read(&h, kind, n);
             }
             return Some(r);
         }
