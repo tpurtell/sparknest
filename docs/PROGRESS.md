@@ -3,6 +3,10 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-02 — 0.7.3 prepared
+
+ADR-077 and ADR-078 below. Not yet released or rolled out.
+
 ## 2026-11-02 — New files spread over a host's disks; disk-aware import; quiet rules (ADR-077, ADR-078)
 
 - New files written through a mount go to a host's disks by its
