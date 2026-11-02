@@ -2730,3 +2730,32 @@ shared-store blob the repos whose snapshots link to it).
 **Alternatives.** Waking only the rules whose selection changed: needs a
 map from every file to the rules covering it; the check is a few queries
 per rule per pass.
+
+## ADR-079 — A Hugging Face repo is deleted as a model, never as a folder (2026-11-02)
+
+**Context.** TJ deleted an old quant, GLM-5.2-EXL3-K3-calibrated-v1, with
+"Delete everywhere…" on its block in the Space view of the scratch store.
+The repo folder went, but its 41 weight files (307 GiB) stayed, listed as
+"other files" under `hub/blobs`. Since hf 2.x a repo's weights live once
+in the hub's shared store, keyed by Xet hash, and the repo's folder only
+links to them: a path delete removes the links and strands the weights.
+Only "Delete model" (`hf cache rm`) removed them, and the two looked the
+same in the UI.
+
+**Decision.**
+1. **The UI deletes a repo as a model** wherever it offers it: a model
+   block in the Space view says "Delete model…", and deleting a repo
+   folder in Files or Space runs the model delete. A model hf cannot see
+   (stale refs) says to run "Tidy hub…" first, instead of deleting the
+   folder.
+2. **`/v1/rm` refuses a repo folder, the hub, or a tree holding it** with
+   409 and the command that does it right (`nest hf rm`), so scripts and
+   `nest rm` cannot strand blobs either. Files inside a repo and the
+   shared store's own files stay path deletes. A dry run answers with
+   `hub_repo` so the UI can switch.
+3. **Stranded blobs** (from before this, or a repo removed some other way)
+   are what `hf cache prune` removes; "Tidy hub…" runs it.
+
+**Alternatives.** Having a path delete also remove the shared blobs whose
+`.refs` name only the removed repo: sparknest would be doing hf's
+bookkeeping itself, and a mistaken one deletes another repo's weights.

@@ -20,7 +20,7 @@ export async function copyTo(selector: string, hosts?: string[]) {
 
 /** Delete a Hugging Face repo from the hub, every copy: `hf cache rm` on
  *  the daemon's host (it knows which shared blobs other repos use). */
-export async function deleteModel(selector: string) {
+export async function deleteModel(selector: string, stay = false) {
   const label = selLabel(selector);
   let d: { repos?: number; revisions?: number; size?: string };
   try {
@@ -30,7 +30,10 @@ export async function deleteModel(selector: string) {
     return;
   }
   if (!d?.repos) {
-    await inform(`Nothing to delete`, `hf finds no ${label} in the hub.`);
+    await inform(
+      `hf cannot see ${label}`,
+      `Its refs may name a revision the hub does not hold. Run "Tidy hub…" in the Models view (it repairs them first), then delete it again: deleting the folder alone would leave its weights in the shared store.`,
+    );
     return;
   }
   const ok = await confirm(
@@ -41,7 +44,7 @@ export async function deleteModel(selector: string) {
   );
   if (!ok) return;
   await startJob("/v1/hf/remove", { targets: [selector] }, `Deleting ${label}`);
-  go("models");
+  if (!stay) go("models");
 }
 
 type RepairStep = { repo: string; action: string; ref: string; to: string; why: string };
@@ -227,7 +230,9 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
       { sep: true, label: "" },
       { label: dir ? "Download as .tar" : "Download", icon: "up", run: () => download(n.path!) },
       { label: "Show in files", icon: "files", run: () => go("files", n.kind === "file" ? n.path!.slice(0, n.path!.lastIndexOf("/")) || "/" : n.path!) },
-      { label: "Delete everywhere…", icon: "trash", danger: true, run: () => deletePath(n.path!, n.kind !== "file") },
+      n.kind === "repo"
+        ? { label: "Delete model…", icon: "trash", danger: true, run: () => deleteModel(sel, true) }
+        : { label: "Delete everywhere…", icon: "trash", danger: true, run: () => deletePath(n.path!, n.kind !== "file") },
     );
   }
   openMenu(x, y, n.name, sub, items);

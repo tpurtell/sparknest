@@ -141,6 +141,12 @@ paths:
       tags: [files]
       summary: Remove a file or (recursive) a tree
       operationId: rm
+      description: >-
+        409 for a Hugging Face repo folder under the hub, the hub itself or a
+        tree holding it (ADR-079): a repo's weights are in the hub's shared
+        store, so removing its folder would leave them unlinked. Delete it as
+        a model (`POST /v1/hf/remove`). A dry run of such a path answers with
+        `hub_repo`.
       requestBody:
         required: true
         content:
@@ -175,6 +181,11 @@ paths:
                     type: array
                     items:
                       type: string
+                  hub_repo:
+                    type: string
+                    description: >-
+                      The path is a hub repo (its selector, `hf:org/name`)
+                      or holds the hub (the hub's path); delete it as a model.
         default:
           $ref: "#/components/responses/Error"
 

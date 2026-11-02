@@ -19,7 +19,18 @@ export async function remove(path: string, dir: boolean): Promise<boolean> {
   let body = "This cannot be undone.";
   if (dir) {
     try {
-      const r = await post<{ files: number; dirs: number }>("/v1/rm", { path, recursive: true, dry_run: true });
+      const r = await post<{ files: number; dirs: number; hub_repo?: string }>("/v1/rm", { path, recursive: true, dry_run: true });
+      // A Hugging Face repo's weights are in the hub's shared store, not
+      // its folder: it is deleted as a model, which removes them too.
+      if (r.hub_repo?.startsWith("hf")) {
+        const { deleteModel } = await import("./actions");
+        await deleteModel(r.hub_repo, true);
+        return true;
+      }
+      if (r.hub_repo) {
+        toast(`${path} holds the Hugging Face hub: delete its models one by one (Models view), so their shared blobs go with them.`, true);
+        return false;
+      }
       body = `${r.files.toLocaleString()} files in ${r.dirs.toLocaleString()} folders, on every host that holds them. This cannot be undone.`;
     } catch {
       /* show the generic warning */

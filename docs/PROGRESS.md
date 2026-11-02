@@ -22,6 +22,9 @@ ADR-077 and ADR-078 below. Not yet released or rolled out.
   on production while maxq quantized); hosts keep 200 finished jobs.
 - Rules and Jobs show the model, file count and size; full paths in a
   Details dialog.
+- Deleting a Hugging Face repo from Space or Files deletes it as a model
+  (ADR-079): a folder delete had left GLM-5.2-EXL3-K3's 307 GiB of shared
+  blobs on scratch. `/v1/rm` refuses repo folders.
 - Reads from a host's extra disks count as local (they counted as archive
   reads, skewing usage and speed-up plans); the I/O view shows each disk.
 

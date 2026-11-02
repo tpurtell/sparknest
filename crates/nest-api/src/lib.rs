@@ -482,6 +482,19 @@ struct RmReq {
 /// Remove a file or (recursive) a tree, many entries per commit.
 async fn remove(State(api): State<Api>, Json(r): Json<RmReq>) -> R<serde_json::Value> {
     let path = api.ns(&r.path);
+    // A hub repo's weights are in the shared store, not under its folder:
+    // removing the folder would leave them, unlinked (ADR-079). Such
+    // deletes go through hf, which removes the blobs no other repo uses.
+    if !r.dry_run
+        && let Some(repo) = hub_repo_dir(&api.hub, &path)
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "{path} is a Hugging Face repo: delete it as a model (POST /v1/hf/remove {{\"targets\": [\"{repo}\"]}}, `nest hf rm {repo}`, or Delete model in the UI) so its shared blobs go too"
+            ),
+        ));
+    }
     let name = path
         .rsplit('/')
         .find(|c| !c.is_empty())
@@ -493,7 +506,35 @@ async fn remove(State(api): State<Api>, Json(r): Json<RmReq>) -> R<serde_json::V
         .vfs
         .remove_tree(parent, &name, r.recursive, r.dry_run)
         .await?;
-    Ok(Json(serde_json::to_value(rep).unwrap_or_default()))
+    let mut v = serde_json::to_value(rep).unwrap_or_default();
+    // A dry run tells the caller to delete a repo as a model instead.
+    if let Some(repo) = hub_repo_dir(&api.hub, &path) {
+        v["hub_repo"] = json!(repo);
+    }
+    Ok(Json(v))
+}
+
+/// The selector (`hf:org/name`, `hf-dataset:org/name`) of the hub repo
+/// whose folder `path` is, or which `path` contains (a hub of its own
+/// included); `None` for anything else, files inside a repo among them.
+fn hub_repo_dir(hub: &str, path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let (dir, name) = path.rsplit_once('/')?;
+    // The hub itself, or a tree holding it: every repo would lose its
+    // blobs' links at once.
+    let hub = hub.trim_end_matches('/');
+    if hub == path || hub.starts_with(&format!("{path}/")) {
+        return Some(hub.to_string());
+    }
+    if dir.trim_end_matches('/') != hub {
+        return None;
+    }
+    if let Some(r) = name.strip_prefix("models--") {
+        Some(format!("hf:{}", r.replacen("--", "/", 1)))
+    } else {
+        name.strip_prefix("datasets--")
+            .map(|r| format!("hf-dataset:{}", r.replacen("--", "/", 1)))
+    }
 }
 
 #[derive(Deserialize)]
@@ -2505,6 +2546,36 @@ async fn reset_setting(State(api): State<Api>, Path(name): Path<String>) -> R<se
     let s = known_setting(&name)?;
     put_setting(&api, s, None).await?;
     Ok(Json(json!({ "name": name, "value": s.default_value() })))
+}
+
+#[cfg(test)]
+mod hub_repo_tests {
+    use super::hub_repo_dir;
+
+    #[test]
+    fn repo_folders_are_recognised() {
+        let h = "/hf-home/hub";
+        assert_eq!(
+            hub_repo_dir(h, "/hf-home/hub/models--org--Name-v1").as_deref(),
+            Some("hf:org/Name-v1")
+        );
+        assert_eq!(
+            hub_repo_dir(h, "/hf-home/hub/datasets--org--set/").as_deref(),
+            Some("hf-dataset:org/set")
+        );
+        assert_eq!(
+            hub_repo_dir(h, "/hf-home/hub").as_deref(),
+            Some("/hf-home/hub")
+        );
+        assert_eq!(hub_repo_dir(h, "/hf-home").as_deref(), Some("/hf-home/hub"));
+        // Files inside a repo, the shared store and other trees stay plain.
+        assert_eq!(
+            hub_repo_dir(h, "/hf-home/hub/models--org--n/snapshots/abc/x"),
+            None
+        );
+        assert_eq!(hub_repo_dir(h, "/hf-home/hub/blobs/3e"), None);
+        assert_eq!(hub_repo_dir(h, "/datasets/imagenet"), None);
+    }
 }
 
 #[cfg(test)]
