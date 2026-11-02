@@ -2759,3 +2759,30 @@ same in the UI.
 **Alternatives.** Having a path delete also remove the shared blobs whose
 `.refs` name only the removed repo: sparknest would be doing hf's
 bookkeeping itself, and a mistaken one deletes another repo's weights.
+
+## ADR-080 — Hub refs are remembered by file version (2026-11-02)
+
+**Context.** The model list, a model's page and the Space and Files trees
+each named every snapshot's branches by reading every repo's `refs` files
+through the mount, one after another: 98 files of 40 bytes on production.
+A ref lives where the host that wrote it put it, on any Spark, an off-grid
+host or an archive store (offloading a model moves its refs too), so each
+read is an open and a fetch. Quiet, that cost 4.5 s per request against
+0.3 s for the rest of a tree; with raptor's disks busy moving models, reads
+took 200–600 ms each and the model page ran past the UI's 20 s limit
+("/v1/hf/detail did not answer within 20 s").
+
+**Decision.** Each API keeps the commit each ref named against the version
+of its file: generation, size, mtime and ctime from the metadata. The refs
+are listed from the metadata (milliseconds), and only a ref whose version
+changed is read again, through the VFS, sixteen at a time. A ref still owned
+by a writer (in its finalize linger) is read on every call and remembered
+once settled. A model's page uses the same lookup for its revisions, which
+also gives nested refs (`refs/pr/1`) their commits there.
+
+**Alternatives.** Watching the mount with inotify: the kernel sees only
+changes made through this host's own mount, and an `hf download` on a Spark
+writes refs through the Spark's. Following the metadata's change effects:
+correct while followed, but a restart or a lag needs a full re-read anyway,
+and comparing versions needs no bookkeeping. A time-based cache: stale
+branch names for its lifetime after any download.

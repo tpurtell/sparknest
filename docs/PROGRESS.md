@@ -5,7 +5,17 @@ what is next. Keep entries short; link to benchmarks and ADRs.
 
 ## 2026-11-02 — 0.7.3 prepared
 
-ADR-077 and ADR-078 below. Not yet released or rolled out.
+ADR-077 to ADR-080 below. Not yet released or rolled out.
+
+## 2026-11-02 — Hub refs remembered by file version (ADR-080)
+
+The model page timed out ("did not answer within 20 s") while raptor's
+disks moved models: every model view read all 98 refs through the mount
+one by one, 4.5 s quiet and over 20 s busy. Refs are now listed from the
+metadata and read again only when their file's version changes, sixteen
+at a time (`hub_refs_are_read_again_only_when_changed`). Production
+before: `/v1/space/tree` 4.9 s against 0.3 s without refs, `/v1/hf` 9.8 s,
+`/v1/hf/detail` 5–7 s.
 
 ## 2026-11-02 — New files spread over a host's disks; disk-aware import; quiet rules (ADR-077, ADR-078)
 

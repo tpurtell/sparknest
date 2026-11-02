@@ -1226,6 +1226,7 @@ dependencies = [
  "bytes",
  "futures",
  "libc",
+ "nest-api",
  "nest-data",
  "nest-fabric",
  "nest-meta",

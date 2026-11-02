@@ -41,6 +41,26 @@ pub struct Api {
     pub host: String,
     /// Live updates for web UI subscribers.
     pub events: Arc<events::Events>,
+    /// Hub refs already read, by file and version (`hub_refs`).
+    pub refs_cache: Arc<RefsCache>,
+}
+
+/// Each hub ref's commit against the version of its file that held it,
+/// and how many refs have been read through the VFS (for tests).
+#[derive(Default)]
+pub struct RefsCache {
+    known: std::sync::Mutex<HashMap<nest_types::FileId, (RefVersion, String)>>,
+    reads: std::sync::atomic::AtomicU64,
+}
+
+/// A file's generation, size, mtime and ctime: any change to it, made on
+/// any host, changes one of them.
+type RefVersion = (u64, u64, i64, i64);
+
+impl RefsCache {
+    pub fn reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// The web/API bearer token: HMAC of a fixed label under the cluster secret,
@@ -1159,53 +1179,121 @@ fn mount_hub(api: &Api) -> Result<std::path::PathBuf, ApiError> {
 }
 
 /// Every hub repo's refs: repo directory → commit → the branch and tag
-/// names (`refs/<name>`, `refs/pr/1`) naming it, read through this node's
-/// mount on a blocking thread. Empty without a mount.
-async fn hub_refs(api: &Api) -> HashMap<String, HashMap<String, Vec<String>>> {
-    let Ok(hub) = mount_hub(api) else {
+/// names (`refs/<name>`, `refs/pr/1`) naming it. The files are listed from
+/// the metadata, and a ref's commit is remembered against its file's
+/// version (generation, size, mtime, ctime): only a ref changed since, by
+/// any host, is read again, through the VFS and several at once. A ref
+/// still being written is read each time and not remembered.
+pub async fn hub_refs(api: &Api) -> HashMap<String, HashMap<String, Vec<String>>> {
+    let cache = &api.refs_cache;
+    let Ok(c) = api.conn() else {
         return HashMap::new();
     };
-    tokio::task::spawn_blocking(move || {
-        let mut out: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
-        for e in std::fs::read_dir(&hub).into_iter().flatten().flatten() {
-            let dir = e.file_name().to_string_lossy().into_owned();
-            if !(dir.starts_with("models--") || dir.starts_with("datasets--")) {
+    let hub = api.hub.clone();
+    // (repo directory, ref name, file, version, settled)
+    let listed = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let Ok((hub_id, _)) = selector::resolve_path(&c, &hub) else {
+            return out;
+        };
+        for (_, name, a) in query::readdir_attrs(&c, hub_id, 0, 100_000).unwrap_or_default() {
+            let dir = String::from_utf8_lossy(&name).into_owned();
+            if a.kind != FileKind::Directory
+                || !(dir.starts_with("models--") || dir.starts_with("datasets--"))
+            {
                 continue;
             }
-            let root = e.path().join("refs");
-            let mut stack = vec![root.clone()];
-            while let Some(d) = stack.pop() {
-                for f in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                    let p = f.path();
-                    if p.is_dir() {
-                        stack.push(p);
-                        continue;
+            let Ok(Some(refs)) = query::lookup(&c, a.id, b"refs") else {
+                continue;
+            };
+            let mut stack = vec![(refs, String::new())];
+            while let Some((d, prefix)) = stack.pop() {
+                for (_, n, a) in query::readdir_attrs(&c, d, 0, 10_000).unwrap_or_default() {
+                    let n = String::from_utf8_lossy(&n).into_owned();
+                    let rel = if prefix.is_empty() {
+                        n
+                    } else {
+                        format!("{prefix}/{n}")
+                    };
+                    match a.kind {
+                        FileKind::Directory => stack.push((a.id, rel)),
+                        FileKind::Regular => out.push((
+                            dir.clone(),
+                            rel,
+                            a.id,
+                            (a.generation.0, a.size, a.mtime.0, a.ctime.0),
+                            a.gen_state == GenState::Stable,
+                        )),
+                        _ => {}
                     }
-                    let Ok(body) = std::fs::read_to_string(&p) else {
-                        continue;
-                    };
-                    let commit = body.trim().to_string();
-                    let Ok(name) = p.strip_prefix(&root) else {
-                        continue;
-                    };
-                    out.entry(dir.clone())
-                        .or_default()
-                        .entry(commit)
-                        .or_default()
-                        .push(name.to_string_lossy().into_owned());
                 }
-            }
-        }
-        // main first, then by name: the first names a revision's selector.
-        for m in out.values_mut() {
-            for v in m.values_mut() {
-                v.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
             }
         }
         out
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    let mut commits: HashMap<nest_types::FileId, String> = HashMap::new();
+    let mut stale = Vec::new();
+    {
+        let mut m = cache.known.lock().unwrap_or_else(|e| e.into_inner());
+        let live: std::collections::HashSet<_> = listed.iter().map(|l| l.2).collect();
+        m.retain(|id, _| live.contains(id));
+        for (_, _, id, v, settled) in &listed {
+            match m.get(id) {
+                Some((had, commit)) if had == v && *settled => {
+                    commits.insert(*id, commit.clone());
+                }
+                _ => stale.push((*id, *v, *settled)),
+            }
+        }
+    }
+    use futures::StreamExt;
+    let read: Vec<_> = futures::stream::iter(stale)
+        .map(|(id, v, settled)| async move {
+            let (fh, _) = api.vfs.open(id, 0).await.ok()?;
+            let body = api.vfs.read(fh, 0, 256).await;
+            api.vfs.release(fh, None).await;
+            Some((
+                id,
+                v,
+                settled,
+                String::from_utf8_lossy(&body.ok()?).trim().to_string(),
+            ))
+        })
+        .buffer_unordered(16)
+        .filter_map(|r| async move { r })
+        .collect()
+        .await;
+    cache
+        .reads
+        .fetch_add(read.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut m = cache.known.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, v, settled, commit) in read {
+            if settled {
+                m.insert(id, (v, commit.clone()));
+            }
+            commits.insert(id, commit);
+        }
+    }
+    let mut out: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    for (dir, name, id, _, _) in listed {
+        if let Some(commit) = commits.get(&id) {
+            out.entry(dir)
+                .or_default()
+                .entry(commit.clone())
+                .or_default()
+                .push(name);
+        }
+    }
+    // main first, then by name: the first names a revision's selector.
+    for m in out.values_mut() {
+        for v in m.values_mut() {
+            v.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
+        }
+    }
+    out
 }
 
 fn hf_program(given: Option<String>) -> Result<std::path::PathBuf, ApiError> {
@@ -1758,6 +1846,7 @@ async fn hf_detail(State(api): State<Api>, Query(q): Query<DetailQ>) -> R<serde_
             .into_iter()
             .map(|(id, n, _)| (id, n)),
     );
+    let all_refs = hub_refs(&api).await;
     let req = nest_place::space::TreeReq {
         store: None,
         weight: nest_place::space::Weight::Logical,
@@ -1767,7 +1856,7 @@ async fn hf_detail(State(api): State<Api>, Query(q): Query<DetailQ>) -> R<serde_
         max_children: 100_000,
         hub: api.hub.clone(),
         store_names,
-        refs: hub_refs(&api).await,
+        refs: all_refs.clone(),
     };
     let c = api.conn()?;
     let want = sel.describe();
@@ -1808,40 +1897,23 @@ async fn hf_detail(State(api): State<Api>, Query(q): Query<DetailQ>) -> R<serde_
             None => nest_place::space::TreeNode::default(),
         }
     };
-    // Revisions and refs.
+    // Revisions and the refs naming them.
+    let dir_name = dir.rsplit('/').next().unwrap_or_default();
+    let named = all_refs.get(dir_name);
     let mut revisions: Vec<serde_json::Value> = Vec::new();
-    let mut refs: Vec<(String, nest_types::FileId)> = Vec::new();
     {
         let c = api.conn()?;
         if let Ok((sid, _)) = selector::resolve_path(&c, &format!("{dir}/snapshots")) {
             for (_, e) in query::readdir(&c, sid, 0, 1000).map_err(|e| bad(e.to_string()))? {
                 let name = String::from_utf8_lossy(&e.name).into_owned();
                 if name != "." && name != ".." {
-                    revisions.push(json!({ "commit": name, "refs": [] }));
+                    let refs = named
+                        .and_then(|m| m.get(&name))
+                        .cloned()
+                        .unwrap_or_default();
+                    revisions.push(json!({ "commit": name, "refs": refs }));
                 }
             }
-        }
-        if let Ok((rid, _)) = selector::resolve_path(&c, &format!("{dir}/refs")) {
-            for (_, e) in query::readdir(&c, rid, 0, 1000).map_err(|e| bad(e.to_string()))? {
-                let name = String::from_utf8_lossy(&e.name).into_owned();
-                if name != "." && name != ".." {
-                    refs.push((name, e.id));
-                }
-            }
-        }
-    }
-    for (name, id) in refs {
-        let Ok((fh, _)) = api.vfs.open(id, 0).await else {
-            continue;
-        };
-        let body = api.vfs.read(fh, 0, 256).await.unwrap_or_default();
-        api.vfs.release(fh, None).await;
-        let commit = String::from_utf8_lossy(&body).trim().to_string();
-        if let Some(r) = revisions
-            .iter_mut()
-            .find(|r| r["commit"] == commit.as_str())
-        {
-            r["refs"].as_array_mut().expect("array").push(json!(name));
         }
     }
     let rules: Vec<_> = api

@@ -445,6 +445,7 @@ impl Node {
             web_addr: cfg.node.api_listen,
             host: cfg.node.name.clone(),
             events: Default::default(),
+            refs_cache: Default::default(),
         };
         let sock = cfg.api_socket();
         let web_addr = cfg.node.api_listen;
