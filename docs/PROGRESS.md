@@ -3,9 +3,15 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-11-04 — 0.8.0 prepared
+## 2026-11-04 — 0.8.0 released; the fabric tuned for it
 
-ADR-084 below. Not yet released or rolled out.
+ADR-084 below. Switch: `sparknest-qos.rsc` imported (DSCP 18 → class 2,
+PFC on classes 2 and 3 on the seven fabric ports). Every fabric host's
+NICs: cuteafd's own tuning rolled back, then `sparknest-fabric-qos apply`
+and `persist`; each port tuned, its boot unit enabled. 0.8.0 on all ten
+hosts, each back in 3–13 s; fabrics log `traffic_class=72 dscp=18`. The
+tool's check misread newer iproute2's three-field DSCP entries (fixed
+here). A Muse push comparison waits for a current-dev Muse build.
 
 ## 2026-11-04 — SparkNest's own fabric class (ADR-084)
 

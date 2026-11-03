@@ -82,7 +82,7 @@ export verbose` first; the file names this cluster's ports.
 
 ```sh
 scp tools/fabric-qos/sparknest-qos*.rsc admin@switch:
-ssh admin@switch '/import file-name=sparknest-qos.rsc verbose=yes dry-run=yes'
+ssh admin@switch '/import file-name=sparknest-qos.rsc verbose=yes dry-run'
 ssh admin@switch '/import file-name=sparknest-qos.rsc verbose=yes'
 ```
 

@@ -118,6 +118,12 @@ def state(netdev):
     }
 
 
+def dscp_prio(s):
+    """{dscp: priority} from `dcb -j app show`; newer iproute2 adds a third
+    field (the selector's name) to each entry."""
+    return {int(e[0]): int(e[1]) for e in s["app"].get("dscp_prio", [])}
+
+
 def mutate(dry, *argv):
     print(("DRY-RUN " if dry else "") + " ".join(argv), flush=True)
     if not dry:
@@ -125,7 +131,7 @@ def mutate(dry, *argv):
 
 
 def tuned(s):
-    mapped = {d: p for d, p in s["app"].get("dscp_prio", [])}
+    mapped = dscp_prio(s)
     return (s["trust"] == "dscp" and s["pfc"] == PFC.split(",")
             and all(mapped.get(d, 0) == DSCP_PRIO.get(d, 0) for d in range(64))
             and s["pause"]["rx"] == "off" and s["pause"]["tx"] == "off"
@@ -134,7 +140,7 @@ def tuned(s):
 
 def same_policy(a, b):
     """The fields apply changes (buffer sizes aside: the driver sets those)."""
-    m = lambda s: sorted(map(tuple, s["app"].get("dscp_prio", [])))
+    m = lambda s: sorted(dscp_prio(s).items())
     return (a["trust"], a["pfc"], a["buffers"], a["pause"], m(a)) == \
         (b["trust"], b["pfc"], b["buffers"], b["pause"], m(b))
 
@@ -150,7 +156,7 @@ def other_owner():
 def check(ports):
     for netdev, dev in ports:
         s = state(netdev)
-        mapped = {d: p for d, p in s["app"].get("dscp_prio", [])}
+        mapped = dscp_prio(s)
         good = tuned(s)
         print(f"{netdev} ({dev}): trust={s['trust']} pfc={''.join(s['pfc'])} "
               f"buffers={''.join(s['buffers'])} sizes={','.join(s['sizes'])} "
@@ -270,9 +276,9 @@ def rollback(dry):
         mutate(dry, "mlnx_qos", "-i", netdev, "--prio2buffer", ",".join(s["buffers"]))
         mutate(dry, "mlnx_qos", "-i", netdev, "--buffer_size", ",".join(s["sizes"]))
         mutate(dry, "dcb", "app", "flush", "dev", netdev, "dscp-prio")
-        pairs = s["app"].get("dscp_prio", [])
+        pairs = dscp_prio(s)
         if pairs:
-            mutate(dry, "dcb", "app", "add", "dev", netdev, "dscp-prio", *[f"{d}:{p}" for d, p in pairs])
+            mutate(dry, "dcb", "app", "add", "dev", netdev, "dscp-prio", *[f"{d}:{p}" for d, p in sorted(pairs.items())])
         mutate(dry, "mlnx_qos", "-i", netdev, "--trust", s["trust"])
         mutate(dry, "mlnx_qos", "-i", netdev, "--pfc", ",".join(s["pfc"]))
         p = s["pause"]
