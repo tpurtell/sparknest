@@ -29,6 +29,15 @@ Measured on raptor plus six DGX Sparks at 100G per rail
 rdmasync), reads from a host without a copy at 5 GB/s over the fabric, and
 from a local copy at 9.6 GB/s cold and 85 GB/s warm.
 
+## A lossless fabric
+
+SparkNest marks its RDMA **DSCP 18** (priority 2), a class of its own below
+an inference engine's DSCP 26 (priority 3). With the hosts and switch tuned
+for it, SparkNest's traffic is never dropped under incast and always yields
+to the engine's; untuned, it travels in the default lossy queue as before.
+[`docs/LOSSLESS.md`](docs/LOSSLESS.md) has the host script and the MikroTik
+switch configuration (`tools/fabric-qos/`).
+
 ## Install
 
 ```sh
@@ -55,6 +64,8 @@ nest ui                                       # link to the web UI
 
 - [`docs/INSTALL.md`](docs/INSTALL.md): installing and running a cluster.
 - [`docs/MIGRATION.md`](docs/MIGRATION.md): moving existing caches in.
+- [`docs/LOSSLESS.md`](docs/LOSSLESS.md): tuning hosts and switch for
+  SparkNest's fabric class.
 - [`PROPOSAL.md`](PROPOSAL.md): the design.
   [`docs/DECISIONS.md`](docs/DECISIONS.md): why it is built this way.
 - [`ROADMAP.md`](ROADMAP.md), [`docs/PROGRESS.md`](docs/PROGRESS.md),

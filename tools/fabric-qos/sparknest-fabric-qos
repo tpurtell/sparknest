@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Tune one host's ConnectX NICs for SparkNest's fabric class (ADR-084).
+
+    sparknest-fabric-qos check              show each fabric NIC's QoS state
+    sparknest-fabric-qos apply [--dry-run]  set the policy below (root)
+    sparknest-fabric-qos rollback [--dry-run]  restore what apply saved (root)
+    sparknest-fabric-qos persist            reapply at every boot (root)
+    sparknest-fabric-qos boot               what the boot unit runs
+
+The policy, on every active RoCE port with a 10.55.0.x/10.55.1.x address:
+  - trust DSCP (not PCP: the fabric links are untagged);
+  - DSCP 18 -> priority 2 (SparkNest), DSCP 26 -> priority 3 (the engine),
+    DSCP 48 -> priority 6 (the engine's CNPs), every other DSCP -> 0;
+  - PFC on priorities 2 and 3 only, each in its own receive buffer, so a
+    pause of one class never stops the other (the driver sizes headroom
+    from the link's speed, MTU and cable length);
+  - global 802.3x pause off: it stops the whole port, every class at once.
+
+One tool owns a NIC's QoS: apply refuses while the engine's own tuning
+(cuteafd's fabric-lossless) holds saved state; roll that back first, so the
+state saved here is the NIC's true original. apply saves each NIC's state to
+/var/lib/sparknest/fabric-qos/ before its first change and refuses to run
+over a saved state; rollback restores it.
+
+The settings live in the NIC, so a reboot or NIC reset loses them. persist
+installs a root-owned copy of this script in /usr/local/sbin and a oneshot
+unit, sparknest-fabric-qos.service, that runs `boot` after the network is
+up: for each fabric NIC with saved state, it does nothing if the NIC is
+tuned, reapplies if it is back at its saved original, and otherwise refuses
+(and fails the unit) rather than overwrite a state it does not know.
+Needs mlnx_qos (mlnx-tools), dcb (iproute2) and ethtool. Run it as root
+(agent-sudo) only with no load running: changing a NIC's buffers drops the
+link for a moment.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+STATE = Path("/var/lib/sparknest/fabric-qos")
+# The engine's own NIC tuning; its saved state means it owns the NICs.
+OTHER_OWNER = Path("/var/lib/cuteafd/fabric-lossless")
+INSTALLED = Path("/usr/local/sbin/sparknest-fabric-qos")
+UNIT = Path("/etc/systemd/system/sparknest-fabric-qos.service")
+UNIT_TEXT = """[Unit]
+Description=SparkNest fabric class on this host's RoCE NICs (docs/LOSSLESS.md)
+Wants=network-online.target
+After=network-online.target
+Before=sparknestd@sparknest.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sparknest-fabric-qos boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+DSCP_PRIO = {18: 2, 26: 3, 48: 6}
+PFC = "0,0,1,1,0,0,0,0"
+# Lossy traffic in buffer 0, SparkNest's class in 1, the engine's in 2.
+PRIO2BUFFER = "0,0,1,2,0,0,0,0"
+
+
+def run(*argv):
+    return subprocess.check_output(argv, text=True, timeout=30).strip()
+
+
+def fabric_ports():
+    """(netdev, rdma device) for each active Ethernet RDMA port on the fabric."""
+    out = []
+    for port in sorted(Path("/sys/class/infiniband").glob("*/ports/*")):
+        if not (port / "state").read_text().strip().endswith("ACTIVE"):
+            continue
+        if (port / "link_layer").read_text().strip() != "Ethernet":
+            continue
+        for ndev in sorted((port / "gid_attrs/ndevs").glob("*")):
+            try:
+                netdev = ndev.read_text().strip()
+            except OSError:
+                continue
+            if not netdev:
+                continue
+            addrs = json.loads(run("ip", "-j", "-4", "addr", "show", "dev", netdev))
+            if any(a.get("local", "").startswith(("10.55.0.", "10.55.1."))
+                   for link in addrs for a in link.get("addr_info", [])):
+                out.append((netdev, port.parent.parent.name))
+                break
+    out = sorted(set(out))
+    if not out:
+        raise SystemExit("no active RoCE port with a 10.55.0.x/10.55.1.x address")
+    return out
+
+
+def state(netdev):
+    text = run("mlnx_qos", "-i", netdev)
+
+    def field(pattern):
+        m = re.search(pattern, text, re.M)
+        if not m:
+            raise SystemExit(f"{netdev}: unexpected mlnx_qos output ({pattern})")
+        return m.group(1)
+
+    pause = run("ethtool", "-a", netdev)
+    return {
+        "netdev": netdev,
+        "dcbx_os": "DCBX mode: OS controlled" in text,
+        "trust": field(r"^Priority trust state: (pcp|dscp)$"),
+        "pfc": field(r"^\s*enabled\s+([01](?:\s+[01]){7})\s*$").split(),
+        "buffers": field(r"^\s*buffer\s+([0-7](?:\s+[0-7]){7})\s*$").split(),
+        "sizes": field(r"^Receive buffer size \(bytes\): ([0-9,]+)").rstrip(",").split(","),
+        "app": json.loads(run("dcb", "-j", "-N", "app", "show", "dev", netdev) or "{}"),
+        "pause": {k: re.search(rf"^{label}:\s+(on|off)", pause, re.M).group(1)
+                  for k, label in (("autoneg", "Autonegotiate"), ("rx", "RX"), ("tx", "TX"))},
+    }
+
+
+def mutate(dry, *argv):
+    print(("DRY-RUN " if dry else "") + " ".join(argv), flush=True)
+    if not dry:
+        run(*argv)
+
+
+def tuned(s):
+    mapped = {d: p for d, p in s["app"].get("dscp_prio", [])}
+    return (s["trust"] == "dscp" and s["pfc"] == PFC.split(",")
+            and all(mapped.get(d, 0) == DSCP_PRIO.get(d, 0) for d in range(64))
+            and s["pause"]["rx"] == "off" and s["pause"]["tx"] == "off"
+            and s["buffers"] == PRIO2BUFFER.split(","))
+
+
+def same_policy(a, b):
+    """The fields apply changes (buffer sizes aside: the driver sets those)."""
+    m = lambda s: sorted(map(tuple, s["app"].get("dscp_prio", [])))
+    return (a["trust"], a["pfc"], a["buffers"], a["pause"], m(a)) == \
+        (b["trust"], b["pfc"], b["buffers"], b["pause"], m(b))
+
+
+def other_owner():
+    """Saved state of the engine's own NIC tuning, if it holds any."""
+    try:
+        return [p for p in OTHER_OWNER.glob("*.json") if ".restored." not in p.name]
+    except PermissionError:
+        return None
+
+
+def check(ports):
+    for netdev, dev in ports:
+        s = state(netdev)
+        mapped = {d: p for d, p in s["app"].get("dscp_prio", [])}
+        good = tuned(s)
+        print(f"{netdev} ({dev}): trust={s['trust']} pfc={''.join(s['pfc'])} "
+              f"buffers={''.join(s['buffers'])} sizes={','.join(s['sizes'])} "
+              f"dscp18->{mapped.get(18, '-')} dscp26->{mapped.get(26, '-')} "
+              f"global-pause rx={s['pause']['rx']} tx={s['pause']['tx']} "
+              f"=> {'tuned' if good else 'NOT tuned'}")
+
+
+def apply(ports, dry):
+    if os.geteuid() != 0 and not dry:
+        raise SystemExit("apply needs root (agent-sudo); --dry-run shows the commands")
+    held = other_owner()
+    if held:
+        raise SystemExit(f"the engine's NIC tuning holds saved state ({', '.join(map(str, held))}); "
+                         "roll it back first so one tool owns these NICs")
+    if held is None:
+        if not dry:
+            raise SystemExit(f"cannot read {OTHER_OWNER}")
+        print(f"(not root: cannot see whether {OTHER_OWNER} holds saved state; apply checks)")
+    plans = []
+    for netdev, dev in ports:
+        s = state(netdev)
+        if not s["dcbx_os"]:
+            raise SystemExit(f"{netdev}: DCBX is not OS controlled; not changing it here")
+        if (STATE / f"{netdev}.json").exists():
+            raise SystemExit(f"{netdev}: a saved state exists; rollback first")
+        total = sum(map(int, s["sizes"]))
+        # Split the port's receive memory three ways: lossy, SparkNest, engine.
+        third = total // 3 // 1024 * 1024
+        if third < 131072:
+            raise SystemExit(f"{netdev}: {total} bytes of receive buffer is too little for two lossless classes")
+        plans.append((netdev, s, third))
+    if not dry:
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for netdev, s, _ in plans:
+            with open(STATE / f"{netdev}.json", "x") as f:
+                json.dump(s, f, indent=1)
+    for netdev, s, third in plans:
+        print(f"{netdev}: state saved to {STATE / (netdev + '.json')}")
+        set_policy(netdev, third, dry)
+    if not dry:
+        check(ports)
+
+
+def third_of(s):
+    return sum(map(int, s["sizes"])) // 3 // 1024 * 1024
+
+
+def set_policy(netdev, third, dry):
+    mutate(dry, "ethtool", "-A", netdev, "autoneg", "off", "rx", "off", "tx", "off")
+    mutate(dry, "mlnx_qos", "-i", netdev, "--buffer_size", ",".join([str(third)] * 3 + ["0"] * 5))
+    mutate(dry, "mlnx_qos", "-i", netdev, "--prio2buffer", PRIO2BUFFER)
+    mutate(dry, "dcb", "app", "flush", "dev", netdev, "dscp-prio")
+    mutate(dry, "mlnx_qos", "-i", netdev,
+           *[f"--dscp2prio=set,{d},{DSCP_PRIO.get(d, 0)}" for d in range(64)])
+    # mlnx_qos refuses trust and dscp2prio in one call.
+    mutate(dry, "mlnx_qos", "-i", netdev, "--trust", "dscp")
+    mutate(dry, "mlnx_qos", "-i", netdev, "--pfc", PFC)
+
+
+def boot(ports):
+    """Reapply after a reboot: only over a NIC's saved original, never over
+    a state this tool does not know."""
+    if os.geteuid() != 0:
+        raise SystemExit("boot runs as root, from sparknest-fabric-qos.service")
+    refused = []
+    for netdev, dev in ports:
+        path = STATE / f"{netdev}.json"
+        if not path.exists():
+            print(f"{netdev}: no saved state (never applied here); leaving it")
+            continue
+        saved = json.loads(path.read_text())
+        now = state(netdev)
+        if tuned(now):
+            print(f"{netdev}: tuned")
+        elif same_policy(now, saved):
+            print(f"{netdev}: back at its saved original; reapplying")
+            set_policy(netdev, third_of(saved), False)
+        else:
+            print(f"{netdev}: neither tuned nor its saved original; not changing it")
+            refused.append(netdev)
+    if refused:
+        raise SystemExit(f"unknown NIC state on {', '.join(refused)}: inspect, then rollback or apply by hand")
+    check(ports)
+
+
+def persist():
+    """Install a root-owned copy and the boot unit, and enable it."""
+    if os.geteuid() != 0:
+        raise SystemExit("persist needs root (agent-sudo)")
+    import shutil
+    tmp = INSTALLED.with_suffix(".new")
+    shutil.copyfile(Path(__file__).resolve(), tmp)
+    os.chown(tmp, 0, 0)
+    tmp.chmod(0o755)
+    tmp.rename(INSTALLED)
+    UNIT.write_text(UNIT_TEXT)
+    UNIT.chmod(0o644)
+    run("systemctl", "daemon-reload")
+    run("systemctl", "enable", UNIT.name)
+    print(f"installed {INSTALLED} and {UNIT} (enabled); remove: systemctl disable {UNIT.name}")
+
+
+def rollback(dry):
+    if os.geteuid() != 0 and not dry:
+        raise SystemExit("rollback needs root (agent-sudo); --dry-run shows the commands")
+    saved = sorted(STATE.glob("*.json")) if STATE.is_dir() else []
+    saved = [p for p in saved if ".restored." not in p.name]
+    if not saved:
+        print("nothing saved; nothing to restore")
+    for path in saved:
+        s = json.loads(path.read_text())
+        netdev = s["netdev"]
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", netdev) or path.name != f"{netdev}.json":
+            raise SystemExit(f"{path}: not a saved state")
+        mutate(dry, "mlnx_qos", "-i", netdev, "--pfc", "0,0,0,0,0,0,0,0")
+        mutate(dry, "mlnx_qos", "-i", netdev, "--prio2buffer", ",".join(s["buffers"]))
+        mutate(dry, "mlnx_qos", "-i", netdev, "--buffer_size", ",".join(s["sizes"]))
+        mutate(dry, "dcb", "app", "flush", "dev", netdev, "dscp-prio")
+        pairs = s["app"].get("dscp_prio", [])
+        if pairs:
+            mutate(dry, "dcb", "app", "add", "dev", netdev, "dscp-prio", *[f"{d}:{p}" for d, p in pairs])
+        mutate(dry, "mlnx_qos", "-i", netdev, "--trust", s["trust"])
+        mutate(dry, "mlnx_qos", "-i", netdev, "--pfc", ",".join(s["pfc"]))
+        p = s["pause"]
+        mutate(dry, "ethtool", "-A", netdev, "autoneg", p["autoneg"], "rx", p["rx"], "tx", p["tx"])
+        if not dry:
+            path.rename(path.with_name(f"{netdev}.restored.{time.time_ns()}.json"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("action", choices=("check", "apply", "rollback", "persist", "boot"))
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    if a.action == "check":
+        check(fabric_ports())
+    elif a.action == "apply":
+        apply(fabric_ports(), a.dry_run)
+    elif a.action == "rollback":
+        rollback(a.dry_run)
+    elif a.action == "persist":
+        persist()
+    else:
+        boot(fabric_ports())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.SubprocessError as e:
+        raise SystemExit(f"sparknest-fabric-qos: {e}; stop, inspect, and roll back if apply was partial")

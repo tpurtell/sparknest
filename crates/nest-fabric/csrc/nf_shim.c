@@ -277,7 +277,7 @@ static void nf_rd_atomic(struct ibv_context *ctx, uint8_t *init, uint8_t *dest)
 
 int nf_qp_connect(struct nf_qp *q, uint8_t port, int sgid_index, uint32_t local_psn,
 		  const uint8_t remote_gid[16], uint32_t remote_qpn, uint32_t remote_psn,
-		  uint32_t mtu)
+		  uint32_t mtu, uint8_t traffic_class)
 {
 	struct ibv_qp_attr a;
 	uint8_t rd_init, rd_dest;
@@ -294,6 +294,12 @@ int nf_qp_connect(struct nf_qp *q, uint8_t port, int sgid_index, uint32_t local_
 	memcpy(a.ah_attr.grh.dgid.raw, remote_gid, 16);
 	a.ah_attr.grh.sgid_index = (uint8_t)sgid_index;
 	a.ah_attr.grh.hop_limit = 64;
+	/* The IP header's TOS byte on RoCE v2: DSCP in its top six bits, which a
+	 * DSCP-trusting NIC and switch map to a priority (ADR-084). The service
+	 * level is the DSCP's class selector, the priority a PCP-trusting NIC
+	 * would use, so priority PFC also pauses this QP's sends. */
+	a.ah_attr.grh.traffic_class = traffic_class;
+	a.ah_attr.sl = traffic_class >> 5;
 	if (ibv_modify_qp(q->qp, &a, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU
 			  | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC
 			  | IBV_QP_MIN_RNR_TIMER))

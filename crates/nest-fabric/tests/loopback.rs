@@ -43,8 +43,9 @@ fn write_with_imm_and_send_over_loopback() {
         gid: rail.gid,
         mtu,
     };
-    a.connect(rail.gid_index, ia.psn, &ib, mtu).unwrap();
-    b.connect(rail.gid_index, ib.psn, &ia, mtu).unwrap();
+    let tc = nest_fabric::TRAFFIC_CLASS;
+    a.connect(rail.gid_index, ia.psn, &ib, mtu, tc).unwrap();
+    b.connect(rail.gid_index, ib.psn, &ia, mtu, tc).unwrap();
 
     let src = Region::new(&ctx, 4 << 20, false).unwrap();
     let dst = Region::new(&ctx, 4 << 20, true).unwrap();

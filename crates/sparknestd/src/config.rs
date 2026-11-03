@@ -206,9 +206,19 @@ pub struct FabricSection {
     /// cap). 0: 2 ms of this host's links, at least 64 MiB.
     #[serde(default)]
     pub inflight_mib: u64,
+    /// The TOS byte on this host's RDMA packets (ADR-084): 72 (DSCP 18,
+    /// SparkNest's own class) unless set; 0 sends them unmarked. Every host
+    /// should agree, and the fabric be tuned for it (`docs/LOSSLESS.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_class: Option<u8>,
 }
 
 impl FabricSection {
+    /// The TOS byte for RDMA packets.
+    pub fn traffic_class(&self) -> u8 {
+        self.traffic_class.unwrap_or(nest_fabric::TRAFFIC_CLASS)
+    }
+
     /// The incast cap in bytes (0: the fabric's default).
     pub fn inflight_bytes(&self) -> u64 {
         match (self.inflight_mib, self.max_inflight) {
@@ -395,6 +405,27 @@ mod tests {
         let cfg: Config = toml::from_str(old).unwrap();
         assert_eq!(cfg.cluster.members[0].lan, None);
         assert!(!toml::to_string(&cfg).unwrap().contains("lan ="));
+    }
+
+    #[test]
+    fn rdma_traffic_is_marked_dscp_18_unless_set() {
+        let base = r#"
+            [node]
+            id = 1
+            name = "a"
+            state_dir = "/tmp/x"
+            listen = "10.55.0.22:7400"
+            [cluster]
+            name = "c"
+            secret_file = "/tmp/s"
+            members = [{ id = 1, name = "a", addr = "10.55.0.22:7400" }]
+        "#;
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.fabric.traffic_class(), 18 << 2);
+        assert!(!toml::to_string(&cfg).unwrap().contains("traffic_class"));
+        let off: Config =
+            toml::from_str(&format!("{base}\n[fabric]\ntraffic_class = 0\n")).unwrap();
+        assert_eq!(off.fabric.traffic_class(), 0);
     }
 
     #[test]

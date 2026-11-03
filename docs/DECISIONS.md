@@ -2880,3 +2880,49 @@ there to measure once that consumer is fixed.
 bounded by the dense part. Reordering within files: breaks the band rule.
 Interleaving files into one slot: ADR-063 keeps one open slot per rank
 per source, so a slot never mixes files beyond a boundary.
+
+## ADR-084 — SparkNest's RDMA travels in a fabric class of its own (2026-11-04)
+
+**Context.** SparkNest's queue pairs set no traffic class, so every RDMA
+packet was DSCP 0. The fabric switch (CRS804, 7.24.5) was tuned for the
+inference engine alone: DSCP 26 → traffic class 3 with PFC, everything
+else in lossy class 1. Under a Muse push (eight sources, eight ranks) class
+1 dropped packets; each drop stalled its lane for a go-back-N resend, and
+the receivers' CNPs on every out-of-sequence arrival slowed the senders.
+Ranks held at about 3 GB/s on 100G ports; the lossy queue had dropped 3–6.6
+billion packets per Spark port over its life, against 10–92 million in
+class 3. Neither the engine's consumer, the incast budget (256 MiB: no
+gain), packing (11–20 GB/s per Spark core on the Muse plan) nor reads of
+gaps was the limit. raptor's NIC trusted PCP with PFC off and global pause
+on, so nothing reaching it was in a lossless class, the engine's included.
+
+**Decision.**
+- **Every SparkNest QP carries TOS 72 (DSCP 18)** in its GRH, with service
+  level 2 (the class selector, for a PCP-trusting NIC). `[fabric]
+  traffic_class` overrides it; 0 sends packets unmarked. The fabric log
+  line names it.
+- **DSCP 18 is priority 2 / switch class 2**: lossless (PFC), its own NIC
+  receive buffer, and in the switch's low-priority group, so it is sent
+  only when the engine's class 3 has nothing queued, and its pauses (per
+  priority) never stop class 3. Not the engine's own class: a SparkNest
+  replication or push while a model serves must not hold up inference.
+- **The tuning ships in the repo**: `tools/fabric-qos/sparknest-fabric-qos`
+  for each host's NICs (saving their state first, with rollback), and
+  `sparknest-qos.rsc` / `sparknest-qos-rollback.rsc` for the switch;
+  `docs/LOSSLESS.md` explains it.
+- **One owner per NIC, and it survives reboots.** The host policy includes
+  the engine's priority 3, so this tool owns NIC QoS and the engine's own
+  only checks; apply refuses while the engine's tool holds saved state. A
+  root-owned boot unit reapplies over a NIC's saved original and refuses
+  any state it does not know.
+
+**What stays.** Untuned, DSCP 18 lands in the default lossy queue, as all
+SparkNest traffic did before: nothing needs the tuning to work. TCP lanes
+and the control connection stay unmarked. ECN and WRED stay off: neither
+class is ECN-capable.
+
+**Alternatives.** The engine's DSCP 26: lossless at once, but SparkNest and
+the engine would pause each other in one class. A lossy class 2 with ECN
+and DCQCN: no pause coupling at all, but the engine's tuning is PFC-only,
+and incast would still drop. More lanes per peer: each drop would stall
+less, but drops would remain.

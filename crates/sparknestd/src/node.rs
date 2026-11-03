@@ -301,6 +301,7 @@ impl Node {
                 let mut fc = fc.clone();
                 fc.devices = cfg.fabric.devices.clone();
                 fc.inflight_bytes = cfg.fabric.inflight_bytes();
+                fc.traffic_class = cfg.fabric.traffic_class();
                 match nest_fabric::Fabric::start(id, fc, rpc.clone()) {
                     Ok(Some(f)) => {
                         vfs.attach_fabric(f.clone());
@@ -400,6 +401,7 @@ impl Node {
             let mut fc = tuning.fabric.clone().expect("checked");
             fc.devices = cfg.fabric.devices.clone();
             fc.inflight_bytes = cfg.fabric.inflight_bytes();
+            fc.traffic_class = cfg.fabric.traffic_class();
             tokio::spawn(async move {
                 for _ in 0..40 {
                     tokio::time::sleep(Duration::from_secs(15)).await;

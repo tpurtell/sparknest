@@ -57,9 +57,11 @@ package() {
   install -m 0755 tools/hf-fetch/sparknest-hf-fetch "$stage/libexec/sparknest/"
   install -m 0755 tools/rdma-counters/sparknest-rdma-counters "$stage/bin/"
   install -m 0755 tools/lan-standby/sparknest-add-lan-standby "$stage/bin/"
+  install -m 0755 tools/fabric-qos/sparknest-fabric-qos "$stage/bin/"
+  install -m 0644 tools/fabric-qos/sparknest-qos.rsc tools/fabric-qos/sparknest-qos-rollback.rsc "$stage/share/sparknest/"
   install -m 0644 tools/drop-page-cache/drop-page-cache.c "$stage/libexec/sparknest/"
   cp -r packaging/config packaging/systemd "$stage/share/sparknest/"
-  cp README.md docs/INSTALL.md LICENSE-MIT LICENSE-APACHE "$stage/share/doc/sparknest/"
+  cp README.md docs/INSTALL.md docs/LOSSLESS.md LICENSE-MIT LICENSE-APACHE "$stage/share/doc/sparknest/"
   for f in "$stage"/bin/sparknestd "$stage"/bin/nest; do
     local m; m=$(glibc_max "$f")
     [ "$(printf '%s\n%s\n' "$m" "$GLIBC_CEILING" | sort -V | tail -1)" = "$GLIBC_CEILING" ] \

@@ -77,6 +77,7 @@ unsafe extern "C" {
         remote_qpn: u32,
         remote_psn: u32,
         mtu: u32,
+        traffic_class: u8,
     ) -> c_int;
     pub fn nf_qp_error(q: *mut nf_qp) -> c_int;
     pub fn nf_qp_destroy(q: *mut nf_qp);

@@ -3,6 +3,14 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-04 — SparkNest's own fabric class (ADR-084)
+
+Muse push loads held each rank near 3 GB/s: SparkNest's RDMA was unmarked
+(DSCP 0) in the switch's lossy queue, which drops under eight-way incast.
+Now every QP is DSCP 18 (`[fabric] traffic_class`, default 72), and
+`tools/fabric-qos/` tunes hosts and the switch for it: priority/class 2,
+lossless, below the engine's class 3 (`docs/LOSSLESS.md`). Not released.
+
 ## 2026-11-03 — 0.7.5 released
 
 ADR-083 below (off by default), with each load's record naming its

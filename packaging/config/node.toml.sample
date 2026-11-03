@@ -33,6 +33,8 @@ members = [
 [fabric]
 mode = "auto"      # auto | rdma | tcp
 devices = []       # optional filter, e.g. ["mlx5_0"]
+# traffic_class = 72  # TOS byte on RDMA packets: DSCP 18, SparkNest's own
+#                     # fabric class (docs/LOSSLESS.md); 0 sends them unmarked
 
 [fuse]
 allow_other = true # needs user_allow_other in /etc/fuse.conf

@@ -96,11 +96,19 @@ pub struct FabricConfig {
     /// A remote write still unanswered after this fails with its outcome
     /// unknown, and its lane is retired.
     pub write_timeout: Duration,
+    /// The TOS byte this host's RDMA packets carry (ADR-084): DSCP 18 in
+    /// its top bits, a class of its own below the engine's DSCP 26, so a
+    /// fabric tuned for it (`docs/LOSSLESS.md`) neither drops it nor lets
+    /// it hold up the engine's traffic. 0 sends it unmarked.
+    pub traffic_class: u8,
     /// The protocol this host offers; tests set 2 to stand in for an
     /// older host.
     #[doc(hidden)]
     pub protocol: u32,
 }
+
+/// DSCP 18 (AF21) as a TOS byte: SparkNest's own fabric class (ADR-084).
+pub const TRAFFIC_CLASS: u8 = 18 << 2;
 
 /// A slot tier: its size, and landing and staging slots per device.
 #[derive(Clone, Copy, Debug)]
@@ -147,6 +155,7 @@ impl Default for FabricConfig {
                 },
             ],
             write_timeout: WRITE_TIMEOUT,
+            traffic_class: TRAFFIC_CLASS,
             protocol: PROTOCOL,
         }
     }
@@ -958,7 +967,12 @@ impl Fabric {
                 }) as BoxFuture<'static, Result<bytes::Bytes, String>>
             }),
         );
-        tracing::info!(rails = ?fabric.rails.iter().map(|r| format!("{}/{}", r.ibdev, r.addr)).collect::<Vec<_>>(), "RDMA fabric up");
+        tracing::info!(
+            rails = ?fabric.rails.iter().map(|r| format!("{}/{}", r.ibdev, r.addr)).collect::<Vec<_>>(),
+            traffic_class = fabric.cfg.traffic_class,
+            dscp = fabric.cfg.traffic_class >> 2,
+            "RDMA fabric up"
+        );
         Ok(Some(fabric))
     }
 
@@ -1205,7 +1219,10 @@ impl Fabric {
             let mtu = lane.dev.mtu.min(offer.qp.mtu);
             lane.mtu
                 .store(crate::counters::mtu_bytes(mtu), Ordering::Relaxed);
-            if let Err(e) = lane.qp.connect(rail.gid_index, psn, &offer.qp, mtu) {
+            if let Err(e) =
+                lane.qp
+                    .connect(rail.gid_index, psn, &offer.qp, mtu, self.cfg.traffic_class)
+            {
                 made.push((rail.clone(), lane));
                 self.retire_lanes(&made.into_iter().map(|(_, l)| l).collect::<Vec<_>>());
                 return FabricResp::Refused(e.to_string());
@@ -1434,10 +1451,13 @@ impl Fabric {
             let mtu = lane.dev.mtu.min(remote.mtu);
             lane.mtu
                 .store(crate::counters::mtu_bytes(mtu), Ordering::Relaxed);
-            if let Err(e) = lane
-                .qp
-                .connect(lane.local.gid_index, psns[i as usize], &remote, mtu)
-            {
+            if let Err(e) = lane.qp.connect(
+                lane.local.gid_index,
+                psns[i as usize],
+                &remote,
+                mtu,
+                self.cfg.traffic_class,
+            ) {
                 self.retire_lanes(&lanes);
                 return Err(NestError::Io(e.to_string()));
             }

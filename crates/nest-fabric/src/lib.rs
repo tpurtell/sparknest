@@ -21,7 +21,7 @@ pub mod verbs;
 
 pub use engine::{
     Fabric, FabricConfig, PROTOCOL, ReadBuf, ReadDone, ReadSource, Reservation, ServeFile, Stats,
-    Tier, WriteError, WriteOp, WriteSink,
+    TRAFFIC_CLASS, Tier, WriteError, WriteOp, WriteSink,
 };
 pub use pool::{Pool, Slot, Tiers};
 pub use rail::{Rail, discover};

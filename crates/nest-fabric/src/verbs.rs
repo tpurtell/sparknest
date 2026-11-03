@@ -498,12 +498,15 @@ impl Qp {
         unsafe { sys::nf_qp_num(self.raw) }
     }
 
+    /// Move the QP to RTS toward `remote`. `traffic_class` is the TOS byte
+    /// its packets carry (DSCP × 4; 0 leaves them unmarked).
     pub fn connect(
         &self,
         sgid_index: u32,
         local_psn: u32,
         remote: &QpInfo,
         mtu: u32,
+        traffic_class: u8,
     ) -> io::Result<()> {
         // SAFETY: raw live; gid is 16 bytes.
         let r = unsafe {
@@ -516,6 +519,7 @@ impl Qp {
                 remote.qpn,
                 remote.psn,
                 mtu,
+                traffic_class,
             )
         };
         if r != 0 {
