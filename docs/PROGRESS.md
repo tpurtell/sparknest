@@ -3,6 +3,10 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-04 — 0.8.0 prepared
+
+ADR-084 below. Not yet released or rolled out.
+
 ## 2026-11-04 — SparkNest's own fabric class (ADR-084)
 
 Muse push loads held each rank near 3 GB/s: SparkNest's RDMA was unmarked
