@@ -3,6 +3,10 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-03 — 0.7.4 prepared
+
+ADR-081 and ADR-082 below. Not yet released or rolled out.
+
 ## 2026-11-03 — Late push landings keep their grants (ADR-082)
 
 A GLM Flash push stalled after "a slot without a credit": a finished
