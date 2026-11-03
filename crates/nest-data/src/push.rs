@@ -1086,6 +1086,7 @@ impl Push {
             .vfs()
             .map_or(0, |v| v.setting(nest_types::Setting::PushReorderLookahead))
             as usize;
+        let mut reorder_ms = None;
         if lookahead > 1 {
             let t0 = std::time::Instant::now();
             let mut known: Vec<u64> = rates.values().copied().filter(|b| *b > 0).collect();
@@ -1119,12 +1120,9 @@ impl Push {
                     fs.drain(..).map(|f| (f.index, f)).collect();
                 fs.extend(ord.into_iter().filter_map(|i| by_index.remove(&(i as u32))));
             }
-            tracing::info!(
-                group,
-                lookahead,
-                ms = t0.elapsed().as_millis() as u64,
-                "push files reordered"
-            );
+            let ms = t0.elapsed().as_millis() as u64;
+            reorder_ms = Some(ms);
+            tracing::info!(group, lookahead, ms, "push files reordered");
         }
         // Which sources owe each rank anything.
         let mut owing: Vec<Vec<Src>> = vec![Vec::new(); ranks.len()];
@@ -1177,7 +1175,7 @@ impl Push {
             let started = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64);
-            let rec = crate::push_record::Record::new(
+            let mut rec = crate::push_record::Record::new(
                 group,
                 self.name_of(me),
                 started,
@@ -1185,6 +1183,8 @@ impl Push {
                 names_r,
                 totals.rank_bytes.iter().sum(),
             );
+            rec.reorder_lookahead = lookahead as u64;
+            rec.reorder_ms = reorder_ms;
             self.state.lock().history.push(rec);
         }
         for (r, host) in rank_hosts.iter().enumerate() {

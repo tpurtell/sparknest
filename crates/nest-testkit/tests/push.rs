@@ -297,6 +297,7 @@ async fn strided_shares(lanes: bool) {
     }
     assert!(full.source_done_ms.iter().all(|d| d.is_some()));
     assert!(full.rank_done_ms.iter().all(|d| d.is_some()));
+    assert_eq!((full.reorder_lookahead, full.reorder_ms), (0, None));
     assert_eq!(forecast.rank_bytes, vec![arena, arena]);
     // Each file was streamed by the host holding it.
     let mut stores: Vec<_> = forecast.streams.iter().map(|s| s.store.clone()).collect();
@@ -1896,4 +1897,9 @@ async fn reordered_files_still_land_exactly() {
             );
         }
     }
+    // The load's record says how it was ordered.
+    let recs = c.node(1).push.history(None);
+    let rec = recs.last().expect("a record");
+    assert_eq!(rec.reorder_lookahead, 8);
+    assert!(rec.reorder_ms.is_some());
 }

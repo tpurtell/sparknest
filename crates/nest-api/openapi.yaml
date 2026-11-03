@@ -2552,6 +2552,12 @@ components:
           items:
             type: integer
             nullable: true
+        reorder_lookahead:
+          type: integer
+          description: The push-reorder-lookahead the load ran with (0 or 1, plan order).
+        reorder_ms:
+          type: [integer, "null"]
+          description: Milliseconds the hub took to reorder the sources' files; null when it kept plan order.
     Error:
       type: object
       required: [error]

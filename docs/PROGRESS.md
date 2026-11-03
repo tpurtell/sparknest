@@ -10,6 +10,8 @@ files so the rank furthest behind its planned share is fed next, picking
 from each source's next N files. Each file's reads keep rising offsets;
 nothing on the wire changes. 2 ms for 3,000 files at the largest
 lookahead. `reordered_files_still_land_exactly` loads with it on.
+Each load's record (`/v1/push/loads/{group}`) carries
+`reorder_lookahead` and `reorder_ms`, so an A/B describes itself.
 Not released.
 
 ## 2026-11-03 — 0.7.4 released

@@ -60,6 +60,12 @@ pub struct Record {
     /// released, when the engine last released one).
     #[serde(default)]
     pub rings: Vec<Option<crate::push::RingState>>,
+    /// The push-reorder-lookahead the load ran with (0: plan order), and
+    /// how long the hub took to reorder (ADR-083).
+    #[serde(default)]
+    pub reorder_lookahead: u64,
+    #[serde(default)]
+    pub reorder_ms: Option<u64>,
 }
 
 impl Record {
