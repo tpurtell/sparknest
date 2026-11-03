@@ -1114,7 +1114,7 @@ paths:
         description: A setting name; unknown names are 404.
         schema:
           type: string
-          enum: [read-recovery-wait, preferred-leader]
+          enum: [read-recovery-wait, preferred-leader, control-on-lan, push-grant-floor, push-incast-mib, push-reorder-lookahead]
     put:
       tags: [cluster]
       summary: Set a cluster setting
@@ -3316,7 +3316,7 @@ components:
       properties:
         name:
           type: string
-          enum: [read-recovery-wait, preferred-leader]
+          enum: [read-recovery-wait, preferred-leader, control-on-lan, push-grant-floor, push-incast-mib, push-reorder-lookahead]
         value:
           type: integer
           description: In `unit`; for a host-valued setting a node id (0 - none).

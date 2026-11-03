@@ -211,6 +211,8 @@ pub struct Totals {
     pub rank_bytes: Vec<u64>,
     /// Bytes read out of each file (sum over its entries).
     pub file_bytes: Vec<u64>,
+    /// Bytes each file sends each rank: `file_rank_bytes[file * ranks + rank]`.
+    pub file_rank_bytes: Vec<u64>,
 }
 
 impl Plan {
@@ -233,6 +235,7 @@ impl Plan {
         let mut t = Totals {
             rank_bytes: vec![0; arenas.len()],
             file_bytes: vec![0; self.files.len()],
+            file_rank_bytes: vec![0; self.files.len() * arenas.len()],
         };
         // (rank, dst start, dst end, entry) for the overlap check.
         let mut spans: Vec<(u32, u64, u64, usize)> = Vec::with_capacity(self.entries.len());
@@ -271,6 +274,7 @@ impl Plan {
             }
             t.rank_bytes[e.rank as usize] += ext.bytes;
             t.file_bytes[e.file as usize] += ext.bytes;
+            t.file_rank_bytes[e.file as usize * arenas.len() + e.rank as usize] += ext.bytes;
             spans.push((e.rank, e.dst_base, dst_end, i));
         }
         spans.sort_unstable();

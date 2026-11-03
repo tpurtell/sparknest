@@ -2838,3 +2838,45 @@ out of the ring for the rest of the load, the stall 0.6.1 fixed. Having
 the source wait for the rank host to acknowledge each landing: a round
 trip per slot on the fast path.
 
+
+## ADR-083 — Push sources may reorder their files to feed the rank furthest behind (2026-11-03; amends ADR-063)
+
+**Context.** ADR-063's 2026-10-21 amendment promised that a source
+streams its files in plan order. Across sources, nothing held: files go to
+whichever holder would finish soonest (ADR-066), so the order a rank sees
+is already a mix of every source's lists and changes with placement. When
+a plan lists files rank by rank (dense layers in order, say), every source
+starts on the same ranks and leaves the rest idle until late. cuteafd
+checked each of its consumers on 2026-11-03 (weight arena, dense
+transforms, HostStaging, scale codes, native K6): none depends on order
+across files, only on each file's reads rising in offset (the
+coordinator's 128-row bands).
+
+**Decision.**
+- **A cluster setting, `push-reorder-lookahead`** (files, 0..=1024,
+  default 0). With 0 or 1, sources stream in plan order, as before.
+- **The hub orders each source's files at Start.** After ADR-066 assigns
+  files to sources, it simulates the load at disk speed: the source whose
+  clock is earliest picks next. It takes the rank furthest behind its
+  planned share (received over planned bytes), and from its next
+  `lookahead` files in plan order the one sending the most bytes to that
+  rank. Its clock moves on by that file's size at the source's measured
+  rate. The plan's per-file, per-rank bytes come from the check it
+  already makes.
+- **What stays.** Each file comes from one source, whole, its reads in
+  rising offset order. No message, plan field or persisted type changes:
+  a source streams its list in the order it is given. The plan-order
+  promise for a source's files holds only while the setting is 0.
+- **Cost.** One pick per file, `ranks · log ranks + lookahead · ranks`,
+  on a blocking thread: a 3,000-file, 8-source, 8-rank plan at the
+  largest lookahead takes 2 ms. The hub logs each reorder and its time.
+
+**Why off by default.** The slow 8-source Muse loads of 2026-11-03 were
+cuteafd's consumer (one copy stream per rank, slots released strictly in
+order), not file order, and expert shards feed every rank evenly. It is
+there to measure once that consumer is fixed.
+
+**Alternatives.** A whole-plan optimiser: costly at Start for a gain
+bounded by the dense part. Reordering within files: breaks the band rule.
+Interleaving files into one slot: ADR-063 keeps one open slot per rank
+per source, so a slot never mixes files beyond a boundary.

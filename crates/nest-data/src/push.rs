@@ -527,6 +527,84 @@ fn assign(files: &[Resolved], me: NodeId, rates: &HashMap<StoreId, u64>) -> Vec<
     out
 }
 
+/// The order each source streams its files in (ADR-083), given each
+/// source's files in plan order (`by_source`, indices into the plan's
+/// files), what each file sends each rank (`frb[file * ranks + rank]`),
+/// each file's size, each source's disk read rate and the lookahead.
+///
+/// A simulation of the load at disk speed: the source whose clock is
+/// earliest picks next. It looks for the rank furthest behind its planned
+/// share (received / planned, smallest first) that one of its next
+/// `lookahead` files feeds, and takes from those the file carrying the
+/// most of its bytes to that rank; its clock moves on by the file's size
+/// at its rate (a file sent to every rank is still read once). A
+/// lookahead of 0 or 1 leaves plan order.
+///
+/// Cost: one pick per file, each `ranks · log ranks + lookahead · ranks`,
+/// with no allocation per pick (a 3,000-file, 8-source, 8-rank plan at
+/// the largest lookahead orders in 2 ms; the default 0 does nothing).
+fn reorder(
+    by_source: &mut [Vec<usize>],
+    frb: &[u64],
+    ranks: usize,
+    sizes: &[u64],
+    rates: &[f64],
+    lookahead: usize,
+) {
+    if lookahead <= 1 || ranks == 0 {
+        return;
+    }
+    let mut planned = vec![0u64; ranks];
+    for fs in by_source.iter() {
+        for &f in fs {
+            for (r, p) in planned.iter_mut().enumerate() {
+                *p += frb[f * ranks + r];
+            }
+        }
+    }
+    let mut got = vec![0u64; ranks];
+    let mut clock = vec![0f64; by_source.len()];
+    let mut left: Vec<VecDeque<usize>> = by_source
+        .iter_mut()
+        .map(|fs| std::mem::take(fs).into())
+        .collect();
+    let mut behind: Vec<usize> = (0..ranks).collect();
+    // The earliest source with files left picks next.
+    while let Some(s) = (0..left.len())
+        .filter(|s| !left[*s].is_empty())
+        .min_by(|a, b| clock[*a].total_cmp(&clock[*b]))
+    {
+        let window = left[s].len().min(lookahead);
+        // Ranks furthest behind first (0/0 is never behind: done).
+        let share = |r: usize| {
+            if planned[r] == 0 {
+                f64::INFINITY
+            } else {
+                got[r] as f64 / planned[r] as f64
+            }
+        };
+        behind.sort_by(|a, b| share(*a).total_cmp(&share(*b)));
+        let mut pick = 0;
+        for &r in &behind {
+            let best = (0..window)
+                .map(|k| (k, frb[left[s][k] * ranks + r]))
+                .max_by_key(|(k, b)| (*b, std::cmp::Reverse(*k)));
+            if let Some((k, b)) = best
+                && b > 0
+            {
+                pick = k;
+                break;
+            }
+        }
+        let f = left[s].remove(pick).expect("picked within the window");
+        for (r, g) in got.iter_mut().enumerate() {
+            *g += frb[f * ranks + r];
+        }
+        clock[s] += sizes[f] as f64 / rates[s].max(1.0);
+        by_source[s].push(f);
+    }
+}
+
 impl Push {
     pub fn new(vfs: &Arc<Vfs>) -> Arc<Push> {
         let p = Arc::new(Push {
@@ -1003,6 +1081,50 @@ impl Push {
                 generation: r.generation,
                 entries,
             });
+        }
+        let lookahead = self
+            .vfs()
+            .map_or(0, |v| v.setting(nest_types::Setting::PushReorderLookahead))
+            as usize;
+        if lookahead > 1 {
+            let t0 = std::time::Instant::now();
+            let mut known: Vec<u64> = rates.values().copied().filter(|b| *b > 0).collect();
+            known.sort_unstable();
+            let median = known.get(known.len() / 2).copied().unwrap_or(1);
+            let srcs: Vec<Src> = by_source.keys().copied().collect();
+            let src_rates: Vec<f64> = srcs
+                .iter()
+                .map(|s| {
+                    rates
+                        .get(&s.store)
+                        .copied()
+                        .filter(|b| *b > 0)
+                        .unwrap_or(median) as f64
+                })
+                .collect();
+            let mut order: Vec<Vec<usize>> = by_source
+                .values()
+                .map(|fs| fs.iter().map(|f| f.index as usize).collect())
+                .collect();
+            let (frb, n, sz) = (totals.file_rank_bytes.clone(), ranks.len(), sizes.clone());
+            let order = tokio::task::spawn_blocking(move || {
+                reorder(&mut order, &frb, n, &sz, &src_rates, lookahead);
+                order
+            })
+            .await
+            .map_err(|e| NestError::Io(e.to_string()))?;
+            for (s, ord) in srcs.iter().zip(order) {
+                let fs = by_source.get_mut(s).expect("a source");
+                let mut by_index: HashMap<u32, SourceFile> =
+                    fs.drain(..).map(|f| (f.index, f)).collect();
+                fs.extend(ord.into_iter().filter_map(|i| by_index.remove(&(i as u32))));
+            }
+            tracing::info!(
+                group,
+                lookahead,
+                ms = t0.elapsed().as_millis() as u64,
+                "push files reordered"
+            );
         }
         // Which sources owe each rank anything.
         let mut owing: Vec<Vec<Src>> = vec![Vec::new(); ranks.len()];
@@ -2769,6 +2891,88 @@ mod tests {
         r.granted.remove(&1);
         r.landed_from.insert(a, 3);
         assert_eq!(r.reclaimable(), vec![2]);
+    }
+
+    /// Bytes each rank has received when the slowest source finishes its
+    /// first `upto` files, simulated as `reorder` does.
+    fn received_at(order: &[Vec<usize>], frb: &[u64], ranks: usize, upto: usize) -> Vec<u64> {
+        let mut got = vec![0; ranks];
+        for fs in order {
+            for &f in fs.iter().take(upto) {
+                for (r, g) in got.iter_mut().enumerate() {
+                    *g += frb[f * ranks + r];
+                }
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn reordered_sources_feed_every_rank_together() {
+        // Two sources, four ranks: plan order has each file feed one rank,
+        // rank by rank (dense layers in rank order), so both sources start
+        // on rank 0 and rank 3 waits for the end.
+        let ranks = 4;
+        let n = 16;
+        let mut frb = vec![0u64; n * ranks];
+        for f in 0..n {
+            frb[f * ranks + f * ranks / n] = 10;
+        }
+        let sizes = vec![10u64; n];
+        let plan: Vec<Vec<usize>> = vec![(0..n).step_by(2).collect(), (1..n).step_by(2).collect()];
+        let mut order = plan.clone();
+        reorder(&mut order, &frb, ranks, &sizes, &[1.0, 1.0], 0);
+        assert_eq!(order, plan, "lookahead 0 keeps plan order");
+        // A quarter of the way in, plan order has fed rank 0 only.
+        assert_eq!(received_at(&order, &frb, ranks, 2), vec![40, 0, 0, 0]);
+        reorder(&mut order, &frb, ranks, &sizes, &[1.0, 1.0], 8);
+        assert_eq!(received_at(&order, &frb, ranks, 2), vec![10, 10, 10, 10]);
+        // Every file is still streamed once, by the source holding it.
+        for (s, fs) in order.iter().enumerate() {
+            let mut a = fs.clone();
+            a.sort();
+            assert_eq!(a, plan[s]);
+        }
+    }
+
+    #[test]
+    fn a_reorder_window_never_looks_past_its_lookahead() {
+        // One source, two ranks; rank 1's only file is last. A window of 2
+        // cannot reach it until the end.
+        let ranks = 2;
+        let mut frb = vec![0u64; 6 * ranks];
+        for f in 0..5 {
+            frb[f * ranks] = 1;
+        }
+        frb[5 * ranks + 1] = 1;
+        let mut order = vec![(0..6).collect::<Vec<_>>()];
+        reorder(&mut order, &frb, ranks, &[1; 6], &[1.0], 2);
+        assert_eq!(order[0][..4], [0, 1, 2, 3]);
+        let mut order = vec![(0..6).collect::<Vec<_>>()];
+        reorder(&mut order, &frb, ranks, &[1; 6], &[1.0], 6);
+        assert_eq!(order[0][1], 5, "{order:?}");
+    }
+
+    #[test]
+    fn reordering_a_large_plan_takes_well_under_a_second() {
+        // 3,000 files on 8 sources to 8 ranks, every file feeding every
+        // rank unevenly; the largest lookahead.
+        let (n, ranks, sources) = (3_000usize, 8usize, 8usize);
+        let frb: Vec<u64> = (0..n * ranks)
+            .map(|i| (i as u64 * 2_654_435_761) % 1_000)
+            .collect();
+        let sizes: Vec<u64> = (0..n)
+            .map(|f| frb[f * ranks..(f + 1) * ranks].iter().sum())
+            .collect();
+        let mut order: Vec<Vec<usize>> = (0..sources)
+            .map(|s| (s..n).step_by(sources).collect())
+            .collect();
+        let max = nest_types::Setting::PushReorderLookahead.range().1 as usize;
+        let t = std::time::Instant::now();
+        reorder(&mut order, &frb, ranks, &sizes, &[1.0; 8], max);
+        let ms = t.elapsed().as_millis();
+        assert_eq!(order.iter().map(|o| o.len()).sum::<usize>(), n);
+        assert!(ms < 1_000, "{ms} ms");
     }
 
     fn files(n: usize, size: u64, holders: &[u64]) -> Vec<Resolved> {

@@ -1789,3 +1789,111 @@ async fn landings_after_their_source_finished_still_count() {
         0
     );
 }
+
+/// With `push-reorder-lookahead` set, each source picks from its next files
+/// the one feeding the rank furthest behind (ADR-083). The plan lists eight
+/// files, each for one rank, rank 0's first: in plan order both sources
+/// feed rank 0 first. Reordered, every rank still receives exactly its
+/// bytes, each file from the source holding it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn reordered_files_still_land_exactly() {
+    let c = ready(3).await;
+    c.node(1)
+        .meta
+        .propose(nest_meta::Command::SetSetting {
+            name: nest_types::Setting::PushReorderLookahead.name().into(),
+            value: Some(8),
+        })
+        .await
+        .unwrap();
+    c.converge().await;
+    c.eventually("the lookahead applies", Duration::from_secs(5), |c| {
+        c.node(1)
+            .vfs
+            .setting(nest_types::Setting::PushReorderLookahead)
+            == 8
+    })
+    .await;
+    let len = 4usize << 20;
+    let files: Vec<Vec<u8>> = (0..8)
+        .map(|f| (0..len).map(|i| ((i * 7 + f * 31) % 251) as u8).collect())
+        .collect();
+    for (f, data) in files.iter().enumerate() {
+        sealed(&c, 2 + (f as u64 % 2), &format!("r{f}.bin"), data.clone()).await;
+    }
+    // Files 0..3 feed rank 0, 4..7 rank 1, whole.
+    let patterns = vec![Pattern {
+        run: len as u32,
+        dims: vec![],
+    }];
+    let entries: Vec<Entry> = (0..8u32)
+        .map(|f| Entry {
+            file: f,
+            pattern: 0,
+            src_base: 0,
+            dst_base: (f % 4) as u64 * len as u64,
+            rank: f / 4,
+        })
+        .collect();
+    let arena = 4 * len as u64;
+    let (slots, slot_bytes) = (16u32, 1u32 << 20);
+    let hub = c.push_socket(1);
+    let socks = [c.push_socket(1), c.push_socket(3)];
+    let arenas = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(20));
+        let specs = (0..2u32)
+            .map(|r| RankSpec {
+                rank: r,
+                host: if r == 0 { "n1" } else { "n3" }.into(),
+                arena_bytes: arena,
+            })
+            .collect();
+        let names = (0..8).map(|f| format!("/r{f}.bin")).collect();
+        let g = Coordinator::create(&hub, specs, names, t).map_err(|e| format!("create: {e}"))?;
+        g.patterns(patterns).unwrap();
+        g.entries(entries).unwrap();
+        let (group, token) = (g.group, g.token);
+        let ranks: Vec<_> = (0..2u32)
+            .map(|r| {
+                let ring = memfd(slots as usize * slot_bytes as usize);
+                let k = Rank::join(
+                    &socks[r as usize],
+                    JoinArgs {
+                        group,
+                        token,
+                        rank: r,
+                        ring_fd: ring.as_raw_fd(),
+                        slots,
+                        slot_bytes,
+                    },
+                    t,
+                )
+                .map_err(|e| format!("join {r}: {e}"))?;
+                Ok(std::thread::spawn(move || {
+                    run_rank(k, ring, slots, slot_bytes, arena as usize)
+                }))
+            })
+            .collect::<Result<_, String>>()?;
+        g.start().map_err(|e| format!("start: {e}"))?;
+        let arenas = ranks
+            .into_iter()
+            .enumerate()
+            .map(|(i, h): (usize, std::thread::JoinHandle<_>)| {
+                h.join().unwrap().map_err(|e| format!("rank {i}: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, String>(arenas)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    for (r, got) in arenas.iter().enumerate() {
+        for k in 0..4 {
+            let f = r * 4 + k;
+            assert!(
+                got[k * len..(k + 1) * len] == files[f][..],
+                "rank {r}, file {f}"
+            );
+        }
+    }
+}

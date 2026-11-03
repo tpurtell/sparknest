@@ -3,6 +3,15 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-03 — Push sources may reorder their files (ADR-083)
+
+`push-reorder-lookahead` (default 0, off): the hub orders each source's
+files so the rank furthest behind its planned share is fed next, picking
+from each source's next N files. Each file's reads keep rising offsets;
+nothing on the wire changes. 2 ms for 3,000 files at the largest
+lookahead. `reordered_files_still_land_exactly` loads with it on.
+Not released.
+
 ## 2026-11-03 — 0.7.4 released
 
 ADR-081 and ADR-082 below. Rolled to all ten hosts, maxq included, one

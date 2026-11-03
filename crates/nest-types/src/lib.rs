@@ -324,6 +324,9 @@ pub enum Setting {
     /// Push bytes a host lets sources have in flight toward its rings
     /// (MiB); 0 is the fabric's read budget.
     PushIncastMib,
+    /// How many of its next files (in plan order) a push source may choose
+    /// from, to feed the rank furthest behind (ADR-083); 0 is plan order.
+    PushReorderLookahead,
 }
 
 impl Setting {
@@ -333,6 +336,7 @@ impl Setting {
         Setting::ControlOnLan,
         Setting::PushGrantFloor,
         Setting::PushIncastMib,
+        Setting::PushReorderLookahead,
     ];
 
     pub fn name(self) -> &'static str {
@@ -342,6 +346,7 @@ impl Setting {
             Setting::ControlOnLan => "control-on-lan",
             Setting::PushGrantFloor => "push-grant-floor",
             Setting::PushIncastMib => "push-incast-mib",
+            Setting::PushReorderLookahead => "push-reorder-lookahead",
         }
     }
 
@@ -356,6 +361,7 @@ impl Setting {
             Setting::ControlOnLan => 1,
             Setting::PushGrantFloor => 1,
             Setting::PushIncastMib => 0,
+            Setting::PushReorderLookahead => 0,
         }
     }
 
@@ -366,6 +372,7 @@ impl Setting {
             Setting::ControlOnLan => "0/1",
             Setting::PushGrantFloor => "grants",
             Setting::PushIncastMib => "MiB",
+            Setting::PushReorderLookahead => "files",
         }
     }
 
@@ -386,6 +393,9 @@ impl Setting {
             Setting::PushIncastMib => {
                 "push bytes in flight toward one host's rings (0: the fabric's read budget)"
             }
+            Setting::PushReorderLookahead => {
+                "files ahead a push source may pick from to feed the rank furthest behind (0: plan order)"
+            }
         }
     }
 
@@ -397,6 +407,7 @@ impl Setting {
             Setting::ControlOnLan => (0, 1),
             Setting::PushGrantFloor => (1, 64),
             Setting::PushIncastMib => (0, 4096),
+            Setting::PushReorderLookahead => (0, 1024),
         }
     }
 
