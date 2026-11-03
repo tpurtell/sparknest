@@ -3,9 +3,13 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-11-02 — 0.7.3 prepared
+## 2026-11-03 — 0.7.3 released
 
-ADR-077 to ADR-080 below. Not yet released or rolled out.
+ADR-077 to ADR-080 below. Rolled to every host but maxq (still on 0.7.1
+until its quant ends), one at a time under CuteAFD's hardware locks; each
+host back in 12–14 s. With raptor's I/O pressure still at ~95%, the model
+page now answers in 0.28 s (5–7 s before), the models tree in 0.29 s
+(4.9 s) and the repo list in 0.55 s (9.8 s).
 
 ## 2026-11-02 — Hub refs remembered by file version (ADR-080)
 
