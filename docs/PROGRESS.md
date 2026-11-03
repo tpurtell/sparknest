@@ -11,7 +11,9 @@ NICs: cuteafd's own tuning rolled back, then `sparknest-fabric-qos apply`
 and `persist`; each port tuned, its boot unit enabled. 0.8.0 on all ten
 hosts, each back in 3–13 s; fabrics log `traffic_class=72 dscp=18`. The
 tool's check misread newer iproute2's three-field DSCP entries (fixed
-here). A Muse push comparison waits for a current-dev Muse build.
+here). Muse max then pushed in 13.8 s at 31.1 GB/s (was 20–25 s at
+17–21 GB/s), with 7–12 retransmits per host instead of thousands
+(benchmarks/M13-MODEL-LOAD.md).
 
 ## 2026-11-04 — SparkNest's own fabric class (ADR-084)
 

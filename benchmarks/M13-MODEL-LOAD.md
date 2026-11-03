@@ -234,3 +234,31 @@ Sparks from the start and never held them back: they finished at their
 own disks' pace while it held its share of the grants, then it ran on
 alone at the SATA disk's rate. The load's end is that disk: 8.6 GB at
 0.5 GB/s.
+
+## Muse max before and after SparkNest's fabric class (ADR-084, 2026-11-04)
+
+The same Muse max plan (429.0 GB, eight sources, six Spark ranks and two on
+raptor, lookahead 1024, default incast budget), from the hub's load records,
+the hosts' NIC counters and the switch's per-queue counters.
+
+| | 0.7.5, DSCP 0 (…432, …433, …434) | 0.8.0, DSCP 18 (3868415327535105) |
+|---|---|---|
+| Load | 21.0 / 25.0 / 20.1 s | **13.8 s** |
+| Aggregate | 20.4 / 17.2 / 21.3 GB/s | **31.1 GB/s** |
+| Per Spark rank, steady | ~3 GB/s | 6.0–6.6 GB/s |
+| Per source | ~2.3 GB/s | 4.5–6.6 GB/s |
+| RoCE retransmits per Spark, whole load | 6,000–9,000 | 7–12 |
+| Out-of-sequence per Spark | 13,000–22,000 | 400–800 |
+| Switch queue carrying it | 1 (lossy) | 2 (PFC) |
+| Switch drops per Spark port | (queue 1: 3–6.6 G over its life) | 5.6–20 k in queue 2 |
+
+cuteafd's own measure, engine join to group commit: 29.24 s → 18.75 s.
+Its class 3 saw no pauses and no retransmits during the load; its
+readiness (93.5 s) is now bound by drafter staging, not the push.
+
+Packing is not the limit: on the Muse plan one Spark core packs 11 GB/s
+(Cortex-A725) to 20 GB/s (X925), and the busiest packing thread stayed
+under 40% of a core. Ports still run 4–5.7 GB/s each way of 12.5; each
+Spark's single RDMA poller thread is busy throughout, and queue 2 still
+drops a few thousand packets per port under eight-way incast (the PFC
+thresholds are `auto`).
