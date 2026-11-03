@@ -41,6 +41,8 @@ struct Times {
     walks: u64,
     slots: u64,
     bytes: u64,
+    /// Bytes copied into slots: what ranks get of `bytes` read.
+    payload: u64,
 }
 
 struct Packing {
@@ -175,6 +177,7 @@ fn main() {
                     t.walks += 1;
                     for (s, d, len) in RunWalk::new(p, e, at, end) {
                         t.runs += 1;
+                        t.payload += len as u64;
                         let o = (s - at) as usize;
                         k.put(&mut t, e.rank as usize, d, &buf[o..o + len as usize]);
                     }
@@ -203,6 +206,12 @@ fn main() {
         t.walks,
         t.walks as f64 / (t.bytes as f64 / READ_CHUNK as f64),
         t.slots
+    );
+    println!(
+        "  payload {:.1} GB of {:.1} GB read ({:.0}%: the rest is gaps read through)",
+        t.payload as f64 / 1e9,
+        t.bytes as f64 / 1e9,
+        100.0 * t.payload as f64 / t.bytes.max(1) as f64
     );
     println!(
         "  walk+pack {:.2} s, read copy {:.2} s, staging copy {:.2} s",
