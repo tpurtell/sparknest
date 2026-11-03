@@ -3,6 +3,18 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-03 — Late push landings keep their grants (ADR-082)
+
+A GLM Flash push stalled after "a slot without a credit": a finished
+source's last RDMA landings arrived after the hub's word that it was done,
+and the rank host had already taken back their grants (and could grant
+them again, mixing slot content). The hub now tells rank hosts how many
+slots each finished source sent, and grants come back only once those have
+landed. `landings_after_their_source_finished_still_count` stalls the old
+code (landings held 50 ms) and completes now;
+`a_finished_sources_grants_come_back_only_once_its_slots_landed` covers
+re-granting. Not a 0.7 regression: the take-back is from 0.6.1.
+
 ## 2026-11-03 — A branch is deleted as a branch (ADR-081)
 
 Branch rows (`repo@branch`) could not be deleted from the UI: hf's dry run

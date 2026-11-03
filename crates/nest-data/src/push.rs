@@ -146,6 +146,15 @@ pub(crate) enum PushMsg {
         rank: u32,
         ring: RingState,
     },
+    /// Hub → rank host: `source` finished, having sent `rank` `slots` slots
+    /// in all. Its grants come back once that many have landed: its last
+    /// RDMA writes may land after this arrives.
+    Owed {
+        group: u64,
+        rank: u32,
+        source: Src,
+        slots: u64,
+    },
 }
 
 /// A rank's ring as its host sees it.
@@ -311,6 +320,11 @@ struct RankSlot {
     token_id: u32,
     /// Sources owing this rank slots.
     sources: Vec<Src>,
+    /// Slots landed from each source.
+    landed_from: HashMap<Src, u64>,
+    /// Finished sources (no longer in `sources`): how many slots each sent
+    /// this rank in all. Their grants come back as their count is reached.
+    owed: HashMap<Src, u64>,
     next: usize,
     done_sent: bool,
     /// When the rank joined, its releases and when the last came.
@@ -320,6 +334,26 @@ struct RankSlot {
 }
 
 impl RankSlot {
+    /// Granted ring slots that may come back: those held by a finished
+    /// source whose every slot for this rank has landed. Until then a
+    /// slot stays granted, so it is neither re-granted nor taken for
+    /// another source's fill while that source's landing is on its way
+    /// (its bytes are in the ring already). A source dropped before the
+    /// hub's count arrives (two finishing at once) keeps its grants.
+    fn reclaimable(&self) -> Vec<u32> {
+        self.granted
+            .iter()
+            .filter(|(_, (s, _))| {
+                !self.sources.contains(s)
+                    && self
+                        .owed
+                        .get(s)
+                        .is_some_and(|n| self.landed_from.get(s).copied().unwrap_or(0) >= *n)
+            })
+            .map(|(slot, _)| *slot)
+            .collect()
+    }
+
     fn ring_state(&self) -> RingState {
         let since = |t: tokio::time::Instant| {
             self.joined_at
@@ -437,6 +471,9 @@ pub struct Push {
     /// a completion is lost to a lane failure (the slot then also goes by
     /// RPC).
     lose_acks: AtomicU64,
+    /// Tests: hold each RDMA landing this many milliseconds before it is
+    /// handed on, as when the completion thread falls behind.
+    landing_delay_ms: AtomicU64,
 }
 
 /// A file resolved at start: its current sealed generation, pinned for the
@@ -502,6 +539,7 @@ impl Push {
             rdma_slots: AtomicU64::new(0),
             rpc_slots: AtomicU64::new(0),
             lose_acks: AtomicU64::new(0),
+            landing_delay_ms: AtomicU64::new(0),
         });
         vfs.rpc().register(
             nest_rpc::service::PUSH,
@@ -534,6 +572,12 @@ impl Push {
     /// although they landed (each is then sent again by RPC).
     pub fn lose_rdma_acks(&self, n: u64) {
         self.lose_acks.store(n, Ordering::Relaxed);
+    }
+
+    /// Tests: hand each RDMA landing on only after `d`.
+    pub fn delay_landings(&self, d: Duration) {
+        self.landing_delay_ms
+            .store(d.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> PushStats {
@@ -642,6 +686,15 @@ impl Push {
                     sources,
                 } => {
                     me.rank_sources(group, rank, sources);
+                    Ok(())
+                }
+                PushMsg::Owed {
+                    group,
+                    rank,
+                    source,
+                    slots,
+                } => {
+                    me.owed(group, rank, source, slots);
                     Ok(())
                 }
                 PushMsg::Stream {
@@ -1240,7 +1293,8 @@ impl Push {
             for (r, owing) in g.owing.iter_mut().enumerate() {
                 if owing.contains(&source) {
                     owing.retain(|s| *s != source);
-                    tell.push((g.rank_hosts[r], r as u32, owing.clone()));
+                    let sent = slots.get(r).copied().unwrap_or(0);
+                    tell.push((g.rank_hosts[r], r as u32, owing.clone(), sent));
                 }
             }
             (g.streaming.is_empty(), tell)
@@ -1250,7 +1304,20 @@ impl Push {
             self.finish(group).await;
             return;
         }
-        for (host, rank, sources) in tell {
+        // What it sent first: the rank host then keeps the grants its last
+        // landings still fill when Sources drops it.
+        for (host, rank, sources, sent) in tell {
+            let _ = self
+                .send(
+                    host,
+                    PushMsg::Owed {
+                        group,
+                        rank,
+                        source,
+                        slots: sent,
+                    },
+                )
+                .await;
             let _ = self
                 .send(
                     host,
@@ -1424,6 +1491,8 @@ impl Push {
                 rdma: None,
                 token_id: 0,
                 sources: Vec::new(),
+                landed_from: HashMap::new(),
+                owed: HashMap::new(),
                 next: 0,
                 done_sent: false,
                 joined_at: None,
@@ -1499,33 +1568,53 @@ impl Push {
     }
 
     /// The sources owing this rank, at Start and again whenever one
-    /// finishes: grants held by a source no longer listed come back (it
-    /// will fill none of them).
+    /// finishes. A source no longer listed is given no more grants; those
+    /// it holds come back once its last slots have landed (`reclaim`).
     fn rank_sources(self: &Arc<Self>, group: u64, rank: u32, sources: Vec<Src>) {
         {
             let mut st = self.state.lock();
             let Some(r) = st.ranks.get_mut(&(group, rank)) else {
                 return;
             };
-            let back: Vec<u32> = r
-                .granted
-                .iter()
-                .filter(|(_, (s, _))| !sources.contains(s))
-                .map(|(slot, _)| *slot)
-                .collect();
-            let mut budgeted = 0;
-            for slot in &back {
-                r.granted.remove(slot);
-                if !r.floor.remove(slot) {
-                    budgeted += 1;
-                }
-                r.free.push(*slot);
-            }
             r.sources = sources;
-            let b = r.ring.as_ref().map_or(0, |x| x.slot_bytes as u64);
-            st.granted_bytes = st.granted_bytes.saturating_sub(b * budgeted);
         }
+        self.reclaim(group, rank);
         self.grant(group, rank);
+    }
+
+    /// `source` finished, having sent this rank `slots` slots.
+    fn owed(self: &Arc<Self>, group: u64, rank: u32, source: Src, slots: u64) {
+        {
+            let mut st = self.state.lock();
+            let Some(r) = st.ranks.get_mut(&(group, rank)) else {
+                return;
+            };
+            r.owed.insert(source, slots);
+        }
+        self.reclaim(group, rank);
+        self.grant(group, rank);
+    }
+
+    /// Grants held by sources no longer listed come back, but only those
+    /// of a source whose every slot has landed: a source's send completes
+    /// when its RDMA write reaches the ring, and the landing is handed on
+    /// here after that, possibly after the hub has said it finished.
+    fn reclaim(&self, group: u64, rank: u32) {
+        let mut st = self.state.lock();
+        let Some(r) = st.ranks.get_mut(&(group, rank)) else {
+            return;
+        };
+        let back = r.reclaimable();
+        let mut budgeted = 0;
+        for slot in &back {
+            r.granted.remove(slot);
+            if !r.floor.remove(slot) {
+                budgeted += 1;
+            }
+            r.free.push(*slot);
+        }
+        let b = r.ring.as_ref().map_or(0, |x| x.slot_bytes as u64);
+        st.granted_bytes = st.granted_bytes.saturating_sub(b * budgeted);
     }
 
     /// Hand free ring slots to sources as grants: first each owing source's
@@ -1668,9 +1757,10 @@ impl Push {
                 .get_mut(&(group, rank))
                 .ok_or_else(|| invalid("no such rank here"))?;
             let ring = r.ring.clone().ok_or_else(|| invalid("rank not joined"))?;
-            if r.granted.remove(&slot).is_none() {
+            let Some((from, _)) = r.granted.remove(&slot) else {
                 return Err(invalid("a slot without a credit"));
-            }
+            };
+            *r.landed_from.entry(from).or_default() += 1;
             // The slot is no longer in flight: its budget is free (a floor
             // grant never took any).
             if !r.floor.remove(&slot) {
@@ -2528,6 +2618,10 @@ impl nest_fabric::push::PushSink for Landings {
         tracing::trace!(token, group, rank, "push landed");
         // Off the completion thread: checking takes locks and may send.
         self.1.spawn(async move {
+            let delay = p.landing_delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             if let Err(e) = p.landed(group, rank, token & 0xfff) {
                 tracing::warn!(error = %e, group, rank, "bad push slot");
             }
@@ -2614,6 +2708,68 @@ fn is_lane_failure(e: &NestError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rank_slot() -> RankSlot {
+        RankSlot {
+            hub: NodeId(1),
+            token: 0,
+            arena: 0,
+            ring: None,
+            engine: None,
+            filled: 0,
+            expected: None,
+            bytes: 0,
+            reported: 0,
+            free: Vec::new(),
+            granted: HashMap::new(),
+            floor: Default::default(),
+            floor_n: 1,
+            budget: 64 << 20,
+            next_seq: 0,
+            rdma: None,
+            token_id: 0,
+            sources: Vec::new(),
+            landed_from: HashMap::new(),
+            owed: HashMap::new(),
+            next: 0,
+            done_sent: false,
+            joined_at: None,
+            released: 0,
+            last_release: None,
+        }
+    }
+
+    /// A finished source's grants stay granted, so not re-granted, until
+    /// every slot it sent has landed: its last writes are in the ring
+    /// before the rank host hands their landings on, and a slot granted
+    /// again meanwhile would take a late landing for another source's fill
+    /// while that one writes over it.
+    #[test]
+    fn a_finished_sources_grants_come_back_only_once_its_slots_landed() {
+        let (a, b) = (Src::host(NodeId(2)), Src::host(NodeId(3)));
+        let mut r = rank_slot();
+        r.sources = vec![a, b];
+        // a holds slots 0..3, b slot 3; a has landed one slot so far.
+        for (slot, s) in [(0, a), (1, a), (2, a), (3, b)] {
+            r.granted.insert(slot, (s, slot as u64));
+        }
+        r.landed_from.insert(a, 1);
+        // The hub drops a before its count arrives: nothing comes back.
+        r.sources = vec![b];
+        assert!(r.reclaimable().is_empty());
+        // a sent 3: two of its landings are still on their way.
+        r.owed.insert(a, 3);
+        assert!(r.reclaimable().is_empty());
+        // One lands (slot 0): still one owed.
+        r.granted.remove(&0);
+        r.landed_from.insert(a, 2);
+        assert!(r.reclaimable().is_empty());
+        // The last lands (slot 1): a's unused grant (slot 2) comes back,
+        // and b's, still streaming, stays.
+        r.granted.remove(&1);
+        r.landed_from.insert(a, 3);
+        assert_eq!(r.reclaimable(), vec![2]);
+    }
 
     fn files(n: usize, size: u64, holders: &[u64]) -> Vec<Resolved> {
         (0..n)

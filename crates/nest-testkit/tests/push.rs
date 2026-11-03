@@ -1670,3 +1670,122 @@ async fn an_offgrid_host_sources_what_only_it_holds() {
     assert!(out[..len] == a[..], "the fabric host's file");
     assert!(out[len..] == b[..], "the off-grid host's file");
 }
+
+/// A source's last RDMA writes may land after the hub has told the rank
+/// host that source finished (its send completions come back before the
+/// rank host's completion thread has handed the landings on). Those grants
+/// are still owed: they are filled, not taken back (GLM Flash on
+/// 2026-11-03: "a slot without a credit", and the load stalled).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn landings_after_their_source_finished_still_count() {
+    if nest_fabric::discover(&[]).is_empty() {
+        return;
+    }
+    let mut t = nest_testkit::fast_tuning();
+    t.fabric = Some(nest_fabric::FabricConfig {
+        devices: vec![],
+        ..nest_fabric::FabricConfig::default()
+    });
+    let c = TestCluster::start_with(3, t).await;
+    c.eventually("serving", Duration::from_secs(8), |c| {
+        (1..=3).all(|i| c.node(i).data.caught_up() && c.node(i).data.session().is_some())
+    })
+    .await;
+    c.eventually("names registered", Duration::from_secs(8), |c| {
+        c.node(1)
+            .placer
+            .nodes()
+            .map(|n| n.iter().all(|h| !h.name.starts_with("node")))
+            .unwrap_or(false)
+    })
+    .await;
+    // n2 holds a small file and finishes first; n3 a large one, still
+    // streaming when n2's last landings are handed on.
+    let small: Vec<u8> = (0..(4usize << 20)).map(|i| (i % 241) as u8).collect();
+    let large: Vec<u8> = (0..(48usize << 20)).map(|i| (i % 239) as u8).collect();
+    sealed(&c, 2, "small.bin", small.clone()).await;
+    sealed(&c, 3, "large.bin", large.clone()).await;
+    // The rank on n1, the hub: its landings wait, so the hub's word that
+    // n2 finished always comes first.
+    c.node(1).push.delay_landings(Duration::from_millis(50));
+    let total = (small.len() + large.len()) as u64;
+    let (hub, sock) = (c.push_socket(1), c.push_socket(1));
+    let (slots, slot_bytes) = (32u32, 128u32 << 10);
+    let (sl, ll) = (small.len() as u64, large.len() as u64);
+    let out = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(30));
+        let g = Coordinator::create(
+            &hub,
+            vec![RankSpec {
+                rank: 0,
+                host: "n1".into(),
+                arena_bytes: total,
+            }],
+            vec!["/small.bin".into(), "/large.bin".into()],
+            t,
+        )
+        .unwrap();
+        g.patterns(vec![
+            Pattern {
+                run: sl as u32,
+                dims: vec![],
+            },
+            Pattern {
+                run: ll as u32,
+                dims: vec![],
+            },
+        ])
+        .unwrap();
+        g.entries(vec![
+            Entry {
+                file: 0,
+                pattern: 0,
+                src_base: 0,
+                dst_base: 0,
+                rank: 0,
+            },
+            Entry {
+                file: 1,
+                pattern: 1,
+                src_base: 0,
+                dst_base: sl,
+                rank: 0,
+            },
+        ])
+        .unwrap();
+        let ring = memfd(slots as usize * slot_bytes as usize);
+        let rank = Rank::join(
+            &sock,
+            JoinArgs {
+                group: g.group,
+                token: g.token,
+                rank: 0,
+                ring_fd: ring.as_raw_fd(),
+                slots,
+                slot_bytes,
+            },
+            t,
+        )
+        .unwrap();
+        let h = std::thread::spawn(move || run_rank(rank, ring, slots, slot_bytes, total as usize));
+        g.start().unwrap();
+        let arena = h.join().unwrap().expect("the load completes");
+        loop {
+            match g.next().unwrap() {
+                Some(Event::Done) => break,
+                Some(Event::Progress { .. }) => {}
+                other => panic!("coordinator got {other:?}"),
+            }
+        }
+        arena
+    })
+    .await
+    .unwrap();
+    assert!(out[..small.len()] == small[..]);
+    assert!(out[small.len()..] == large[..]);
+    // Every slot went by RDMA: none fell back to RPC.
+    assert_eq!(
+        c.node(2).push.stats().rpc_slots + c.node(3).push.stats().rpc_slots,
+        0
+    );
+}

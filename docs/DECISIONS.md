@@ -2805,3 +2805,36 @@ its ref, and the shared blobs no other snapshot uses (checked against a
 copy of the production layout: the branch's weight went, the other six
 branches kept every file).
 
+## ADR-082 — A finished source's grants come back once its slots have landed (2026-11-03)
+
+**Context.** A cuteafd GLM Flash weight push stalled and timed out, and a
+retry delivered mixed slot content, after "a slot without a credit" on the
+rank hosts. A source finishes once its sends complete; an RDMA send
+completes when the write reaches the rank host's ring, and the rank host's
+completion thread hands the landing on to `landed()` after that. The hub,
+told the source finished, sends the rank host the remaining sources, and
+since 0.6.1 (ADR-063's "a finished source gives back its ring slots") the
+rank host took back every grant the finished source still held, at once.
+A landing still queued then found its grant gone: it was dropped (never
+counted, never given to the engine, so the rank never completed), or, if
+the slot had been granted again meanwhile, it was taken as the new grant's
+fill while the new source wrote over it. In group 3700886014394384 the bad
+slots followed raptor's D2 and D3 finishing by 13–24 ms on ostrich and
+moa's by 2 ms on raptor; 0.7.0's disks as sources of their own made more
+sources finish mid-load.
+
+**Decision.** The hub sends each rank host `Owed` (a new push message,
+appended) with how many slots a finished source sent that rank, before
+the reduced `Sources`. The rank host counts landings per source and gives
+back a finished source's grants only once its count has landed; until
+then they stay granted, so they are neither re-granted nor matched to
+another fill. A source dropped before its count arrives keeps its grants
+until it does. Push is not run across versions (ADR-063), so a rank host
+needs no rule for a hub that sends no count.
+
+**Alternatives.** Retiring a finished source's unfilled grants until the
+rank ends: no count needed, but the grants a source never used would stay
+out of the ring for the rest of the load, the stall 0.6.1 fixed. Having
+the source wait for the rank host to acknowledge each landing: a round
+trip per slot on the fast path.
+
