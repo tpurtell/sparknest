@@ -29,16 +29,21 @@ export async function deleteModel(selector: string, stay = false) {
     toast((e as Error).message, true);
     return;
   }
-  if (!d?.repos) {
+  // One branch of a repo with several is a revision, not a repo: hf
+  // removes that snapshot and the shared blobs only it used.
+  if (!d?.repos && !d?.revisions) {
     await inform(
       `hf cannot see ${label}`,
       `Its refs may name a revision the hub does not hold. Run "Tidy hub…" in the Models view (it repairs them first), then delete it again: deleting the folder alone would leave its weights in the shared store.`,
     );
     return;
   }
+  const what = d.repos
+    ? `${d.revisions ?? 1} revision${d.revisions === 1 ? "" : "s"}`
+    : "this branch (the repo's other branches stay)";
   const ok = await confirm(
     `Delete ${label}?`,
-    `hf removes ${d.revisions ?? 1} revision${d.revisions === 1 ? "" : "s"} (${d.size ?? "?"}) from every host and archive store. This cannot be undone.`,
+    `hf removes ${what} (${d.size ?? "?"}) from every host and archive store. This cannot be undone.`,
     "Delete",
     true,
   );
@@ -214,7 +219,7 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
   const isHost = scope && places().some((h) => h.name === scope);
   const items: MenuItem[] = [];
   if (zoom && (n.children?.length || n.truncated)) items.push({ label: "Zoom in", icon: "zoom", run: zoom });
-  if (n.kind === "repo") items.push({ label: "Model details", icon: "info", run: () => go("models", sel) });
+  if (n.kind === "repo" || n.kind === "revision") items.push({ label: "Model details", icon: "info", run: () => go("models", sel) });
   items.push(
     { label: "Place…", icon: "target", hint: "hosts, replicas, archive", run: () => openPlace(sel, n.kind === "repo" ? n.name : selLabel(sel)) },
     { label: "Copy to…", icon: "copy", run: () => copyTo(sel) },
@@ -224,6 +229,9 @@ export function nodeMenu(n: TreeNode, x: number, y: number, scope: string | null
   );
   if (isHost) items.push({ label: `Remove from ${scope}`, icon: "trash", danger: true, run: () => removeFrom(sel, [scope!]) });
   items.push({ label: "Remove from…", icon: "trash", danger: true, run: () => removeFrom(sel) });
+  // A branch of a repo cached at several: its snapshot, through hf.
+  if (n.kind === "revision")
+    items.push({ sep: true, label: "" }, { label: "Delete branch…", icon: "trash", danger: true, run: () => deleteModel(sel, true) });
   if (n.path) {
     const dir = n.kind === "dir" || n.kind === "group";
     items.push(

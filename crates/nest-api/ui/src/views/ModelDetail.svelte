@@ -78,7 +78,11 @@
       <button class="btn" onclick={() => copyTo(selector)}><Icon name="copy" size={15} /> Copy to…</button>
       <button class="btn" onclick={() => keepOn(selector)}><Icon name="pin" size={15} /> Keep on…</button>
       <button class="btn danger" onclick={() => removeFrom(selector)}><Icon name="trash" size={15} /> Remove from…</button>
-      <button class="btn danger" onclick={() => deleteModel(selector)} title="Delete the repo from the hub with hf: every copy, every host"><Icon name="trash" size={15} /> Delete model</button>
+      {#if selector.includes("@")}
+        <button class="btn danger" onclick={() => deleteModel(selector)} title="Delete this branch from the hub with hf: every copy, every host; the repo's other branches stay"><Icon name="trash" size={15} /> Delete branch</button>
+      {:else}
+        <button class="btn danger" onclick={() => deleteModel(selector)} title="Delete the repo from the hub with hf: every copy, every host"><Icon name="trash" size={15} /> Delete model</button>
+      {/if}
     </div>
     {#if pt?.files}
       {@const all = pt.always === pt.files}

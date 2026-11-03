@@ -3,6 +3,13 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-03 — A branch is deleted as a branch (ADR-081)
+
+Branch rows (`repo@branch`) could not be deleted from the UI: hf's dry run
+for one branch reports `repos: 0`, which the UI took for "hf cannot see
+it". It now goes on to the confirm; Space blocks for a branch offer
+"Delete branch…". `hf_removes_one_branch` already covers hf's side.
+
 ## 2026-11-03 — 0.7.3 released
 
 ADR-077 to ADR-080 below. Rolled to every host one at a time under

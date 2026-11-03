@@ -2786,3 +2786,22 @@ writes refs through the Spark's. Following the metadata's change effects:
 correct while followed, but a restart or a lag needs a full re-read anyway,
 and comparing versions needs no bookkeeping. A time-based cache: stale
 branch names for its lifetime after any download.
+
+## ADR-081 — A branch is deleted as a branch (2026-11-03)
+
+**Context.** TJ could not delete turboderp's Qwen3-0.6B-exl3 quants. A repo
+cached at several branches shows one row (and one Space block) per branch,
+selected as `repo@branch`. For one branch `hf cache rm` removes a revision,
+not a repo, so its dry run reports `repos: 0, revisions: 1`; the UI read
+`repos: 0` as "hf cannot see this model" and stopped. In the Space view a
+branch's block had no delete at all (it has no path, and ADR-079 put
+"Delete model…" on repo blocks only).
+
+**Decision.** The UI deletes a branch through hf like a model: a dry run
+naming any revision goes on to the confirm, which says the repo's other
+branches stay. A branch's block in the Space view offers "Delete branch…",
+and a branch's model page says "Delete branch". hf removes the snapshot,
+its ref, and the shared blobs no other snapshot uses (checked against a
+copy of the production layout: the branch's weight went, the other six
+branches kept every file).
+
