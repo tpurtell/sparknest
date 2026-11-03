@@ -3,10 +3,11 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-11-03 — 0.7.5 prepared
+## 2026-11-03 — 0.7.5 released
 
 ADR-083 below (off by default), with each load's record naming its
-lookahead. Not yet released or rolled out.
+lookahead. Rolled to all ten hosts under CuteAFD's locks, raptor last;
+each was back in 12–13 s (maxq 3 s).
 
 ## 2026-11-03 — Push sources may reorder their files (ADR-083)
 
