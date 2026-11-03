@@ -3,6 +3,11 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-03 — 0.7.5 prepared
+
+ADR-083 below (off by default), with each load's record naming its
+lookahead. Not yet released or rolled out.
+
 ## 2026-11-03 — Push sources may reorder their files (ADR-083)
 
 `push-reorder-lookahead` (default 0, off): the hub orders each source's
