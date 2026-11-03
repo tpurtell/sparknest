@@ -3,9 +3,11 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
-## 2026-11-03 — 0.7.4 prepared
+## 2026-11-03 — 0.7.4 released
 
-ADR-081 and ADR-082 below. Not yet released or rolled out.
+ADR-081 and ADR-082 below. Rolled to all ten hosts, maxq included, one
+at a time under CuteAFD's hardware locks with raptor last; each was back
+in 11–13 s. CuteAFD restarts the containers that bound the mount.
 
 ## 2026-11-03 — Late push landings keep their grants (ADR-082)
 
