@@ -8,6 +8,7 @@
 /interface ethernet switch qos port set qsfp56-dd-3-5 !egress-rate-queue2 pfc=cuteafd-pfc3
 /interface ethernet switch qos port set qsfp56-dd-4-1 !egress-rate-queue2 pfc=cuteafd-pfc3
 /interface ethernet switch qos port set qsfp56-dd-4-5 !egress-rate-queue2 pfc=cuteafd-pfc3
+/interface ethernet switch qos tx-manager queue set [find traffic-class=2] ecn=no
 /interface ethernet switch qos priority-flow-control remove [find name=pfc-2-3]
 /interface ethernet switch qos map ip remove [find profile=sparknest-rdma]
 /interface ethernet switch qos profile remove [find name=sparknest-rdma]

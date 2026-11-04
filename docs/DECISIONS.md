@@ -2967,3 +2967,41 @@ what stalled, idle holders and the blocked stream were (an earlier
 proportional split finished slower). One stream per rank: a source reads each
 file once for every rank it feeds. A larger budget: the grants would sit at
 the same sources.
+
+## ADR-086 — ECN on SparkNest's class, PFC its backstop, 8 MiB incast by default (2026-11-04; amends ADR-084)
+
+**Context.** After ADR-084 and ADR-085, Muse max pushes still stalled for
+0.25–0.75 s several times a load. Every rank's ring had all its grants out,
+the engine held 0–7 slots, and its class was idle: the stalls were the
+fabric. With 64 MiB in flight toward each rank host and PFC alone, each
+burst of eight sources into one 100G port filled the switch's lossless pool
+(4 MiB of its 8 MiB; `auto`): it paused every sender on class 2 at once,
+so all sources stalled together, and still dropped 1.6–2.3 M packets per
+port, each a go-back-N resend. Nothing slowed the senders before the queue
+filled: ECN was off since WRED was turned off for lossless, and WRED's
+marking is what ECN rides on.
+
+**Decision.**
+- **ECN marking on switch queue 2** (`ecn=yes`, WRED still off: on this
+  switch ECN marks ECN-capable packets instead of dropping them, and does
+  not need WRED). ConnectX marks RoCE ECN-capable and runs DCQCN, so a
+  receiver sends a CNP as the queue grows and the sender slows. PFC on
+  classes 2 and 3 stays, as the backstop. Queue 3 is left as it is.
+- **`push-incast-mib` defaults to 8** (was 0: the fabric's read budget, 64
+  MiB on a Spark, 95 MiB on raptor). A rank at 6.5 GB/s needs about 4 MiB
+  in flight; 8 MiB is about two grants per source of eight.
+- Measured on one Muse max build (benchmarks/M13-MODEL-LOAD.md): 15.3 s →
+  11.6 s, 0 drops and 0 resends, ranks finishing within 2 ms.
+
+**What stays.** Class 2 stays lossless on this cluster: pushes and
+inference rarely overlap, and lossless with ECN dropped nothing. **Lossy
+with ECN does about as well**: with class 2 out of PFC (the ports on the
+engine's class-3-only profile), ECN and 8 MiB, a push ran as fast with a
+few thousand drops per port, 0–4 resends per host and no pauses, leaving
+the engine's class the lossless pool and PFC to itself. It needs the small
+incast: at 16 MiB drops rose a hundredfold. A fabric where pushes overlap
+inference may prefer it.
+
+**Alternatives.** A lower explicit PFC pause threshold: fewer drops but
+more pausing, and each pause stops every sender on the class. WRED: drops
+by design. More incast (16 MiB): no faster, and more drops.

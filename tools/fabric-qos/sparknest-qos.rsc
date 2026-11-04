@@ -5,11 +5,15 @@
 #     only when the high-priority group (class 3, the engine) is empty.
 #   PFC on classes 2 and 3 together: a port takes one PFC profile, and
 #     PFC pauses each class on its own, so SparkNest's pauses never stop 3.
-# ECN and WRED stay off on every queue: both classes are Not-ECT and lossless.
+# ECN marking on queue 2 (ADR-086): the NICs mark RoCE ECN-capable and slow
+#   a sender on each CNP, so the queue stays short and PFC rarely fires.
+#   WRED stays off on every queue: it drops, and a RoCE drop costs a
+#   go-back-N resend. Queue 3 (the engine) is left as it is.
 # Import with serving stopped; dry-run first. Undo: sparknest-qos-rollback.rsc.
 /interface ethernet switch qos profile add name=sparknest-rdma dscp=18 pcp=2 traffic-class=2 automap=no
 /interface ethernet switch qos map ip add dscp=18 map=default profile=sparknest-rdma
 /interface ethernet switch qos priority-flow-control add name=pfc-2-3 traffic-class=2,3 rx=yes tx=yes
+/interface ethernet switch qos tx-manager queue set [find traffic-class=2] ecn=yes wred=no
 # moa: classes 2 and 3 lossless; queue 2 wire rate for received pause time.
 /interface ethernet switch qos port set qsfp56-dd-1-1 pfc=pfc-2-3 egress-rate-queue2=100.0Gbps
 # rhea: classes 2 and 3 lossless; queue 2 wire rate for received pause time.

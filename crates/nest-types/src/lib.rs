@@ -322,7 +322,8 @@ pub enum Setting {
     /// one host can deadlock.
     PushGrantFloor,
     /// Push bytes a host lets sources have in flight toward its rings
-    /// (MiB); 0 is the fabric's read budget.
+    /// (MiB); 0 is the fabric's read budget. 8 by default (ADR-086): more
+    /// overfills the switch's buffers under eight-way incast.
     PushIncastMib,
     /// How many of its next files (in plan order) a push source may choose
     /// from, to feed the rank furthest behind (ADR-083); 0 is plan order.
@@ -360,7 +361,7 @@ impl Setting {
             Setting::PreferredLeader => 0,
             Setting::ControlOnLan => 1,
             Setting::PushGrantFloor => 1,
-            Setting::PushIncastMib => 0,
+            Setting::PushIncastMib => 8,
             Setting::PushReorderLookahead => 0,
         }
     }

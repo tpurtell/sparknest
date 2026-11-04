@@ -3,6 +3,18 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-04 — ECN on SparkNest's class, 8 MiB incast (ADR-086)
+
+0.8.1 rolled to all ten hosts (raptor last, under cuteafd's locks). Muse
+max still stalled: the ring traces cleared the engine and the credits, and
+the switch's counters showed PFC pausing every class-2 sender at once and
+dropping 1.6–2.3 M packets per port. One Muse max load per arm: 8 MiB
+incast took it from 15.3 s to 11.2 s; ECN on queue 2 to 11.7 s with 0
+drops; both to 11.6 s, 0 drops, 0 resends, ranks within 2 ms. Lossy with
+ECN and 8 MiB ran as fast (0–4 resends); at 16 MiB drops rose a hundredfold.
+Kept: lossless, ECN on queue 2 (switch set, `sparknest-qos.rsc` updated),
+8 MiB the new default (benchmarks/M13-MODEL-LOAD.md). Not released.
+
 ## 2026-11-04 — Push grants follow demand (ADR-085), 0.8.1
 
 Muse max loads after 0.8.0 still paused 0.25–0.75 s about eight times a

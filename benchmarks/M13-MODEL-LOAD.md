@@ -262,3 +262,46 @@ under 40% of a core. Ports still run 4–5.7 GB/s each way of 12.5; each
 Spark's single RDMA poller thread is busy throughout, and queue 2 still
 drops a few thousand packets per port under eight-way incast (the PFC
 thresholds are `auto`).
+
+## Muse max: credits, incast and ECN (ADR-085, ADR-086; 2026-11-04)
+
+The same Muse max push (429.0 GB, eight sources, six Spark ranks and two on
+raptor, engine build dev 2312a49d0, slot `muse-max-qos:whole`), one load per
+row. "Push" is the hub's load window; "join → commit" is cuteafd's. Stalls
+are 250 ms bins under 15 GB/s. Drops are the switch's `tx-drop-queue2` per
+Spark port, resends `roce_adp_retrans` per host, pauses `rx_prio2_pause`
+per Spark, all over the load.
+
+| Group | SparkNest | Class 2 | ECN q2 | Incast | Push | Join → commit | Stalls | Drops / port | Resends / host | Pauses / Spark | Rank spread |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| …120 | 0.8.0 | lossless | off | 64 MiB | 15.7 s | — | 18 / 63 | — | — | — | — |
+| …880 | 0.8.1 | lossless | off | 64 MiB | 15.3 s | 19.99 s | 12 / 62 | 1.6–2.3 M (four ports) | 1.5–2.4 k | 685 k | 31 ms |
+| …888 | 0.8.1 | lossless | off | 8 MiB | 11.2 s | 15.79 s | 0 / 45 | 9–12 k | 5–16 | 235 k | 3 ms |
+| …891 | 0.8.1 | lossless | on | 64 MiB | 11.7 s | 16.39 s | 0 / 47 | 0 | 0 | 90 k | 26 ms |
+| **…894** | 0.8.1 | **lossless** | **on** | **8 MiB** | **11.6 s** | **16.30 s** | 0 / 47 | **0** | **0** | 70 k | **2 ms** |
+| …896 | 0.8.1 | lossy | on | 8 MiB | 11.6 s | 16.18 s | 0 / 47 | 1.5–5.9 k | 0–4 | 0 | 3 ms |
+| …897 | 0.8.1 | lossy | on | 16 MiB | 11.9 s | 16.52 s | 1 / 48 | 280–490 k | 1.2–1.9 k | 0 | 2 ms |
+
+With 64 MiB in flight per rank host and PFC alone, each burst filled the
+switch's lossless pool (4 MiB of its 8 MiB): it paused every sender on class
+2 at once, about 78 k pauses into raptor per 250 ms during each stall, and
+still dropped. The engine held 0–7 ring slots throughout, every rank's
+grants were all out, and the engine's class 3 was idle, so neither the
+engine nor SparkNest's credits held the stalls (0.8.1's credit change,
+ADR-085, took stall bins from 18 to 12, not to 0). The four ports that
+dropped were the same model, cable, speed, FEC and PFC profile as the two
+that did not, with no receive errors; in Kimi loads the drops moved to
+other ports.
+
+With ECN, each Spark received 1.1–1.4 M ECN-marked packets and sent 87–113 k
+CNPs per load, and raptor's NIC handled 131–154 k: DCQCN slowed the senders
+before the queue overflowed. 8 MiB per rank host is about two grants per
+source (each Spark ring had 8–16 granted); the push was no slower for it.
+
+V4.1 Flash max (306.6 GB, heavier to raptor's ranks) moved the same way,
+bound by raptor's D2 disk, which finished 5–9 s after every other source:
+20.1 s (64 MiB) → 19.2 s (8 MiB) → 16.3 and 16.7 s (64 MiB, ECN) → 15.9 and
+16.4 s (8 MiB, ECN), the ECN runs with 0 drops and 0 resends.
+
+Cuteafd's readiness moved 81.0–92.0 s across the arms, bound after the push
+by its drafter staging (+47 to +50 s after commit).

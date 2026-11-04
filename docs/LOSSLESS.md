@@ -10,12 +10,21 @@ tuned for it carries that traffic in a class of its own:
 | NIC priority, switch class | 3 | 2 |
 | Switch scheduling | high-priority group | low-priority group: sent only when the high group is empty |
 | Loss | PFC on priority 3 | PFC on priority 2, its own NIC buffer |
+| Congestion | — | ECN marking on switch queue 2; the NICs slow senders on each CNP |
 
 So SparkNest's traffic is not dropped under incast (eight sources into
 one host), and it always yields to the engine's: the switch serves class 2
 only when class 3 has nothing to send, and PFC pauses each priority on its
-own, so a full SparkNest buffer never pauses the engine. ECN and WRED stay
-off: neither class sets ECN bits, so marking cannot slow it, only drop it.
+own, so a full SparkNest buffer never pauses the engine.
+
+**ECN, with PFC as the backstop** (ADR-086). PFC alone let every push burst
+fill the switch's lossless buffer: the switch then paused every sender on
+class 2 at once (all sources stalling together), and still dropped.
+ConnectX marks RoCE packets ECN-capable, so with ECN marking on queue 2
+the receiving NIC sends a CNP as the queue grows and the sender slows
+(DCQCN) before it fills; PFC catches what is left. WRED stays off on every
+queue: it drops, and a RoCE drop costs a go-back-N resend. Each rank host
+also keeps the push it receives to 8 MiB in flight (`push-incast-mib`).
 
 Untuned, nothing breaks: a NIC trusting PCP or a switch ignoring DSCP puts
 DSCP 18 in the default lossy queue, where SparkNest ran before 0.8. Then a
@@ -62,6 +71,30 @@ agent-sudo --agent-context "Reapply SparkNest's RoCE NIC tuning at boot" $T pers
 $T check                       # every port: tuned
 ```
 
+## What it measured
+
+Muse max push loads (429 GB, eight sources, eight ranks, same engine build),
+2026-11-04:
+
+| Class 2 | ECN, queue 2 | Incast | Push | Drops per Spark port | Resends per host |
+|---|---|---|---|---|---|
+| lossy (untuned, before 0.8) | off | 64 MiB | 20–25 s | billions over its life | 6–9 k |
+| lossless | off | 64 MiB | 15.3 s | 1.6–2.3 M | 1.5–2.4 k |
+| lossless | off | 8 MiB | 11.2 s | 9–12 k | 5–16 |
+| lossless | on | 64 MiB | 11.7 s | 0 | 0 |
+| **lossless** | **on** | **8 MiB** | **11.6 s** | **0** | **0** |
+| lossy | on | 8 MiB | 11.6 s | 1.5–5.9 k | 0–4 |
+| lossy | on | 16 MiB | 11.9 s | 280–490 k | 1.2–1.9 k |
+
+**Lossy with ECN does about as well.** With class 2 left out of PFC (the
+ports on the engine's class-3-only profile) and ECN plus the 8 MiB incast,
+a push ran as fast with a few thousand drops per port and almost no resends,
+and sent no pauses at all: the engine's class keeps the lossless buffer and
+PFC to itself. It needs the small incast: at 16 MiB, ECN could not slow
+the senders fast enough and drops rose a hundredfold. This cluster keeps
+class 2 lossless (pushes and inference rarely overlap); a fabric where they
+do may prefer lossy with ECN.
+
 ## Switch (MikroTik CRS8xx)
 
 `tools/fabric-qos/sparknest-qos.rsc` adds to a switch already set up for
@@ -73,8 +106,9 @@ the engine's DSCP 26 / class 3 (as RouterOS 7.24.5 on a CRS804-4DDQ):
   seven fabric ports;
 - queue 2's wire rate on each port, which PFC uses to time pauses it
   receives;
+- ECN marking on queue 2 (WRED off);
 - nothing else: queue 2 is already in the low-priority group, queue 3 in
-  the high one, and ECN and WRED stay off everywhere.
+  the high one and left as it is.
 
 Check the port names and rates against `/interface ethernet switch qos
 export verbose` first; the file names this cluster's ports.
@@ -97,6 +131,9 @@ cat /sys/class/infiniband/*/ports/1/hw_counters/roce_adp_retrans
 
 `tx_prio2_bytes` grows with SparkNest traffic and retransmits stay near
 zero. On the switch, `/interface ethernet switch qos port print stats`
-shows queue 2 carrying it and `tx-drop-queue2-packet` at zero. Pauses on
-priority 2 are normal under incast; pauses on priority 3 that rise only
-with SparkNest loads would mean a buffer is shared, which apply avoids.
+shows queue 2 carrying it and `tx-drop-queue2-packet` at zero. ECN at work
+shows on the receiving hosts as `np_ecn_marked_roce_packets` and
+`np_cnp_sent` rising during a push (`hw_counters`), and on senders as
+`rp_cnp_handled`. Pauses on priority 2 are normal under incast; pauses on
+priority 3 that rise only with SparkNest loads would mean a buffer is
+shared, which apply avoids.

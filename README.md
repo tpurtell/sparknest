@@ -33,8 +33,10 @@ from a local copy at 9.6 GB/s cold and 85 GB/s warm.
 
 SparkNest marks its RDMA **DSCP 18** (priority 2), a class of its own below
 an inference engine's DSCP 26 (priority 3). With the hosts and switch tuned
-for it, SparkNest's traffic is never dropped under incast and always yields
-to the engine's; untuned, it travels in the default lossy queue as before.
+for it (lossless, with ECN marking so senders slow before the switch fills),
+SparkNest's traffic is not dropped under incast and always yields to the
+engine's; untuned, it travels in the default lossy queue as before. Lossy
+with ECN alone does about as well.
 [`docs/LOSSLESS.md`](docs/LOSSLESS.md) has the host script and the MikroTik
 switch configuration (`tools/fabric-qos/`).
 
