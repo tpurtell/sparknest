@@ -13,7 +13,9 @@ incast took it from 15.3 s to 11.2 s; ECN on queue 2 to 11.7 s with 0
 drops; both to 11.6 s, 0 drops, 0 resends, ranks within 2 ms. Lossy with
 ECN and 8 MiB ran as fast (0–4 resends); at 16 MiB drops rose a hundredfold.
 Kept: lossless, ECN on queue 2 (switch set, `sparknest-qos.rsc` updated),
-8 MiB the new default (benchmarks/M13-MODEL-LOAD.md). Not released.
+8 MiB the new default (benchmarks/M13-MODEL-LOAD.md). Released as 0.8.2
+and installed on every host without restarts: the cluster setting already
+holds 8, so running 0.8.1 daemons behave the same until their next restart.
 
 ## 2026-11-04 — Push grants follow demand (ADR-085), 0.8.1
 
