@@ -3,6 +3,17 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-04 — Push grants follow demand (ADR-085), 0.8.1
+
+Muse max loads after 0.8.0 still paused 0.25–0.75 s about eight times a
+load: seven sources stopped together while raptor's ranks received nothing,
+and five-rank loads held raptor's disks at 0.4 GB/s for 20 s. Sources now
+set up to 32 full slots aside instead of waiting on one rank's credit, and
+rank hosts give the budget only to sources with data for the rank within
+64 MiB of reads (`PushMsg::Want`). A test with one engine releasing every
+30 ms: the fast rank's last slot used to come once the slow one had
+released 45 of 49 slots; now well before.
+
 ## 2026-11-04 — 0.8.0 released; the fabric tuned for it
 
 ADR-084 below. Switch: `sparknest-qos.rsc` imported (DSCP 18 → class 2,
