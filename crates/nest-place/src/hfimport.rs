@@ -1928,20 +1928,32 @@ pub fn hf_python(hf: &Path) -> Option<PathBuf> {
 }
 
 /// The driver: `$SPARKNEST_HF_FETCH`, beside this executable, or in
-/// `../libexec/sparknest/` (the Homebrew layout).
+/// `../libexec/sparknest/` (the Homebrew layout). Beside the path the
+/// daemon was started by, too: `current_exe` resolves Homebrew's
+/// `opt/sparknest` link to the versioned keg, which an upgrade deletes
+/// while the old daemon still runs; the unresolved path follows the link
+/// to the new keg.
 pub fn fetch_driver() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("SPARKNEST_HF_FETCH") {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    [
-        dir.join("sparknest-hf-fetch"),
-        dir.join("../libexec/sparknest/sparknest-hf-fetch"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
+    let started = std::env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+    std::env::current_exe()
+        .ok()
+        .into_iter()
+        .chain(started)
+        .filter_map(|exe| exe.parent().map(Path::to_path_buf))
+        .flat_map(|dir| {
+            [
+                dir.join("sparknest-hf-fetch"),
+                dir.join("../libexec/sparknest/sparknest-hf-fetch"),
+            ]
+        })
+        .find(|p| p.is_file())
 }
 
 /// The interpreter and driver to run, or why there are none.
