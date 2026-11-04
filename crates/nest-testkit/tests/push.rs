@@ -1903,3 +1903,145 @@ async fn reordered_files_still_land_exactly() {
     assert_eq!(rec.reorder_lookahead, 8);
     assert!(rec.reorder_ms.is_some());
 }
+
+/// One rank slow to release must not stop a source's other ranks
+/// (ADR-085). Node 2's file interleaves rank 0 (node 3, an engine that
+/// releases a slot every 30 ms) and rank 1 (node 1, fast). A source waited
+/// on rank 0's credit at every full slot of it, so rank 1 moved at rank
+/// 0's pace; now it sets rank 0's slots aside and packs on, and rank 1
+/// finishes while rank 0 is still far from done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_slow_rank_does_not_pace_the_others() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let c = ready(3).await;
+    let (rows, unit) = (192u32, 16u32 << 10);
+    let row = 2 * unit as usize;
+    let len = rows as usize * row;
+    let data: Vec<u8> = (0..len).map(|i| (i * 11 % 251) as u8).collect();
+    sealed(&c, 2, "mix.bin", data.clone()).await;
+    let share = rows as u64 * unit as u64;
+    let patterns: Vec<Pattern> = (0..2)
+        .map(|_| Pattern {
+            run: unit,
+            dims: vec![Dim {
+                steps: Steps::Count(rows),
+                src_stride: row as u64,
+                dst_stride: unit as u64,
+            }],
+        })
+        .collect();
+    let entries: Vec<Entry> = (0..2u32)
+        .map(|r| Entry {
+            file: 0,
+            pattern: r,
+            src_base: (r * unit) as u64,
+            dst_base: 0,
+            rank: r,
+        })
+        .collect();
+    let slot_bytes = 64u32 << 10;
+    let hosts = [3u64, 1];
+    let hub = c.push_socket(1);
+    let sockets: Vec<_> = hosts.iter().map(|h| c.push_socket(*h)).collect();
+    let slow_released = Arc::new(AtomicU64::new(0));
+    let (released, at_fast_done) = (slow_released.clone(), Arc::new(AtomicU64::new(u64::MAX)));
+    let seen = at_fast_done.clone();
+    let arenas = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(30));
+        let specs = hosts
+            .iter()
+            .enumerate()
+            .map(|(r, h)| RankSpec {
+                rank: r as u32,
+                host: format!("n{h}"),
+                arena_bytes: share,
+            })
+            .collect();
+        let g = Coordinator::create(&hub, specs, vec!["/mix.bin".into()], t)
+            .map_err(|e| format!("create: {e}"))?;
+        g.patterns(patterns).unwrap();
+        g.entries(entries).unwrap();
+        let (group, token) = (g.group, g.token);
+        let mut handles = Vec::new();
+        for (r, slots) in [(0u32, 4u32), (1, 16)] {
+            let ring = memfd(slots as usize * slot_bytes as usize);
+            let k = Rank::join(
+                &sockets[r as usize],
+                JoinArgs {
+                    group,
+                    token,
+                    rank: r,
+                    ring_fd: ring.as_raw_fd(),
+                    slots,
+                    slot_bytes,
+                },
+                t,
+            )
+            .map_err(|e| format!("join {r}: {e}"))?;
+            let (released, seen) = (released.clone(), seen.clone());
+            handles.push(std::thread::spawn(move || {
+                // As run_rank; rank 0 takes 30 ms per slot, and rank 1
+                // notes how far rank 0 was at its last slot (its Done
+                // waits for every source to finish, so rank 0's too).
+                let file = std::fs::File::from(ring);
+                let mut out = vec![0u8; share as usize];
+                loop {
+                    match k.next().map_err(|e| e.to_string())? {
+                        Some(Event::Filled { slot: i, .. }) => {
+                            let mut buf = vec![0u8; slot_bytes as usize];
+                            use std::os::unix::fs::FileExt;
+                            file.read_exact_at(&mut buf, i as u64 * slot_bytes as u64)
+                                .unwrap();
+                            let p = slot::parse(&buf, share).map_err(|e| e.to_string())?;
+                            let mut at = 0usize;
+                            for (dst, n) in slot::Fragments::new(&buf, p) {
+                                out[dst as usize..dst as usize + n as usize]
+                                    .copy_from_slice(&buf[at..at + n as usize]);
+                                at += n as usize;
+                            }
+                            if r == 0 {
+                                std::thread::sleep(Duration::from_millis(30));
+                            }
+                            k.release(i).map_err(|e| e.to_string())?;
+                            if r == 0 {
+                                released.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                seen.store(released.load(Ordering::SeqCst), Ordering::SeqCst);
+                            }
+                        }
+                        Some(Event::Done) => return Ok(out),
+                        Some(Event::Failed { reason, .. }) => return Err(reason),
+                        Some(other) => return Err(format!("unexpected {other:?}")),
+                        None => return Err("socket closed".into()),
+                    }
+                }
+            }));
+        }
+        g.start().map_err(|e| format!("start: {e}"))?;
+        handles
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| h.join().unwrap().map_err(|e| format!("rank {i}: {e}")))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    for (r, got) in arenas.iter().enumerate() {
+        let mut want = Vec::new();
+        for rr in 0..rows as usize {
+            let at = rr * row + r * unit as usize;
+            want.extend_from_slice(&data[at..at + unit as usize]);
+        }
+        assert!(got == &want, "rank {r}'s arena differs from its share");
+    }
+    // Rank 0 is 49 slots; paced by it, rank 1's last slot would come
+    // only once rank 0 had released nearly all of them.
+    let slow_at = at_fast_done.load(Ordering::SeqCst);
+    let total = slow_released.load(Ordering::SeqCst);
+    assert!(
+        slow_at + 20 < total,
+        "rank 1's last slot came when the slow rank had released {slow_at} of {total}"
+    );
+}

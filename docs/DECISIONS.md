@@ -2926,3 +2926,44 @@ the engine would pause each other in one class. A lossy class 2 with ECN
 and DCQCN: no pause coupling at all, but the engine's tuning is PFC-only,
 and incast would still drop. More lanes per peer: each drop would stall
 less, but drops would remain.
+
+## ADR-085 — Push grants go to sources that can fill them, and a source no longer stops for one rank (2026-11-04; amends ADR-063)
+
+**Context.** After ADR-084, Muse max pushes (eight sources, eight ranks,
+raptor holding two) still paused about eight times a load: for 0.25–0.75 s
+seven sources stopped together, and only the one whose current files fed no
+raptor rank kept going. Every pause was a stretch where raptor's ranks
+received nothing. Five-rank loads went further: raptor's disks streamed at
+0.4 GB/s each for 20 s, then at 7–10 GB/s once the Sparks finished. Two
+things made one slow rank pace the whole load. A source streams its files in
+order and, at each full slot, waited for that slot's rank's credit, stopping
+every rank it fed. And a rank host shared its incast budget evenly over every
+source owing the rank, so credits sat at sources whose next files fed other
+ranks, while the source that had data for the rank held only its floor
+grant. More lookahead (ADR-083) evens demand out on average, but it plans at
+disk speed and cannot see a rank slowing for half a second.
+
+**Decision.**
+- **A source sets full slots aside** (up to `PARK`, 32, over all its ranks)
+  when their rank has no credit, and packs on for the others; it waits only
+  once more than that are set aside. Its staging grows by `PARK` slots.
+- **A source tells rank hosts its demand**, `WANT_AHEAD` (64 MiB of reads)
+  ahead of its packing: `PushMsg::Want` says whether it has data for that
+  rank soon, or a slot for it set aside. The budget's grants go only to
+  sources that do, fewest held first. A source going quiet hands back its
+  grants beyond `KEEP` (1), so its next slot for that rank still goes at
+  once; grants that arrive after it went quiet come back the same way.
+- **The floor stays**: every owing source holds a grant of each rank, so two
+  ranks on one host cannot deadlock (group 120235912134667). A source with
+  nothing for a rank soon holds no more than `KEEP` of its floor.
+
+**Compatibility.** A rank host never told a source's demand grants to it as
+before, so an older source is served as before. A source whose `Want` is
+refused (an older rank host) stops sending it and takes its handed-back
+grants again.
+
+**Alternatives.** Grants in proportion to each disk's rate: shares were not
+what stalled, idle holders and the blocked stream were (an earlier
+proportional split finished slower). One stream per rank: a source reads each
+file once for every rank it feeds. A larger budget: the grants would sit at
+the same sources.

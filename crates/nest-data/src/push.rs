@@ -7,9 +7,12 @@
 //!   then reports progress and the end.
 //! - **source**: a host whose store holds assigned files. Reads each file
 //!   once, in offset order, packs every run into the destination rank's
-//!   open slot, and sends a slot whenever it fills and a credit allows.
+//!   open slot, and sends a slot whenever it fills and a credit allows,
+//!   setting a few aside meanwhile so one rank without credit does not
+//!   stop the others.
 //! - **rank host**: where a rank's engine joined with its ring. Hands out a
-//!   credit per free ring slot, round robin over the sources owing it;
+//!   credit per free ring slot to the sources owing it, the budget's to
+//!   those with data for it soon (ADR-085);
 //!   writes each arriving slot into the ring slot its credit named, checks
 //!   it, and tells the engine.
 //!
@@ -50,6 +53,17 @@ const JOIN_WAIT: Duration = Duration::from_secs(60);
 const RPC: Duration = Duration::from_secs(30);
 /// Rank hosts report delivered bytes to the hub this often (bytes).
 const REPORT_EVERY: u64 = 256 << 20;
+/// Full slots a source sets aside while their rank has no credit, packing
+/// on for its other ranks meanwhile: one rank slow to grant no longer
+/// stops a source's every rank (ADR-085).
+const PARK: usize = 32;
+/// How far ahead of its packing (bytes of reads) a source tells rank
+/// hosts whether it has data for their ranks: their grants are there by
+/// the time its slots fill, and go to no source that has nothing to fill.
+const WANT_AHEAD: u64 = READ_AHEAD as u64 * READ_CHUNK;
+/// Grants of a rank a source keeps while it has no data for it soon: its
+/// next slot for that rank goes at once.
+const KEEP: usize = 1;
 
 /// Between sparknestds, on `service::PUSH`. Append-only.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,6 +168,18 @@ pub(crate) enum PushMsg {
         rank: u32,
         source: Src,
         slots: u64,
+    },
+    /// Source → rank host: whether `source` has data for `rank` within its
+    /// next `WANT_AHEAD` of reads (only sources that do get the budget's
+    /// grants; one never heard from does), with grants it hands back
+    /// unused, as (slot, seq). `seq` orders one source's messages.
+    Want {
+        group: u64,
+        rank: u32,
+        source: Src,
+        seq: u64,
+        want: bool,
+        returned: Vec<(u32, u64)>,
     },
 }
 
@@ -320,6 +346,8 @@ struct RankSlot {
     token_id: u32,
     /// Sources owing this rank slots.
     sources: Vec<Src>,
+    /// What each source last said of its demand (`Want`), with its seq.
+    wants: HashMap<Src, (u64, bool)>,
     /// Slots landed from each source.
     landed_from: HashMap<Src, u64>,
     /// Finished sources (no longer in `sources`): how many slots each sent
@@ -354,6 +382,33 @@ impl RankSlot {
             .collect()
     }
 
+    /// Sources owing this rank with data for it soon, or that never said:
+    /// the budget's grants go to these only.
+    fn wanting(&self) -> Vec<Src> {
+        self.sources
+            .iter()
+            .copied()
+            .filter(|s| self.wants.get(s).is_none_or(|w| w.1))
+            .collect()
+    }
+
+    /// Grants `source` handed back unused (slot, seq): free again, those
+    /// still its own. How many took from the budget.
+    fn give_back(&mut self, source: Src, returned: &[(u32, u64)]) -> u64 {
+        let mut budgeted = 0;
+        for &(slot, seq) in returned {
+            if self.granted.get(&slot) != Some(&(source, seq)) {
+                continue;
+            }
+            self.granted.remove(&slot);
+            if !self.floor.remove(&slot) {
+                budgeted += 1;
+            }
+            self.free.push(slot);
+        }
+        budgeted
+    }
+
     fn ring_state(&self) -> RingState {
         let since = |t: tokio::time::Instant| {
             self.joined_at
@@ -376,6 +431,23 @@ struct SourceState {
     credits: Vec<VecDeque<Grant>>,
     notify: Arc<tokio::sync::Notify>,
     cancelled: bool,
+    /// This stream, and each rank's host.
+    src: Src,
+    rank_hosts: Vec<NodeId>,
+    /// Per rank: whether its host was last told this stream has data for it.
+    wants: Vec<bool>,
+    /// Per rank: its host refused `Want` (an older sparknestd): not told
+    /// again; it grants as before.
+    legacy: Vec<bool>,
+    want_seq: u64,
+}
+
+impl SourceState {
+    /// A rank's grants beyond `KEEP`, taken to hand back.
+    fn spare(&mut self, rank: usize) -> Vec<Grant> {
+        let c = &mut self.credits[rank];
+        c.drain(KEEP.min(c.len())..).collect()
+    }
 }
 
 /// The engine's ring, mapped into this process: `slots` of `slot_bytes`.
@@ -838,6 +910,17 @@ impl Push {
                 }
                 PushMsg::RankDone { group, rank, slots } => {
                     me.rank_done(group, rank, slots);
+                    Ok(())
+                }
+                PushMsg::Want {
+                    group,
+                    rank,
+                    source,
+                    seq,
+                    want,
+                    returned,
+                } => {
+                    me.want(group, rank, source, seq, want, &returned);
                     Ok(())
                 }
                 PushMsg::End { group, reason } => {
@@ -1613,6 +1696,7 @@ impl Push {
                 rdma: None,
                 token_id: 0,
                 sources: Vec::new(),
+                wants: HashMap::new(),
                 landed_from: HashMap::new(),
                 owed: HashMap::new(),
                 next: 0,
@@ -1742,7 +1826,9 @@ impl Push {
     /// Hand free ring slots to sources as grants: first each owing source's
     /// floor (`push-grant-floor` grants of this rank held at once, outside
     /// the budget), then, while this host's grants outstanding stay within
-    /// the incast budget, each to the owing source holding fewest.
+    /// the incast budget, each to the owing source holding fewest of those
+    /// with data for this rank soon (`Want`; ADR-085): a source whose next
+    /// files feed other ranks would hold budget it cannot fill.
     ///
     /// Fewest held, not round robin: a slow source (an archive disk, an
     /// off-grid host over TCP) fills its grants slowly, and round robin
@@ -1772,19 +1858,27 @@ impl Push {
             for (s, _) in r.granted.values() {
                 *held.entry(*s).or_default() += 1;
             }
+            let wanting = r.wanting();
             let mut floor: VecDeque<Src> = r
                 .sources
                 .iter()
                 .flat_map(|s| {
-                    let need = floor_n.saturating_sub(held.get(s).copied().unwrap_or(0));
+                    // A source with nothing for this rank soon keeps only
+                    // what it would not hand back (`KEEP`).
+                    let n = if wanting.contains(s) {
+                        floor_n
+                    } else {
+                        floor_n.min(KEEP)
+                    };
+                    let need = n.saturating_sub(held.get(s).copied().unwrap_or(0));
                     std::iter::repeat_n(*s, need)
                 })
                 .collect();
             loop {
                 let (s, is_floor) = if let Some(s) = floor.pop_front() {
                     (s, true)
-                } else if granted + slot_bytes <= budget {
-                    let s = fewest(&r.sources, &held, r.next);
+                } else if granted + slot_bytes <= budget && !wanting.is_empty() {
+                    let s = fewest(&wanting, &held, r.next);
                     r.next = r.next.wrapping_add(1);
                     (s, false)
                 } else {
@@ -1994,6 +2088,37 @@ impl Push {
         self.grant(group, rank);
     }
 
+    /// A source's demand for `rank` (`Want`), and grants it hands back.
+    fn want(
+        self: &Arc<Self>,
+        group: u64,
+        rank: u32,
+        source: Src,
+        seq: u64,
+        want: bool,
+        returned: &[(u32, u64)],
+    ) {
+        let back = {
+            let mut st = self.state.lock();
+            let Some(r) = st.ranks.get_mut(&(group, rank)) else {
+                return;
+            };
+            if r.wants.get(&source).is_none_or(|w| w.0 < seq) {
+                r.wants.insert(source, (seq, want));
+            }
+            let back = r.give_back(source, returned);
+            let b = r.ring.as_ref().map_or(0, |x| x.slot_bytes as u64);
+            st.granted_bytes = st.granted_bytes.saturating_sub(b * back);
+            back
+        };
+        if back > 0 {
+            // Budget freed: other ranks here may get grants too.
+            self.grant_waiting();
+        } else {
+            self.grant(group, rank);
+        }
+    }
+
     fn rank_done(self: &Arc<Self>, group: u64, rank: u32, slots: u64) {
         tracing::trace!(group, rank, slots, "push rank done");
         let report = {
@@ -2101,12 +2226,19 @@ impl Push {
                     .unwrap_or_default()
                     .into();
             }
+            let n = ranks.len();
             st.sources.insert(
                 (group, source.store),
                 SourceState {
                     credits,
                     notify: notify.clone(),
                     cancelled: false,
+                    src: source,
+                    rank_hosts: ranks.iter().map(|(h, _)| *h).collect(),
+                    // As a rank host assumes of a source it has not heard.
+                    wants: vec![true; n],
+                    legacy: vec![false; n],
+                    want_seq: 0,
                 },
             );
         }
@@ -2114,9 +2246,10 @@ impl Push {
         tokio::spawn(async move {
             let src = source;
             // Staging for RDMA writes, sized to the largest ring slot: one
-            // per send in flight, and one per rank being packed.
+            // per send in flight, one per rank being packed, and one per
+            // slot set aside for a credit.
             let slot_max = ranks.iter().map(|(_, b)| *b as usize).max().unwrap_or(0);
-            let staged = in_flight(slot_max) + ranks.len();
+            let staged = in_flight(slot_max) + ranks.len() + PARK;
             let pool = me
                 .vfs()
                 .ok()
@@ -2131,6 +2264,10 @@ impl Push {
                 ranks,
                 notify,
                 open: Vec::new(),
+                parked: Vec::new(),
+                n_parked: 0,
+                ahead: Vec::new(),
+                told: Vec::new(),
                 sent: Vec::new(),
                 sends: tokio::task::JoinSet::new(),
                 pool,
@@ -2166,13 +2303,23 @@ impl Push {
         });
     }
 
-    fn credit(&self, group: u64, store: StoreId, rank: u32, grants: Vec<Grant>) {
+    fn credit(self: &Arc<Self>, group: u64, store: StoreId, rank: u32, grants: Vec<Grant>) {
         let mut st = self.state.lock();
         match st.sources.get_mut(&(group, store)) {
             Some(s) => {
-                if let Some(c) = s.credits.get_mut(rank as usize) {
-                    c.extend(grants);
+                let ri = rank as usize;
+                if ri < s.credits.len() {
+                    s.credits[ri].extend(grants);
                     s.notify.notify_waiters();
+                    // Granted before its host heard this stream has nothing
+                    // for the rank soon: handed back.
+                    if !s.wants[ri] && !s.legacy[ri] && s.credits[ri].len() > KEEP {
+                        let back = s.spare(ri);
+                        s.want_seq += 1;
+                        let (src, to, seq) = (s.src, s.rank_hosts[ri], s.want_seq);
+                        drop(st);
+                        self.send_want(group, src, rank, to, seq, false, back);
+                    }
                 }
             }
             None => st
@@ -2183,31 +2330,75 @@ impl Push {
         }
     }
 
-    /// Wait for a grant for `rank` and take it; None if cancelled or none
-    /// came within `STALL`.
-    async fn take_credit(
-        &self,
-        group: u64,
-        store: StoreId,
-        rank: u32,
-        notify: &tokio::sync::Notify,
-    ) -> Option<Grant> {
-        loop {
-            let n = notify.notified();
-            {
-                let mut st = self.state.lock();
-                let s = st.sources.get_mut(&(group, store))?;
-                if s.cancelled {
-                    return None;
-                }
-                if let Some(g) = s.credits[rank as usize].pop_front() {
-                    return Some(g);
-                }
-            }
-            if tokio::time::timeout(STALL, n).await.is_err() {
-                return None;
-            }
+    /// A grant for `rank` if one is here; Err once the stream is cancelled.
+    fn try_credit(&self, group: u64, store: StoreId, rank: u32) -> Result<Option<Grant>, ()> {
+        let mut st = self.state.lock();
+        let s = st.sources.get_mut(&(group, store)).ok_or(())?;
+        if s.cancelled {
+            return Err(());
         }
+        Ok(s.credits[rank as usize].pop_front())
+    }
+
+    /// Tell `rank`'s host whether stream `src` has data for it soon; going
+    /// quiet, it hands back its grants beyond `KEEP`.
+    fn set_want(self: &Arc<Self>, group: u64, src: Src, rank: u32, want: bool) {
+        let (to, seq, back) = {
+            let mut st = self.state.lock();
+            let Some(s) = st.sources.get_mut(&(group, src.store)) else {
+                return;
+            };
+            let ri = rank as usize;
+            if s.legacy[ri] || s.wants[ri] == want {
+                return;
+            }
+            s.wants[ri] = want;
+            s.want_seq += 1;
+            let back = if want { Vec::new() } else { s.spare(ri) };
+            (s.rank_hosts[ri], s.want_seq, back)
+        };
+        self.send_want(group, src, rank, to, seq, want, back);
+    }
+
+    /// Send a `Want`. A host that refuses it (an older sparknestd) keeps
+    /// granting as before: the grants come back here, and it is not told
+    /// again.
+    #[allow(clippy::too_many_arguments)]
+    fn send_want(
+        self: &Arc<Self>,
+        group: u64,
+        src: Src,
+        rank: u32,
+        to: NodeId,
+        seq: u64,
+        want: bool,
+        back: Vec<Grant>,
+    ) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let returned = back.iter().map(|g| (g.slot, g.seq)).collect();
+            let m = PushMsg::Want {
+                group,
+                rank,
+                source: src,
+                seq,
+                want,
+                returned,
+            };
+            if let Err(e) = me.send(to, m).await {
+                tracing::debug!(group, rank, error = %e, "push demand not taken; that host grants as before");
+                let mut st = me.state.lock();
+                if let Some(s) = st.sources.get_mut(&(group, src.store)) {
+                    let ri = rank as usize;
+                    s.legacy[ri] = true;
+                    s.wants[ri] = true;
+                    for g in back.into_iter().rev() {
+                        s.credits[ri].push_front(g);
+                    }
+                    s.notify.notify_waiters();
+                }
+            }
+        });
     }
 
     // ----------------------------------------------------- engine sockets
@@ -2414,6 +2605,14 @@ struct Stream {
     notify: Arc<tokio::sync::Notify>,
     /// Per rank: the slot being packed.
     open: Vec<Option<slot::Packer<SlotBuf>>>,
+    /// Per rank: full slots waiting for a credit (buffer, payload bytes),
+    /// and how many over all ranks (at most `PARK` once `flush` returns).
+    parked: Vec<VecDeque<(SlotBuf, usize)>>,
+    n_parked: usize,
+    /// Per rank: reads within the next `WANT_AHEAD` that feed it, and
+    /// whether its host was last told this stream wants it (`Want`).
+    ahead: Vec<u32>,
+    told: Vec<bool>,
     /// Slots sent per rank (counted when handed to a send).
     sent: Vec<u64>,
     /// Sends in flight (bounded by `in_flight`).
@@ -2496,6 +2695,10 @@ impl Stream {
     async fn run(&mut self, patterns: &[Pattern], files: Vec<SourceFile>) -> Vec<(u32, String)> {
         let n = self.ranks.len();
         self.open = (0..n).map(|_| None).collect();
+        self.parked = (0..n).map(|_| VecDeque::new()).collect();
+        self.ahead = vec![0; n];
+        // As every rank host assumes of a stream it has not heard from.
+        self.told = vec![true; n];
         self.sent = vec![0; n];
         let mut failed: Vec<(u32, String)> = Vec::new();
         let vfs = match self.push.vfs() {
@@ -2520,6 +2723,18 @@ impl Stream {
             .enumerate()
             .flat_map(|(i, x)| reads_of(x).into_iter().map(move |(a, b)| (i, a, b)))
             .collect();
+        // The ranks each read feeds: rank hosts are told `WANT_AHEAD` of
+        // reads ahead which ranks this stream will need grants for.
+        let feeds: Vec<Vec<u32>> = reads
+            .iter()
+            .map(|&(i, a, b)| {
+                let mut rs: Vec<u32> = index[i].overlapping(a, b).map(|e| e.rank).collect();
+                rs.sort_unstable();
+                rs.dedup();
+                rs
+            })
+            .collect();
+        let (mut window_end, mut window_bytes) = (0usize, 0u64);
         // Each file is opened by its first read, and closed after its last.
         type Opened = Arc<std::sync::OnceLock<Result<crate::vfs::PushObject, String>>>;
         let mut objs: Vec<Opened> = files.iter().map(|_| Opened::default()).collect();
@@ -2527,6 +2742,17 @@ impl Stream {
             VecDeque::new();
         let mut next = 0;
         for (k, &(i, at, end)) in reads.iter().enumerate() {
+            // The demand window: this read and those after it, up to
+            // `WANT_AHEAD` bytes.
+            while window_end < reads.len() && (window_end <= k || window_bytes < WANT_AHEAD) {
+                let (_, a, b) = reads[window_end];
+                window_bytes += b - a;
+                for &r in &feeds[window_end] {
+                    self.ahead[r as usize] += 1;
+                }
+                window_end += 1;
+            }
+            self.tell_wants();
             while next < reads.len() && ahead.len() < READ_AHEAD {
                 let (fi, a, b) = reads[next];
                 let (v, obj, f) = (vfs.clone(), objs[fi].clone(), &files[fi]);
@@ -2567,12 +2793,20 @@ impl Stream {
                     return failed;
                 }
             }
+            window_bytes -= end - at;
+            for &r in &feeds[k] {
+                self.ahead[r as usize] -= 1;
+            }
         }
+        let mut last = Ok(());
         for r in 0..n as u32 {
-            if let Err(e) = self.flush(r).await {
-                failed.push((u32::MAX, e));
+            last = self.flush(r).await;
+            if last.is_err() {
                 break;
             }
+        }
+        if let Err(e) = last.and(self.drain(0).await) {
+            failed.push((u32::MAX, e));
         }
         while let Some(r) = self.sends.join_next().await {
             if let Err(e) = r.map_err(|e| e.to_string()).and_then(|x| x) {
@@ -2636,19 +2870,72 @@ impl Stream {
         Ok(())
     }
 
-    /// Send rank `r`'s open slot once a grant allows: by RDMA into the
-    /// granted ring slot when possible, else by RPC.
+    /// Rank `r`'s open slot is done (full, or the stream ends): set it
+    /// aside, send every set-aside slot a credit allows, and wait for
+    /// credits only once more than `PARK` are set aside. One rank slow to
+    /// grant so holds up this stream's other ranks only when it is far
+    /// behind, not at its first full slot (ADR-085).
     async fn flush(&mut self, r: u32) -> Result<(), String> {
+        if let Some(s) = self.open[r as usize].take() {
+            let (buf, payload, _) = s.finish();
+            self.parked[r as usize].push_back((buf, payload));
+            self.n_parked += 1;
+        }
+        self.drain(PARK).await
+    }
+
+    /// Send set-aside slots as credits come, until at most `keep` remain.
+    async fn drain(&mut self, keep: usize) -> Result<(), String> {
+        let notify = self.notify.clone();
+        loop {
+            // Before looking: a credit arriving meanwhile still wakes it.
+            let woken = notify.notified();
+            for ri in 0..self.parked.len() {
+                while !self.parked[ri].is_empty() {
+                    let Some(grant) = self
+                        .push
+                        .try_credit(self.group, self.me.store, ri as u32)
+                        .map_err(|()| "cancelled".to_string())?
+                    else {
+                        break;
+                    };
+                    let (buf, payload) = self.parked[ri].pop_front().expect("not empty");
+                    self.n_parked -= 1;
+                    self.send(ri as u32, buf, payload, grant).await?;
+                }
+            }
+            self.tell_wants();
+            if self.n_parked <= keep {
+                return Ok(());
+            }
+            if tokio::time::timeout(STALL, woken).await.is_err() {
+                return Err("no credit came".into());
+            }
+        }
+    }
+
+    /// Tell each rank's host whether this stream needs its grants: it does
+    /// while a read in the window feeds the rank or a slot for it waits.
+    fn tell_wants(&mut self) {
+        for r in 0..self.told.len() {
+            let want = self.ahead[r] > 0 || !self.parked[r].is_empty();
+            if want != self.told[r] {
+                self.told[r] = want;
+                self.push.set_want(self.group, self.me, r as u32, want);
+            }
+        }
+    }
+
+    /// Send one slot of rank `r` into the ring slot `grant` names: by RDMA
+    /// when possible, else by RPC.
+    async fn send(
+        &mut self,
+        r: u32,
+        buf: SlotBuf,
+        payload: usize,
+        grant: Grant,
+    ) -> Result<(), String> {
         let ri = r as usize;
-        let Some(s) = self.open[ri].take() else {
-            return Ok(());
-        };
-        let (buf, payload, _) = s.finish();
-        let grant = self
-            .push
-            .take_credit(self.group, self.me.store, r, &self.notify)
-            .await
-            .ok_or("cancelled, or no credit came")?;
         let limit = in_flight(
             self.ranks
                 .iter()
@@ -2851,6 +3138,7 @@ mod tests {
             rdma: None,
             token_id: 0,
             sources: Vec::new(),
+            wants: HashMap::new(),
             landed_from: HashMap::new(),
             owed: HashMap::new(),
             next: 0,
@@ -2891,6 +3179,39 @@ mod tests {
         r.granted.remove(&1);
         r.landed_from.insert(a, 3);
         assert_eq!(r.reclaimable(), vec![2]);
+    }
+
+    /// The budget's grants go only to sources with data for the rank soon
+    /// (or never heard from); one that went quiet hands its grants back.
+    #[test]
+    fn only_sources_wanting_a_rank_get_its_budget() {
+        let (a, b, c) = (
+            Src::host(NodeId(2)),
+            Src::host(NodeId(3)),
+            Src::host(NodeId(4)),
+        );
+        let mut r = rank_slot();
+        r.sources = vec![a, b, c];
+        r.wants.insert(a, (1, true));
+        r.wants.insert(b, (1, false));
+        assert_eq!(
+            r.wanting(),
+            vec![a, c],
+            "c never said: it still gets grants"
+        );
+        // b had grants 0 (budget) and 1 (floor), and a grant 2.
+        r.granted.insert(0, (b, 10));
+        r.granted.insert(1, (b, 11));
+        r.floor.insert(1);
+        r.granted.insert(2, (a, 12));
+        // b hands back 0 and 1, and names a stale grant and a's: ignored.
+        let budgeted = r.give_back(b, &[(0, 10), (1, 11), (2, 12), (5, 3)]);
+        assert_eq!(budgeted, 1, "only slot 0 took budget");
+        let mut free = r.free.clone();
+        free.sort();
+        assert_eq!(free, vec![0, 1]);
+        assert!(r.floor.is_empty());
+        assert_eq!(r.granted.get(&2), Some(&(a, 12)));
     }
 
     /// Bytes each rank has received when the slowest source finishes its
