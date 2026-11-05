@@ -282,6 +282,8 @@ struct HubGroup {
     owing: Vec<Vec<Src>>,
     /// Hosts whose pre-fanout decoder rejected GroupProgress for this load.
     no_progress: std::collections::HashSet<NodeId>,
+    /// Hosts sent GroupProgress at least once (logged on the first).
+    told_progress: std::collections::HashSet<NodeId>,
 }
 
 impl HubGroup {
@@ -369,12 +371,17 @@ struct RankSlot {
 }
 
 impl RankSlot {
-    fn progress(&mut self, hub: NodeId, done: u64, total: u64) {
+    /// Forward the group's progress to the engine; whether it was taken
+    /// (from this rank's hub, newer, before Done).
+    fn progress(&mut self, hub: NodeId, done: u64, total: u64) -> bool {
         if self.hub == hub && !self.done_sent && done > self.group_progress {
             self.group_progress = done;
             if let Some(engine) = &self.engine {
                 let _ = engine.send(Event::Progress { done, total });
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -1019,6 +1026,7 @@ impl Push {
                 rings: HashMap::new(),
                 owing: Vec::new(),
                 no_progress: Default::default(),
+                told_progress: Default::default(),
             },
         );
         let (me, expect) = {
@@ -1487,6 +1495,14 @@ impl Push {
                 .copied()
                 .filter(|h| !g.no_progress.contains(h))
                 .collect::<std::collections::BTreeSet<_>>();
+            let first: Vec<NodeId> = hosts
+                .iter()
+                .copied()
+                .filter(|h| g.told_progress.insert(*h))
+                .collect();
+            if !first.is_empty() {
+                tracing::info!(group, done, total, hosts = ?first, "push group progress fanning out");
+            }
             // Never hold state across RPC, nor make a rank's delivery wait for
             // a different host. Out-of-order advances are filtered at receipt.
             // An old host's decoder refuses the variant with exactly this
@@ -1501,6 +1517,7 @@ impl Push {
                         && error == "remote error: encoding error: Serde Deserialization Error"
                         && let Some(g) = me.state.lock().hub.get_mut(&group)
                     {
+                        tracing::info!(group, %host, "push group progress refused by an older host; not sent there again");
                         g.no_progress.insert(host);
                     }
                 });
@@ -1516,9 +1533,25 @@ impl Push {
 
     fn group_progress(&self, hub: NodeId, group: u64, done: u64, total: u64) {
         let mut st = self.state.lock();
-        for (&(id, _), rank) in &mut st.ranks {
-            if id == group {
-                rank.progress(hub, done, total);
+        for (&(id, r), rank) in &mut st.ranks {
+            if id != group {
+                continue;
+            }
+            let first = rank.group_progress == 0;
+            if rank.progress(hub, done, total) {
+                // Once per rank: shows the fan-out reached it (ADR-087).
+                if first {
+                    tracing::info!(
+                        group,
+                        rank = r,
+                        done,
+                        total,
+                        engine = rank.engine.is_some(),
+                        "push group progress reaching this rank"
+                    );
+                }
+            } else if rank.hub != hub {
+                tracing::warn!(group, rank = r, from = %hub, hub = %rank.hub, "push group progress from a host that is not this rank's hub; dropped");
             }
         }
     }

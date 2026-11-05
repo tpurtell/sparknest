@@ -2174,6 +2174,155 @@ async fn group_progress_keeps_an_early_rank_alive_past_its_idle_deadline() {
     assert!(elapsed > Duration::from_secs(30), "{elapsed:?}");
 }
 
+/// The Step-5 shape: one source (n4) feeds early ranks on two other hosts
+/// (n2, n3) first, then the hub's own two ranks (n1) for longer than the
+/// early ranks' idle deadline. Each early rank must hear the group's
+/// progress, from its hub, while it waits for its Done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn waiting_remote_ranks_hear_progress_while_the_hubs_ranks_are_fed() {
+    let c = ready(4).await;
+    let slot_bytes = 64u32 << 10;
+    let payload = slot_bytes as usize - slot::FOOTER - slot::FRAG;
+    let early = 2 * payload + 1;
+    let late = 40 * payload;
+    // Plan order: both early shares, then both late ones.
+    let ranks = [
+        (0, "n2", early),
+        (1, "n3", early),
+        (2, "n1", late),
+        (3, "n1", late),
+    ];
+    let size: usize = ranks.iter().map(|r| r.2).sum();
+    sealed(&c, 4, "hub-late.bin", vec![5; size]).await;
+    let hub = c.push_socket(1);
+    let sockets: Vec<_> = [2, 3, 1, 1].iter().map(|n| c.push_socket(*n)).collect();
+    let deadline = Duration::from_secs(8);
+    let elapsed = tokio::task::spawn_blocking(move || {
+        let g = Coordinator::create(
+            &hub,
+            ranks
+                .iter()
+                .map(|&(rank, host, arena)| RankSpec {
+                    rank,
+                    host: host.into(),
+                    arena_bytes: arena as u64,
+                })
+                .collect(),
+            vec!["/hub-late.bin".into()],
+            Some(Duration::from_secs(30)),
+        )
+        .unwrap();
+        g.patterns(
+            ranks
+                .iter()
+                .map(|r| Pattern {
+                    run: r.2 as u32,
+                    dims: vec![],
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut at = 0u64;
+        g.entries(
+            ranks
+                .iter()
+                .map(|&(rank, _, arena)| {
+                    let e = Entry {
+                        file: 0,
+                        pattern: rank,
+                        src_base: at,
+                        dst_base: 0,
+                        rank,
+                    };
+                    at += arena as u64;
+                    e
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut handles = Vec::new();
+        for &(rank, _, arena) in &ranks {
+            let ring = memfd(slot_bytes as usize);
+            let k = Rank::join(
+                &sockets[rank as usize],
+                JoinArgs {
+                    group: g.group,
+                    token: g.token,
+                    rank,
+                    ring_fd: ring.as_raw_fd(),
+                    slots: 1,
+                    slot_bytes,
+                },
+                Some(if rank < 2 {
+                    deadline
+                } else {
+                    Duration::from_secs(30)
+                }),
+            )
+            .unwrap();
+            handles.push(std::thread::spawn(
+                move || -> Result<(usize, u32), String> {
+                    let file = std::fs::File::from(ring);
+                    let mut out = vec![0u8; arena];
+                    let mut progress = 0u32;
+                    loop {
+                        match k.next().map_err(|e| format!("rank {rank}: {e}"))? {
+                            Some(Event::Filled { slot: i, .. }) => {
+                                let mut buf = vec![0u8; slot_bytes as usize];
+                                use std::os::unix::fs::FileExt;
+                                file.read_exact_at(&mut buf, i as u64 * slot_bytes as u64)
+                                    .unwrap();
+                                let p =
+                                    slot::parse(&buf, arena as u64).map_err(|e| e.to_string())?;
+                                let mut at = 0usize;
+                                for (dst, n) in slot::Fragments::new(&buf, p) {
+                                    out[dst as usize..dst as usize + n as usize]
+                                        .copy_from_slice(&buf[at..at + n as usize]);
+                                    at += n as usize;
+                                }
+                                // The hub's ranks are slow consumers: they pace
+                                // the source past the early ranks' deadline.
+                                if rank >= 2 {
+                                    std::thread::sleep(Duration::from_millis(400));
+                                }
+                                k.release(i).map_err(|e| e.to_string())?;
+                            }
+                            Some(Event::Progress { .. }) => progress += 1,
+                            Some(Event::Done) => {
+                                assert!(out.iter().all(|b| *b == 5), "rank {rank}'s arena");
+                                return Ok((out.len(), progress));
+                            }
+                            other => return Err(format!("rank {rank}: {other:?}")),
+                        }
+                    }
+                },
+            ));
+        }
+        let start = std::time::Instant::now();
+        g.start().unwrap();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for (r, res) in results.iter().enumerate() {
+            let (len, progress) = res.as_ref().unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(*len, ranks[r].2);
+            if r < 2 {
+                assert!(*progress > 0, "early rank {r} heard no group progress");
+            }
+        }
+        loop {
+            match g.next().unwrap() {
+                Some(Event::Progress { .. }) => {}
+                Some(Event::Done) => break,
+                other => panic!("group: {other:?}"),
+            }
+        }
+        start.elapsed()
+    })
+    .await
+    .unwrap();
+    // The early ranks waited longer than their idle deadline.
+    assert!(elapsed > 2 * deadline, "{elapsed:?}");
+}
+
 // Wire types copied verbatim from v0.8.2:crates/nest-data/src/push.rs.
 // Keep this decoder frozen: it must really lack GroupProgress.
 #[allow(dead_code)]
