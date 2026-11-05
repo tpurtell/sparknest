@@ -3,6 +3,17 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-05 — Push group liveness follows actual delivery (ADR-087)
+
+A single-source Step-5 load exposed a rank-local idle timeout while other
+ranks still received bytes. The hub now fans actual aggregate progress to
+live rank sockets; the existing sweep reports actual sub-256-MiB advances.
+An older rank host's decoder rejection disables fanout for that host only,
+without cancelling its load. Tests cover an early-fed rank waiting over
+30 seconds, the real v0.8.2 decoder completing a load, monotonic/hub-checked
+rank events, and a truly stalled consumer still timing out. No version bump,
+deployment, or daemon restart is part of this change.
+
 ## 2026-11-04 — ECN on SparkNest's class, 8 MiB incast (ADR-086)
 
 0.8.1 rolled to all ten hosts (raptor last, under cuteafd's locks). Muse

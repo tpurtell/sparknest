@@ -502,8 +502,9 @@ impl Rpc {
         &self.inner.filter
     }
 
-    pub fn register(&self, service: u8, handler: Arc<dyn Handler>) {
-        self.inner.handlers.write().insert(service, handler);
+    /// Install a service handler, returning the previous one if replaced.
+    pub fn register(&self, service: u8, handler: Arc<dyn Handler>) -> Option<Arc<dyn Handler>> {
+        self.inner.handlers.write().insert(service, handler)
     }
 
     /// Learn a peer's address (from membership). Ignored for a peer whose
@@ -826,10 +827,19 @@ mod tests {
         {
             assert_eq!(r.unwrap(), Bytes::from(format!("2<-1:{i}")));
         }
+        let connection = a.primary_now(NodeId(2)).unwrap();
         assert_eq!(
             a.call(NodeId(2), 7, Bytes::from_static(b"fail"), t).await,
             Err(RpcError::Remote("nope".into()))
         );
+        assert!(Arc::ptr_eq(&connection, &a.primary_now(NodeId(2)).unwrap()));
+        assert_eq!(
+            a.call(NodeId(2), 7, Bytes::from_static(b"still here"), t)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"2<-1:still here")
+        );
+        assert!(Arc::ptr_eq(&connection, &a.primary_now(NodeId(2)).unwrap()));
         assert_eq!(
             a.call(NodeId(2), 9, Bytes::new(), t).await,
             Err(RpcError::NoService(9))

@@ -3005,3 +3005,30 @@ inference may prefer it.
 **Alternatives.** A lower explicit PFC pause threshold: fewer drops but
 more pausing, and each pause stops every sender on the class. WRED: drops
 by design. More incast (16 MiB): no faster, and more drops.
+
+
+## ADR-087 — Actual group progress keeps every waiting push rank live (2026-11-05)
+
+**Context.** A required Step-5 push from one archive source delivered each
+Spark's BF16 portion, then spent over 30 seconds feeding RTX ranks. The
+Spark rings had free credits and the RTX ranks were receiving, but waiting
+Spark engines heard no socket events and timed out. Aggregate delivery
+progress reached only the coordinator. The existing 256 MiB reporting
+threshold can itself exceed the idle deadline on small or slow streams.
+
+**Decision.** Rank hosts also report newly delivered bytes at the existing
+five-second sweep, only if their cumulative count advanced. The hub fans
+actual aggregate advances to each distinct rank host using an appended
+`GroupProgress` message. A rank forwards only increasing counts from its
+recorded hub, while still live. Duplicate or regressive delivery reports do
+not renew the hub's stall clock. No heartbeat, idle-timeout increase, source
+reordering, or checkpoint replication is needed. A truly stalled group
+still fails after 30 seconds without actual progress.
+
+**Compatibility.** There is no create-time capability probe. The first real
+advance attempts fanout; an old decoder's normal unknown-variant RPC error
+excludes that host from further fanout for the group. Other load messages
+continue over the existing connection. Old rank hosts retain their previous
+rank-local timeout behavior until upgraded; mixed-version loads are not
+cancelled merely because a host lacks the new message. The regression uses
+the unmodified v0.8.2 enum decoder and completes the real load through it.

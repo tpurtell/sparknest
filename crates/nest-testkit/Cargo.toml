@@ -26,6 +26,8 @@ tracing-subscriber.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
 nest-api.workspace = true
 nest-push.workspace = true
 nix = { workspace = true, features = ["fs", "user"] }

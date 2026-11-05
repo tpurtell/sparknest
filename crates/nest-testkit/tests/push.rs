@@ -57,6 +57,18 @@ fn memfd(len: usize) -> OwnedFd {
     fd
 }
 
+fn first_filled(rank: &Rank) {
+    loop {
+        match rank.next().unwrap() {
+            Some(Event::Progress { .. }) => {}
+            event => {
+                assert!(matches!(event, Some(Event::Filled { .. })), "{event:?}");
+                return;
+            }
+        }
+    }
+}
+
 /// What an engine rank does: copy each filled slot's fragments into its
 /// arena, release the slot, until Done. Returns the arena.
 fn run_rank(
@@ -85,6 +97,7 @@ fn run_rank(
                 }
                 r.release(i).map_err(|e| e.to_string())?;
             }
+            Some(Event::Progress { .. }) => {}
             Some(Event::Done) => return Ok(out),
             Some(Event::Failed { reason, .. }) => return Err(reason),
             Some(other) => return Err(format!("unexpected {other:?}")),
@@ -473,7 +486,7 @@ async fn a_rank_that_leaves_fails_the_group() {
                 std::thread::sleep(Duration::from_millis(20));
             };
             // Take one slot and leave without releasing it.
-            assert!(matches!(rank.next().unwrap(), Some(Event::Filled { .. })));
+            first_filled(&rank);
             drop(rank);
         });
         g.start().unwrap();
@@ -568,12 +581,12 @@ async fn a_rank_that_leaves_ends_the_group_on_every_host() {
         let (stay, _ring1) = j1.join().unwrap();
         // Rank 0 (on the hub's host) takes one slot and leaves; rank 1 (on
         // n2) never releases, and the coordinator stays.
-        assert!(matches!(leave.next().unwrap(), Some(Event::Filled { .. })));
+        first_filled(&leave);
         drop(leave);
         let t = std::time::Instant::now();
         let ev = loop {
             match stay.next() {
-                Ok(Some(Event::Filled { .. })) => continue,
+                Ok(Some(Event::Filled { .. } | Event::Progress { .. })) => continue,
                 Ok(other) => break Ok(other),
                 Err(e) => break Err(e.to_string()),
             }
@@ -628,7 +641,7 @@ async fn a_coordinator_that_leaves_cancels_the_ranks() {
         // Never release: the load cannot finish; the rank hears it failed.
         loop {
             match rank.next().unwrap() {
-                Some(Event::Filled { .. }) => continue,
+                Some(Event::Filled { .. } | Event::Progress { .. }) => continue,
                 other => return other,
             }
         }
@@ -2010,6 +2023,7 @@ async fn a_slow_rank_does_not_pace_the_others() {
                                 seen.store(released.load(Ordering::SeqCst), Ordering::SeqCst);
                             }
                         }
+                        Some(Event::Progress { .. }) => {}
                         Some(Event::Done) => return Ok(out),
                         Some(Event::Failed { reason, .. }) => return Err(reason),
                         Some(other) => return Err(format!("unexpected {other:?}")),
@@ -2044,4 +2058,464 @@ async fn a_slow_rank_does_not_pace_the_others() {
         slow_at + 20 < total,
         "rank 1's last slot came when the slow rank had released {slow_at} of {total}"
     );
+}
+
+/// One source sends rank 0's full slots first, then spends over the engine's
+/// 30-second idle deadline feeding rank 1. Rank 0 still waits for the source's
+/// last partial slot and Done, but group progress must keep its socket live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn group_progress_keeps_an_early_rank_alive_past_its_idle_deadline() {
+    let c = ready(3).await;
+    let slot_bytes = 64u32 << 10;
+    let payload = slot_bytes as usize - slot::FOOTER - slot::FRAG;
+    let early = 2 * payload + 1;
+    let late = 100 * payload;
+    sealed(&c, 2, "early-late.bin", vec![9; early + late]).await;
+    let (hub, sockets) = (c.push_socket(1), [c.push_socket(3), c.push_socket(1)]);
+    let elapsed = tokio::task::spawn_blocking(move || {
+        let timeout = Some(Duration::from_secs(30));
+        let g = Coordinator::create(
+            &hub,
+            vec![
+                RankSpec {
+                    rank: 0,
+                    host: "n3".into(),
+                    arena_bytes: early as u64,
+                },
+                RankSpec {
+                    rank: 1,
+                    host: "n1".into(),
+                    arena_bytes: late as u64,
+                },
+            ],
+            vec!["/early-late.bin".into()],
+            timeout,
+        )
+        .unwrap();
+        g.patterns(vec![
+            Pattern {
+                run: early as u32,
+                dims: vec![],
+            },
+            Pattern {
+                run: late as u32,
+                dims: vec![],
+            },
+        ])
+        .unwrap();
+        g.entries(vec![
+            Entry {
+                file: 0,
+                pattern: 0,
+                src_base: 0,
+                dst_base: 0,
+                rank: 0,
+            },
+            Entry {
+                file: 0,
+                pattern: 1,
+                src_base: early as u64,
+                dst_base: 0,
+                rank: 1,
+            },
+        ])
+        .unwrap();
+        let mut handles = Vec::new();
+        for (rank, arena) in [(0, early), (1, late)] {
+            let ring = memfd(slot_bytes as usize);
+            let k = Rank::join(
+                &sockets[rank as usize],
+                JoinArgs {
+                    group: g.group,
+                    token: g.token,
+                    rank,
+                    ring_fd: ring.as_raw_fd(),
+                    slots: 1,
+                    slot_bytes,
+                },
+                timeout,
+            )
+            .unwrap();
+            handles.push(std::thread::spawn(move || {
+                if rank == 0 {
+                    return run_rank(k, ring, 1, slot_bytes, arena);
+                }
+                // One slow consumer paces the source without a large test file.
+                loop {
+                    match k.next().map_err(|e| e.to_string())? {
+                        Some(Event::Filled { slot, .. }) => {
+                            std::thread::sleep(Duration::from_millis(400));
+                            k.release(slot).map_err(|e| e.to_string())?;
+                        }
+                        Some(Event::Progress { .. }) => {}
+                        Some(Event::Done) => return Ok(Vec::new()),
+                        other => return Err(format!("slow rank: {other:?}")),
+                    }
+                }
+            }));
+        }
+        let start = std::time::Instant::now();
+        g.start().unwrap();
+        let early_result = handles.remove(0).join().unwrap();
+        let late_result = handles.remove(0).join().unwrap();
+        assert_eq!(early_result.unwrap(), vec![9; early]);
+        late_result.unwrap();
+        loop {
+            match g.next().unwrap() {
+                Some(Event::Progress { .. }) => {}
+                Some(Event::Done) => break,
+                other => panic!("group: {other:?}"),
+            }
+        }
+        start.elapsed()
+    })
+    .await
+    .unwrap();
+    assert!(elapsed > Duration::from_secs(30), "{elapsed:?}");
+}
+
+// Wire types copied verbatim from v0.8.2:crates/nest-data/src/push.rs.
+// Keep this decoder frozen: it must really lack GroupProgress.
+#[allow(dead_code)]
+mod v082 {
+    use super::*;
+    use nest_data::push::RingState;
+    use nest_types::{Generation, StoreId};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub(crate) enum PushMsg {
+        /// Hub → rank host: rank `rank` of `group` will join here.
+        Expect {
+            group: u64,
+            token: u64,
+            hub: NodeId,
+            rank: u32,
+            arena: u64,
+        },
+        /// Rank host → hub: the rank joined; its ring's slots are this big.
+        Joined {
+            group: u64,
+            rank: u32,
+            slot_bytes: u32,
+        },
+        /// Hub → rank host: the sources that will send this rank slots.
+        Sources {
+            group: u64,
+            rank: u32,
+            sources: Vec<Src>,
+        },
+        /// Hub → source host: stream these files from store `source.store`.
+        Stream {
+            group: u64,
+            hub: NodeId,
+            source: Src,
+            patterns: Vec<Pattern>,
+            files: Vec<SourceFile>,
+            /// Per rank: its host and slot size.
+            ranks: Vec<(NodeId, u32)>,
+        },
+        /// Rank host → source host: these ring slots of `rank` may be filled
+        /// by the stream reading `store`, each by RDMA into its target when it
+        /// has one, else by `Slot`.
+        Credit {
+            group: u64,
+            store: StoreId,
+            rank: u32,
+            grants: Vec<Grant>,
+        },
+        /// Source → rank host: a packed slot (`slot_bytes` long) for ring slot
+        /// `slot` of `rank`.
+        Slot {
+            group: u64,
+            rank: u32,
+            source: Src,
+            slot: u32,
+            /// The grant this fills (`Grant::seq`).
+            seq: u64,
+            #[serde(with = "serde_bytes")]
+            bytes: Vec<u8>,
+        },
+        /// Source → hub: finished. `slots` sent per rank; files it could not
+        /// read, by plan index.
+        SourceDone {
+            group: u64,
+            source: Src,
+            slots: Vec<u64>,
+            failed: Vec<(u32, String)>,
+        },
+        /// Rank host → hub: payload bytes delivered so far (progress), and
+        /// whether that rank has everything.
+        Delivered {
+            group: u64,
+            rank: u32,
+            bytes: u64,
+            complete: bool,
+        },
+        /// Source → hub, every `push_record::TICK` and once at the end: payload
+        /// bytes sent to each rank so far, and slots by RDMA and by RPC (for the
+        /// load's record).
+        Sent {
+            group: u64,
+            source: Src,
+            bytes: Vec<u64>,
+            rdma: u64,
+            /// By a fallback: a TCP lane or the control connection.
+            rpc: u64,
+            /// To a rank on this host: no network.
+            local: u64,
+        },
+        /// Hub → rank host: everything for `rank` is `slots` slots in all.
+        RankDone { group: u64, rank: u32, slots: u64 },
+        /// Any → any: the group ended (cancelled or failed).
+        End { group: u64, reason: String },
+        /// Rank host → hub, every few seconds while a rank is live: its ring
+        /// (free slots, granted ones, slots filled and released) and when the
+        /// engine last released a slot, so a stall names its cause.
+        RankState {
+            group: u64,
+            rank: u32,
+            ring: RingState,
+        },
+        /// Hub → rank host: `source` finished, having sent `rank` `slots` slots
+        /// in all. Its grants come back once that many have landed: its last
+        /// RDMA writes may land after this arrives.
+        Owed {
+            group: u64,
+            rank: u32,
+            source: Src,
+            slots: u64,
+        },
+        /// Source → rank host: whether `source` has data for `rank` within its
+        /// next `WANT_AHEAD` of reads (only sources that do get the budget's
+        /// grants; one never heard from does), with grants it hands back
+        /// unused, as (slot, seq). `seq` orders one source's messages.
+        Want {
+            group: u64,
+            rank: u32,
+            source: Src,
+            seq: u64,
+            want: bool,
+            returned: Vec<(u32, u64)>,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+    pub(crate) struct Src {
+        pub store: StoreId,
+        pub host: NodeId,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub(crate) struct Grant {
+        slot: u32,
+        /// Which grant of the rank this is: a ring slot is granted again once
+        /// filled, so a late duplicate of an earlier fill is told apart.
+        seq: u64,
+        /// Where to RDMA-write it (the ring is registered with the rank
+        /// host's fabric).
+        target: Option<nest_fabric::push::PushTarget>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub(crate) struct SourceFile {
+        pub index: u32,
+        pub file: FileId,
+        pub generation: Generation,
+        pub entries: Vec<Entry>,
+    }
+}
+
+/// Old hosts reject the appended variant as a normal RPC handler error.
+/// Their real old decoder still accepts every message needed by the load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_old_rank_decoder_rejects_progress_without_losing_the_load() {
+    use futures::FutureExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let c = ready(3).await;
+    let slot_bytes = 64u32 << 10;
+    let payload = slot_bytes as usize - slot::FOOTER - slot::FRAG;
+    let len = 32 * payload;
+    sealed(&c, 2, "old-rank.bin", vec![17; len]).await;
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let after_rejection = Arc::new(AtomicUsize::new(0));
+    let rpc = c.node(3).rpc.clone();
+    let old = rpc
+        .register(
+            nest_rpc::service::PUSH,
+            Arc::new(|_, _| async { Err("unreachable placeholder".into()) }.boxed()),
+        )
+        .unwrap();
+    let (rejects, accepted, rank_rpc) = (rejected.clone(), after_rejection.clone(), rpc.clone());
+    rpc.register(
+        nest_rpc::service::PUSH,
+        Arc::new(move |peer, body: bytes::Bytes| {
+            let (old, rejects, accepted, rpc) = (
+                old.clone(),
+                rejects.clone(),
+                accepted.clone(),
+                rank_rpc.clone(),
+            );
+            async move {
+                match nest_rpc::decode::<v082::PushMsg>(&body) {
+                    Ok(_) => {
+                        if rejects.load(Ordering::SeqCst) != 0 {
+                            assert!(
+                                rpc.connected(NodeId(1)),
+                                "hub connection closed after rejection"
+                            );
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        old.call(peer, body).await
+                    }
+                    Err(error) => {
+                        assert!(
+                            rpc.connected(peer),
+                            "decoding failure closed the connection"
+                        );
+                        rejects.fetch_add(1, Ordering::SeqCst);
+                        Err(error.to_string())
+                    }
+                }
+            }
+            .boxed()
+        }),
+    );
+    let (hub, sock) = (c.push_socket(1), c.push_socket(3));
+    let group = tokio::task::spawn_blocking(move || {
+        let t = Some(Duration::from_secs(30));
+        let g = Coordinator::create(
+            &hub,
+            vec![RankSpec {
+                rank: 0,
+                host: "n3".into(),
+                arena_bytes: len as u64,
+            }],
+            vec!["/old-rank.bin".into()],
+            t,
+        )
+        .unwrap();
+        g.patterns(vec![Pattern {
+            run: len as u32,
+            dims: vec![],
+        }])
+        .unwrap();
+        g.entries(vec![Entry {
+            file: 0,
+            pattern: 0,
+            src_base: 0,
+            dst_base: 0,
+            rank: 0,
+        }])
+        .unwrap();
+        let ring = memfd(slot_bytes as usize);
+        let k = Rank::join(
+            &sock,
+            JoinArgs {
+                group: g.group,
+                token: g.token,
+                rank: 0,
+                ring_fd: ring.as_raw_fd(),
+                slots: 1,
+                slot_bytes,
+            },
+            t,
+        )
+        .unwrap();
+        let rank = std::thread::spawn(move || {
+            loop {
+                match k.next().unwrap() {
+                    Some(Event::Filled { slot, .. }) => {
+                        std::thread::sleep(Duration::from_millis(400));
+                        k.release(slot).unwrap();
+                    }
+                    Some(Event::Done) => return,
+                    event => panic!("old rank: {event:?}"),
+                }
+            }
+        });
+        g.start().unwrap();
+        loop {
+            match g.next().unwrap() {
+                Some(Event::Progress { .. }) => {}
+                Some(Event::Done) => break,
+                event => panic!("old group: {event:?}"),
+            }
+        }
+        rank.join().unwrap();
+        g.group
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rejected.load(Ordering::SeqCst),
+        1,
+        "old host must be excluded after its first rejection"
+    );
+    assert!(
+        after_rejection.load(Ordering::SeqCst) > 0,
+        "no normal RPC after the rejected variant"
+    );
+    assert!(c.node(1).rpc.connected(NodeId(3)));
+    assert!(
+        c.node(1)
+            .push
+            .history(Some(group))
+            .iter()
+            .any(|r| r.outcome == nest_data::push_record::Outcome::Done)
+    );
+}
+
+/// Periodic ring-state reports are not progress, nor are duplicate byte
+/// reports: a consumer holding its only slot must still fail after 30 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_genuinely_stalled_group_still_times_out() {
+    let c = ready(2).await;
+    let len = 8usize << 20;
+    sealed(&c, 2, "stalled.bin", vec![6; len]).await;
+    let (hub, sock) = (c.push_socket(1), c.push_socket(1));
+    let elapsed = tokio::task::spawn_blocking(move || {
+        let (g, group, token) = one_rank_group(&hub, len as u64, "/stalled.bin");
+        let slot_bytes = 64u32 << 10;
+        let ring = memfd(slot_bytes as usize);
+        let k = Rank::join(
+            &sock,
+            JoinArgs {
+                group,
+                token,
+                rank: 0,
+                ring_fd: ring.as_raw_fd(),
+                slots: 1,
+                slot_bytes,
+            },
+            Some(Duration::from_secs(45)),
+        )
+        .unwrap();
+        g.start().unwrap();
+        first_filled(&k);
+        let start = std::time::Instant::now();
+        loop {
+            match k.next().unwrap() {
+                Some(Event::Progress { .. }) => {}
+                Some(Event::Failed { reason, .. }) => {
+                    assert!(
+                        reason.contains("30") || reason.contains("no credit"),
+                        "{reason}"
+                    );
+                    break;
+                }
+                event => panic!("stalled rank: {event:?}"),
+            }
+        }
+        let elapsed = start.elapsed();
+        drop(g);
+        elapsed
+    })
+    .await
+    .unwrap();
+    assert!(elapsed >= Duration::from_secs(29), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(42), "{elapsed:?}");
 }

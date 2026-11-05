@@ -181,6 +181,9 @@ pub(crate) enum PushMsg {
         want: bool,
         returned: Vec<(u32, u64)>,
     },
+    /// Hub -> rank host: actual aggregate delivery advanced. Old hosts reject
+    /// this appended variant without closing the RPC connection.
+    GroupProgress { group: u64, done: u64, total: u64 },
 }
 
 /// A rank's ring as its host sees it.
@@ -277,6 +280,8 @@ struct HubGroup {
     rings: HashMap<u32, RingState>,
     /// The sources still owing each rank slots.
     owing: Vec<Vec<Src>>,
+    /// Hosts whose pre-fanout decoder rejected GroupProgress for this load.
+    no_progress: std::collections::HashSet<NodeId>,
 }
 
 impl HubGroup {
@@ -355,6 +360,8 @@ struct RankSlot {
     owed: HashMap<Src, u64>,
     next: usize,
     done_sent: bool,
+    /// Highest aggregate byte count forwarded to this rank's engine.
+    group_progress: u64,
     /// When the rank joined, its releases and when the last came.
     joined_at: Option<tokio::time::Instant>,
     released: u64,
@@ -362,6 +369,15 @@ struct RankSlot {
 }
 
 impl RankSlot {
+    fn progress(&mut self, hub: NodeId, done: u64, total: u64) {
+        if self.hub == hub && !self.done_sent && done > self.group_progress {
+            self.group_progress = done;
+            if let Some(engine) = &self.engine {
+                let _ = engine.send(Event::Progress { done, total });
+            }
+        }
+    }
+
     /// Granted ring slots that may come back: those held by a finished
     /// source whose every slot for this rank has landed. Until then a
     /// slot stays granted, so it is neither re-granted nor taken for
@@ -923,6 +939,10 @@ impl Push {
                     me.want(group, rank, source, seq, want, &returned);
                     Ok(())
                 }
+                PushMsg::GroupProgress { group, done, total } => {
+                    me.group_progress(_from, group, done, total);
+                    Ok(())
+                }
                 PushMsg::End { group, reason } => {
                     // To the hub, a rank's end fails the group: every host
                     // in it hears, so sources stop and other ranks are told.
@@ -998,6 +1018,7 @@ impl Push {
                 last_sent: HashMap::new(),
                 rings: HashMap::new(),
                 owing: Vec::new(),
+                no_progress: Default::default(),
             },
         );
         let (me, expect) = {
@@ -1430,14 +1451,18 @@ impl Push {
 
     /// A rank host's report: progress to the coordinator, and `Done` once
     /// every rank has everything.
-    fn delivered(&self, group: u64, rank: u32, bytes: u64, complete: bool) {
+    fn delivered(self: &Arc<Self>, group: u64, rank: u32, bytes: u64, complete: bool) {
         let mut st = self.state.lock();
         let Some(g) = st.hub.get_mut(&group) else {
             return;
         };
-        if let Some(d) = g.delivered.get_mut(rank as usize) {
+        let advanced = if let Some(d) = g.delivered.get_mut(rank as usize) {
+            let advanced = bytes > *d;
             *d = (*d).max(bytes);
-        }
+            advanced
+        } else {
+            false
+        };
         let mut done_at = None;
         if complete && let Some(c) = g.complete.get_mut(rank as usize) {
             *c = true;
@@ -1452,16 +1477,46 @@ impl Push {
         let Some(g) = st.hub.get_mut(&group) else {
             return;
         };
-        g.progress_at = tokio::time::Instant::now();
-        let _ = g.engine.send(Event::Progress {
-            done: g.delivered.iter().sum(),
-            total: g.total,
-        });
+        if advanced {
+            g.progress_at = tokio::time::Instant::now();
+            let (done, total) = (g.delivered.iter().sum(), g.total);
+            let _ = g.engine.send(Event::Progress { done, total });
+            let hosts = g
+                .rank_hosts
+                .iter()
+                .copied()
+                .filter(|h| !g.no_progress.contains(h))
+                .collect::<std::collections::BTreeSet<_>>();
+            // Never hold state across RPC, nor make a rank's delivery wait for
+            // a different host. Out-of-order advances are filtered at receipt.
+            for host in hosts {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    if let Err(NestError::Unavailable(error)) = me
+                        .send(host, PushMsg::GroupProgress { group, done, total })
+                        .await
+                        && error == "remote error: encoding error: Serde Deserialization Error"
+                        && let Some(g) = me.state.lock().hub.get_mut(&group)
+                    {
+                        g.no_progress.insert(host);
+                    }
+                });
+            }
+        }
         if g.complete.iter().all(|c| *c) {
             let _ = g.engine.send(Event::Done);
             drop(st);
             self.record_end(group, crate::push_record::Outcome::Done, None);
             self.state.lock().hub.remove(&group);
+        }
+    }
+
+    fn group_progress(&self, hub: NodeId, group: u64, done: u64, total: u64) {
+        let mut st = self.state.lock();
+        for (&(id, _), rank) in &mut st.ranks {
+            if id == group {
+                rank.progress(hub, done, total);
+            }
         }
     }
 
@@ -1641,6 +1696,25 @@ impl Push {
             let me = self.clone();
             tokio::spawn(async move { me.fail(g, why, Vec::new()).await });
         }
+        // Small/slow streams can take longer than the engine idle deadline
+        // to reach REPORT_EVERY. Report actual new bytes at the sweep too.
+        let progressed = {
+            let mut st = self.state.lock();
+            st.ranks
+                .iter_mut()
+                .filter_map(|(&(group, rank), r)| {
+                    if r.bytes > r.reported && !r.done_sent {
+                        r.reported = r.bytes;
+                        Some((r.hub, group, rank, r.bytes))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for (hub, group, rank, bytes) in progressed {
+            self.report(group, rank, hub, bytes, false);
+        }
         let live: Vec<(NodeId, u64, u32, RingState)> = {
             let st = self.state.lock();
             st.ranks
@@ -1701,6 +1775,7 @@ impl Push {
                 owed: HashMap::new(),
                 next: 0,
                 done_sent: false,
+                group_progress: 0,
                 joined_at: None,
                 released: 0,
                 last_release: None,
@@ -3143,10 +3218,44 @@ mod tests {
             owed: HashMap::new(),
             next: 0,
             done_sent: false,
+            group_progress: 0,
             joined_at: None,
             released: 0,
             last_release: None,
         }
+    }
+
+    #[test]
+    fn progress_requires_a_new_byte_count_from_the_hub_and_a_live_rank() {
+        let mut rank = rank_slot();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rank.engine = Some(tx);
+        rank.progress(NodeId(2), 10, 100);
+        rank.progress(NodeId(1), 0, 100);
+        assert!(rx.try_recv().is_err());
+        rank.progress(NodeId(1), 10, 100);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Event::Progress {
+                done: 10,
+                total: 100
+            }
+        );
+        rank.progress(NodeId(1), 10, 100);
+        rank.progress(NodeId(1), 9, 100);
+        assert!(rx.try_recv().is_err());
+        rank.progress(NodeId(1), 11, 100);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Event::Progress {
+                done: 11,
+                total: 100
+            }
+        );
+        rank.done_sent = true;
+        rank.progress(NodeId(1), 12, 100);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rank.group_progress, 11);
     }
 
     /// A finished source's grants stay granted, so not re-granted, until
