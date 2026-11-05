@@ -830,7 +830,7 @@ impl Push {
     }
 
     /// A message from another host, or this one.
-    fn on_msg(self: &Arc<Self>, _from: NodeId, m: PushMsg) -> BoxFuture<'static, NestResult<()>> {
+    fn on_msg(self: &Arc<Self>, from: NodeId, m: PushMsg) -> BoxFuture<'static, NestResult<()>> {
         let me = self.clone();
         async move {
             match m {
@@ -940,7 +940,7 @@ impl Push {
                     Ok(())
                 }
                 PushMsg::GroupProgress { group, done, total } => {
-                    me.group_progress(_from, group, done, total);
+                    me.group_progress(from, group, done, total);
                     Ok(())
                 }
                 PushMsg::End { group, reason } => {
@@ -1489,6 +1489,9 @@ impl Push {
                 .collect::<std::collections::BTreeSet<_>>();
             // Never hold state across RPC, nor make a rank's delivery wait for
             // a different host. Out-of-order advances are filtered at receipt.
+            // An old host's decoder refuses the variant with exactly this
+            // error; any other failure keeps it in the fan-out, which only
+            // costs a refused message per advance and never fails the load.
             for host in hosts {
                 let me = self.clone();
                 tokio::spawn(async move {

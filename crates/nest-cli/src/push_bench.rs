@@ -209,6 +209,8 @@ pub fn consume(
             }
             Event::Done => break,
             Event::Failed { reason, .. } => bail!("rank {rank}: {reason}"),
+            // The group's progress (ADR-087): it keeps the idle deadline off.
+            Event::Progress { .. } => {}
             other => bail!("rank {rank}: unexpected {other:?}"),
         }
     }

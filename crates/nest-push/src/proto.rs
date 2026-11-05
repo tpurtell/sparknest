@@ -75,6 +75,9 @@ pub enum Event {
     },
     /// The plan checked out; what the hub expects.
     Planned(Forecast),
+    /// Bytes delivered to every rank so far: to the coordinator, and since
+    /// ADR-087 to each waiting rank too, so its idle deadline sees the
+    /// group moving. A rank skips it.
     Progress {
         done: u64,
         total: u64,

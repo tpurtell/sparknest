@@ -14,8 +14,10 @@
 //!
 //! Each rank opens its own connection to its host's sparknestd with
 //! [`Rank::join`], passing the ring's fd, then loops on [`Rank::next`]:
-//! copy each `Filled` slot out, then [`Rank::release`] it. Any error, or
-//! the socket being absent, means: load through the mount instead.
+//! copy each `Filled` slot out, then [`Rank::release`] it; skip
+//! `Progress` (the group's, sent while other ranks are still being fed,
+//! ADR-087). Any error, or the socket being absent, means: load through
+//! the mount instead.
 //!
 //! Timeouts: the constructors take one and set it before their first send,
 //! so a hung sparknestd fails `create`/`join` with `ErrorKind::TimedOut`.
