@@ -11,8 +11,9 @@ live rank sockets; the existing sweep reports actual sub-256-MiB advances.
 An older rank host's decoder rejection disables fanout for that host only,
 without cancelling its load. Tests cover an early-fed rank waiting over
 30 seconds, the real v0.8.2 decoder completing a load, monotonic/hub-checked
-rank events, and a truly stalled consumer still timing out. No version bump,
-deployment, or daemon restart is part of this change.
+rank events, and a truly stalled consumer still timing out. `nest push
+rank` now skips Progress too. Released as 0.8.3 with the hf-fetch lookup
+that survives an upgrade under a running daemon; rolled to every host.
 
 ## 2026-11-04 — ECN on SparkNest's class, 8 MiB incast (ADR-086)
 
