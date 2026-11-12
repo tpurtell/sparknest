@@ -13,7 +13,8 @@ on 28 lanes, sharing one queue with the off-grid hosts' control traffic.
 sparknest's sockets now set cubic and a DSCP (control AF41, lanes CS1);
 `tools/lan-tcp/sparknest-lan-tcp` sets `tcp_ecn=1` and turns 802.3x pause
 off on each host's LAN NIC. CuteAFD was asked to drop its host-wide BBR and
-fq. Not yet measured: the same copy after the change.
+fq. Released as 0.8.4 with 6a908d0's group-progress logging. Not yet
+measured: the same copy after the change.
 
 ## 2026-11-05 — Push group liveness follows actual delivery (ADR-087)
 
