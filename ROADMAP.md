@@ -121,10 +121,14 @@ raw CSV).
   second at a time. Both rings were nearly empty (127 and 120 of 128 slots
   free), with only 1 and 8 grants outstanding. So the ranks granted it
   about one slot per round trip, plus lane latency, and never the budget
-  share `grant()` means it to have. Suspects: whether `Want` from a TCP
-  source reaches the rank (`wanting()` empty → floor only), `KEEP`
-  hand-back, and the floor of 1. Reproduce in nest-testkit with one
-  source behind an added delay.
+  share `grant()` means it to have. Second look: slots were 1 MiB and
+  `push-incast-mib` is 8, so the 8 grants on rank 1 plus a floor grant
+  were the whole budget, as designed. The slowness is in turning grants
+  around: each took 2–9 s over lanes with a 1 ms RTT. Suspect the source's
+  per-file cost on many tiny files (most of the 385 are 6.6 KiB: an open,
+  a read, and a mostly empty slot each), or Credit/Want messages queued
+  behind bulk on the off-grid host's control path. Time a source's loop on
+  cassowary first; then reproduce in nest-testkit.
 - **Push: no progress deadline for a trickling source** (2026-11-12).
   In the loads above, every fabric source finished in 6 s, and the group
   then waited on cassowary until the engine's own 900 s readiness timeout
