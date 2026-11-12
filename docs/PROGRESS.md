@@ -3,6 +3,24 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-12 — RDMA links survive a GID renumbering; plans list disks
+
+The fabric switch lost power on 2026-11-11 (18:19–19:45). When the links
+came back the kernel re-added each port's IPv4 RoCE v2 GID, on some hosts
+at a new index (kiwi and ostrich now have it at 4, not 3). A daemon that
+ran through the outage kept the index it read at start, and every QP
+connect then failed RTR with ENODATA (os error 61). rhea, the only daemon
+not restarted since, could not make RDMA links for 18 hours, and its
+sources fell back to TCP. Reproduced on rhea: `ibv_rc_pingpong -g 4`
+(empty) fails RTR, `-g 3` works. Rails now look up their GID's current
+index at each connect (`Rail::current_gid_index`), with a test against a
+renumbered fake sysfs table. On main, not released; rhea was restarted
+onto 0.8.4 meanwhile, which also cleared it.
+
+The Plans page lists a host's extra disks (raptor D2, D3) as places of
+their own, so they can shed or take room; the planner already handled
+them (ADR-073). Off-grid hosts are labelled.
+
 ## 2026-11-12 — LAN congestion: cubic, DSCP, ECN, no 802.3x pause (ADR-088)
 
 A Mistral copy from kakapo to the seven fabric hosts filled the single 10G

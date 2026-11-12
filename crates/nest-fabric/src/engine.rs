@@ -1219,10 +1219,13 @@ impl Fabric {
             let mtu = lane.dev.mtu.min(offer.qp.mtu);
             lane.mtu
                 .store(crate::counters::mtu_bytes(mtu), Ordering::Relaxed);
-            if let Err(e) =
-                lane.qp
-                    .connect(rail.gid_index, psn, &offer.qp, mtu, self.cfg.traffic_class)
-            {
+            if let Err(e) = lane.qp.connect(
+                rail.current_gid_index(),
+                psn,
+                &offer.qp,
+                mtu,
+                self.cfg.traffic_class,
+            ) {
                 made.push((rail.clone(), lane));
                 self.retire_lanes(&made.into_iter().map(|(_, l)| l).collect::<Vec<_>>());
                 return FabricResp::Refused(e.to_string());
@@ -1451,8 +1454,9 @@ impl Fabric {
             let mtu = lane.dev.mtu.min(remote.mtu);
             lane.mtu
                 .store(crate::counters::mtu_bytes(mtu), Ordering::Relaxed);
+            // Looked up now, not at start: a link flap can renumber it.
             if let Err(e) = lane.qp.connect(
-                lane.local.gid_index,
+                lane.local.current_gid_index(),
                 psns[i as usize],
                 &remote,
                 mtu,

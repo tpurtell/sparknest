@@ -43,6 +43,40 @@ impl Rail {
     }
 }
 
+impl Rail {
+    /// The GID table index this rail's GID has now. The kernel numbers a
+    /// port's IP-derived GIDs as it adds them, so a link flap that drops and
+    /// regains the address can move it (a Spark's IPv4 RoCE v2 GID sits at 3
+    /// on some hosts, 4 on others). Connecting with the index found at start
+    /// then names an empty entry, and every QP fails RTR with ENODATA:
+    /// rhea, after the switch lost power on 2026-11-11, until a restart.
+    /// Falls back to the index found at start where it cannot be read.
+    pub fn current_gid_index(&self) -> u32 {
+        let base = Path::new("/sys/class/infiniband")
+            .join(&self.ibdev)
+            .join(format!("ports/{}", self.port));
+        gid_index_in(&base, &self.gid).unwrap_or(self.gid_index)
+    }
+}
+
+/// The RoCE v2 entry of the port at `base` (`.../ports/N`) holding `gid`.
+fn gid_index_in(base: &Path, gid: &[u8; 16]) -> Option<u32> {
+    let want = std::net::Ipv6Addr::from(*gid);
+    let mut found: Vec<u32> = fs::read_dir(base.join("gids"))
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|i| {
+            read(base.join(format!("gid_attrs/types/{i}"))).as_deref() == Some("RoCE v2")
+                && read(base.join(format!("gids/{i}")))
+                    .and_then(|t| t.parse::<std::net::Ipv6Addr>().ok())
+                    == Some(want)
+        })
+        .collect();
+    found.sort_unstable();
+    found.first().copied()
+}
+
 fn read(p: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(p).ok().map(|s| s.trim().to_string())
 }
@@ -295,6 +329,57 @@ mod choose_tests {
             "the lower subnet, on every host"
         );
         assert_eq!(at(200), vec!["roceP2p1s0f0", "rocep1s0f0"]);
+    }
+
+    /// A fake `ports/1`: (index, gid text, type) per entry.
+    fn port(entries: &[(u32, &str, &str)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("gids")).unwrap();
+        fs::create_dir_all(d.path().join("gid_attrs/types")).unwrap();
+        for i in 0..8 {
+            let (g, t) = entries
+                .iter()
+                .find(|e| e.0 == i)
+                .map_or(("0000:0000:0000:0000:0000:0000:0000:0000", ""), |e| {
+                    (e.1, e.2)
+                });
+            fs::write(d.path().join(format!("gids/{i}")), format!("{g}\n")).unwrap();
+            fs::write(
+                d.path().join(format!("gid_attrs/types/{i}")),
+                format!("{t}\n"),
+            )
+            .unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_gid_moved_by_a_link_flap_is_found_at_its_new_index() {
+        let v4 = "0000:0000:0000:0000:0000:ffff:0a37:0005";
+        let gid = "::ffff:10.55.0.5"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        let ll = "fe80:0000:0000:0000:4a21:0bff:fe9d:77bf";
+        // At start: v1 at 2, v2 at 3.
+        let before = port(&[
+            (0, ll, "IB/RoCE v1"),
+            (1, ll, "RoCE v2"),
+            (2, v4, "IB/RoCE v1"),
+            (3, v4, "RoCE v2"),
+        ]);
+        assert_eq!(gid_index_in(before.path(), &gid), Some(3));
+        // After the flap: re-added with v2 at 4, 3 left empty (kiwi, ostrich).
+        let after = port(&[
+            (0, ll, "IB/RoCE v1"),
+            (1, ll, "RoCE v2"),
+            (2, v4, "IB/RoCE v1"),
+            (4, v4, "RoCE v2"),
+        ]);
+        assert_eq!(gid_index_in(after.path(), &gid), Some(4));
+        // Gone altogether (link down): none, and the caller keeps its own.
+        let gone = port(&[(0, ll, "IB/RoCE v1"), (1, ll, "RoCE v2")]);
+        assert_eq!(gid_index_in(gone.path(), &gid), None);
     }
 
     #[test]
