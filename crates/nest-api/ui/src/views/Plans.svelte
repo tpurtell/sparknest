@@ -1,6 +1,6 @@
 <script lang="ts">
   import { post, type Plan } from "../lib/api";
-  import { app, route, singleFlight } from "../lib/state.svelte";
+  import { app, route, singleFlight, places } from "../lib/state.svelte";
   import { human, pct } from "../lib/format";
   import PlanPreview from "../components/PlanPreview.svelte";
   import Icon from "../components/Icon.svelte";
@@ -14,12 +14,14 @@
 
   // ---- make room: desired free bytes per host, set by dragging.
   let want = $state<Record<string, number>>({});
-  const hosts = $derived(app.status?.nodes.filter((n) => n.info) ?? []);
+  // Every place copies live: each host, then its extra disks, each a place
+  // of its own (ADR-073), so a disk can shed or take room like a host.
+  const hosts = $derived(places().filter((p) => p.up && p.total > 0));
   $effect(() => {
     // Arriving from "plan to make room here": start that host 20% freer.
     const h = route.params.get("host");
     const n = hosts.find((x) => x.name === h);
-    if (n?.info && want[n.name] === undefined) want[n.name] = Math.min(n.info.total_bytes, n.info.free_bytes + n.info.total_bytes * 0.2);
+    if (n && want[n.name] === undefined) want[n.name] = Math.min(n.total, n.free + n.total * 0.2);
   });
 
   // ---- tidy / speed up
@@ -74,14 +76,14 @@
   }
   function move(e: PointerEvent) {
     if (!drag) return;
-    const n = hosts.find((x) => x.name === drag!.host)?.info;
+    const n = hosts.find((x) => x.name === drag!.host);
     if (!n) return;
     const r = drag.el.getBoundingClientRect();
     const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
     // Left of today's free space: shed; right of it: room granted for other
     // hosts' files. Snap to "as now" near the current mark.
-    let t = n.total_bytes * (1 - f);
-    if (Math.abs(t - n.free_bytes) < n.total_bytes * 0.005) t = n.free_bytes;
+    let t = n.total * (1 - f);
+    if (Math.abs(t - n.free) < n.total * 0.005) t = n.free;
     want[drag.host] = t;
     schedule();
   }
@@ -113,16 +115,16 @@
 
   <div class="panel pad stack">
     {#if goal === "free"}
-      <div class="row"><h3>Target free space</h3><span class="small muted">Drag left to make room on a host, right to let it take more. A host that must shed drops redundant copies first (least recently used), then moves its only copies to hosts you let take more, then to the archives you pick. A moved file leaves its source only once it has arrived.</span></div>
+      <div class="row"><h3>Target free space</h3><span class="small muted">Drag left to make room on a host or disk, right to let it take more (a host's extra disks and off-grid hosts too). A place that must shed drops redundant copies first (least recently used), then moves its only copies to places you let take more, then to the archives you pick. A moved file leaves its source only once it has arrived.</span></div>
       <div class="bars">
         {#each hosts as h (h.name)}
-          {@const i = h.info!}
-          {@const other = i.total_bytes - i.free_bytes - i.object_bytes}
+          {@const i = { total_bytes: h.total, free_bytes: h.free, object_bytes: h.held }}
+          {@const other = Math.max(0, i.total_bytes - i.free_bytes - i.object_bytes)}
           {@const w = want[h.name]}
           {@const p = projected(h.name)}
           {@const target = w ?? i.free_bytes}
           <div class="hrow">
-            <div class="hn"><b>{h.name}</b><div class="tiny muted mono">{human(i.free_bytes)} free</div></div>
+            <div class="hn" class:sub={h.disk}><b>{h.name}</b><div class="tiny muted mono">{human(i.free_bytes)} free{h.offgrid ? " · off-grid" : ""}</div></div>
             <div class="track" class:set={w !== undefined}>
               <i class="other" style="width:{pct(other, i.total_bytes)}%"></i>
               <i class="ours" style="left:{pct(other, i.total_bytes)}%;width:{pct(i.object_bytes, i.total_bytes)}%"></i>
@@ -213,6 +215,7 @@
   .bars { display: flex; flex-direction: column; gap: 12px; }
   .hrow { display: grid; grid-template-columns: 110px 1fr 150px; gap: 14px; align-items: center; }
   .hn b { display: block; overflow: hidden; text-overflow: ellipsis; }
+  .hn.sub { padding-left: 12px; border-left: 1px solid var(--line); }
   .track { position: relative; height: 22px; border-radius: 8px; background: rgba(90, 140, 220, 0.1); border: 1px solid var(--line); touch-action: none; }
   .track i { position: absolute; top: 0; bottom: 0; }
   .track .other { left: 0; background: #2c3a52; border-radius: 7px 0 0 7px; }
