@@ -28,6 +28,11 @@ Every host: `/etc/sysctl.d/90-sparknest-tcp.conf` sets
 `net.ipv4.tcp_slow_start_after_idle = 0` (benchmarks/M10-LAN-TCP.md);
 the original nine on 2026-10-12, cassowary and maxq on 2026-10-26 (cassowary
 had been missed). `scripts/add-offgrid.sh check` now requires it.
+From ADR-088 it also sets `net.ipv4.tcp_ecn = 1`, and 802.3x pause is off on
+each host's LAN NIC (`sparknest-lan-pause.service`): `tools/lan-tcp/sparknest-lan-tcp
+check` shows a host, `apply` sets both (root). Every host also has the
+engine's `/etc/sysctl.d/90-cuteafd.conf` (2026-10-25: BBR, `fq`, 128 MiB
+buffers); sparknestd sets cubic on its own sockets regardless.
 
 ### Off-grid hosts (LAN only, ADR-047)
 

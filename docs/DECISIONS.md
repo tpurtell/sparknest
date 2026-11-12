@@ -3032,3 +3032,53 @@ continue over the existing connection. Old rank hosts retain their previous
 rank-local timeout behavior until upgraded; mixed-version loads are not
 cancelled merely because a host lacks the new message. The regression uses
 the unmodified v0.8.2 enum decoder and completes the real load through it.
+
+## ADR-088 — sparknest's TCP runs cubic, marked by what it carries; ECN and no 802.3x pause on the LAN (2026-11-12)
+
+**Context.** A copy of a Mistral model from kakapo (off-grid) to the seven
+fabric hosts sent about 7 Gb/s through the one 10G LAN port that every
+fabric host sits behind. While it ran, raptor saw 50–70% ping loss to the
+off-grid hosts and round trips up to 1.4 s to rhea. The leader's heartbeats
+to kakapo, cassowary and maxq timed out, and their leases lapsed every few
+seconds (serving, then not serving again). Copies sourced on kakapo failed
+"not serving right now", waited out ADR-067's retry, and the plan ended.
+No bulk data was on the control connection (ADR-067): the lanes and the
+control connections shared one congested queue. Since 2026-10-25 every host
+has had a host-wide BBR, `fq` and 128 MiB socket buffers
+(`90-cuteafd.conf`, the engine's tuning); the LAN measurements of
+benchmarks/M10-LAN-TCP.md (2026-10-12) ran cubic and `fq_codel`. BBR v1
+mostly ignores loss and ignores ECN completely: 28 lanes (4 to each of 7 hosts) kept a
+shallow switch buffer full and dropping. Off-grid hosts have no fabric
+fallback for control (ADR-068), so their leases took the loss.
+
+**Decision.**
+1. **Cubic on every sparknest socket.** Control connections and TCP lanes
+   set `TCP_CONGESTION=cubic` themselves, so a host default cannot change
+   how sparknest's TCP behaves. Cubic backs off on loss and on ECN marks.
+   RDMA has no TCP congestion control and is unaffected (ADR-084, ADR-086).
+2. **DSCP by what a connection carries.** Control (Raft, leases,
+   metadata; port 7400) is AF41 (34); TCP lanes (bulk; port 7402) are CS1
+   (8), "lower effort". A switch between the halves can queue control
+   strictly ahead of bulk. These are separate from the fabric's DSCP 18
+   and 26, and only the RDMA classes are mapped on the fabric NICs.
+3. **Host settings** (`tools/lan-tcp/sparknest-lan-tcp`): `tcp_ecn=1` (ask
+   for ECN, not only answer it), `tcp_slow_start_after_idle=0` (as
+   before), and 802.3x pause off on the LAN NIC, kept at boot by a oneshot
+   unit. The LAN is not lossless: ECN and drops are its congestion
+   signals, and a pause stops every flow on a port.
+4. **No rate caps.** The fix is senders that respond to congestion, plus
+   priority where the switch has it, not a configured limit.
+5. The engine's host-wide BBR, `fq` and buffer sizes are the engine's to
+   set per socket if it needs them. That was asked of it, not done here.
+
+**Alternatives.** A cluster setting capping lane rate per host (works on
+any switch, but it's a guess that leaves bandwidth idle and needs tuning
+per topology); BBR with priority queueing (still drops without ECN
+response, and needs the switch); dctcp (needs ECN marking on every hop,
+which the switches between the halves don't do yet).
+
+**Consequences.** Long-lived connections keep their congestion control
+until they reconnect: a daemon restart takes the change. With a marking
+switch (the new MikroTik between the halves), cubic plus ECN should keep
+queues short with no drops; strict priority on AF41 protects leases even
+while bulk fills the link.

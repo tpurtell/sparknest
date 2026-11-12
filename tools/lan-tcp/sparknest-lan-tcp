@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Host TCP settings for SparkNest's 10G LAN (ADR-088).
+#
+#   sparknest-lan-tcp check            show this host's settings; exit 1 if any differ
+#   sparknest-lan-tcp apply [--dry-run]  set them, now and at every boot (root)
+#
+# The policy:
+#   - net.ipv4.tcp_ecn = 1: ask for ECN on outgoing connections, so a switch
+#     that marks can slow senders before it drops (2, the default, only
+#     answers a peer that asks);
+#   - net.ipv4.tcp_slow_start_after_idle = 0 (benchmarks/M10-LAN-TCP.md);
+#   - 802.3x pause off on the LAN NIC (the one routing to the LAN peers): a
+#     pause stops the whole port, every flow on it, and the LAN is not
+#     lossless; ECN and drops are its congestion signals.
+#
+# Congestion control is not a host setting here: sparknestd sets cubic on
+# each of its sockets, whatever the host default. A host default of BBR (v1)
+# still affects every other program's TCP.
+set -euo pipefail
+
+SYSCTL=/etc/sysctl.d/90-sparknest-tcp.conf
+UNIT=/etc/systemd/system/sparknest-lan-pause.service
+PEER=${SPARKNEST_LAN_PEER:-172.22.2.12}
+
+lan_nic() {
+  local dev
+  dev=$(ip -o -4 route get "$PEER" 2>/dev/null | grep -o 'dev [^ ]*' | cut -d' ' -f2)
+  # raptor routes its own address over lo; use the NIC that holds it.
+  if [ "$dev" = lo ]; then
+    dev=$(ip -o -4 addr show | awk -v a="$PEER" '$4 ~ "^"a"/" {print $2; exit}')
+  fi
+  echo "$dev"
+}
+
+pause_state() { ethtool -a "$1" 2>/dev/null | awk '/^RX:/{r=$2} /^TX:/{t=$2} END{print r"/"t}'; }
+
+check() {
+  local ok=0 dev
+  for kv in net.ipv4.tcp_ecn=1 net.ipv4.tcp_slow_start_after_idle=0; do
+    local k=${kv%=*} want=${kv#*=} have
+    have=$(sysctl -n "$k")
+    if [ "$have" = "$want" ]; then echo "ok      $k = $have"; else echo "differs $k = $have (want $want)"; ok=1; fi
+  done
+  echo "info    net.ipv4.tcp_congestion_control = $(sysctl -n net.ipv4.tcp_congestion_control) (host default; sparknestd sets cubic per socket)"
+  dev=$(lan_nic)
+  if [ -z "$dev" ]; then echo "differs no LAN NIC found (route to $PEER)"; return 1; fi
+  local p; p=$(pause_state "$dev")
+  case "$p" in
+    off/off|/) echo "ok      $dev 802.3x pause ${p:-unsupported}" ;;
+    *) echo "differs $dev 802.3x pause rx/tx $p (want off/off)"; ok=1 ;;
+  esac
+  return $ok
+}
+
+apply() {
+  local run=() dev
+  [ "${1:-}" = --dry-run ] && run=(echo)
+  dev=$(lan_nic)
+  [ -n "$dev" ] || { echo "no LAN NIC found (route to $PEER)" >&2; exit 1; }
+  "${run[@]}" install -m 0644 /dev/stdin "$SYSCTL" <<EOF
+# sparknest (ADR-088, benchmarks/M10-LAN-TCP.md): keep the TCP window after
+# idle; ask for ECN so a marking switch slows senders before it drops.
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_ecn = 1
+EOF
+  "${run[@]}" sysctl -q -p "$SYSCTL"
+  "${run[@]}" install -m 0644 /dev/stdin "$UNIT" <<EOF
+[Unit]
+Description=802.3x pause off on SparkNest's LAN NIC (ADR-088)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/sbin/ethtool -A $dev autoneg off rx off tx off
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  "${run[@]}" systemctl daemon-reload
+  "${run[@]}" systemctl enable --now sparknest-lan-pause.service
+  # A NIC whose pause is already off (or that has none) refuses the
+  # unchanged setting; that is fine.
+  "${run[@]}" ethtool -A "$dev" autoneg off rx off tx off 2>/dev/null || true
+  [ ${#run[@]} -gt 0 ] || check
+}
+
+case "${1:-}" in
+  check) check ;;
+  apply) shift; apply "$@" ;;
+  *) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

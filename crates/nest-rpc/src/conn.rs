@@ -195,6 +195,7 @@ impl Conn {
             .map_err(|e| unreachable(e.to_string()))?;
         s.set_nodelay(true).ok();
         crate::sockopt::set_rto_min(&s, crate::sockopt::RTO_MIN);
+        crate::sockopt::tune(&s, crate::sockopt::Traffic::Control);
         let who = tokio::time::timeout(
             inner.cfg.connect_timeout,
             auth::client(
@@ -736,6 +737,7 @@ impl Rpc {
 async fn serve(inner: Arc<Inner>, mut s: TcpStream) {
     s.set_nodelay(true).ok();
     crate::sockopt::set_rto_min(&s, crate::sockopt::RTO_MIN);
+    crate::sockopt::tune(&s, crate::sockopt::Traffic::Control);
     let hs = tokio::time::timeout(
         inner.cfg.connect_timeout,
         auth::server(

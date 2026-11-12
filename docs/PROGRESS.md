@@ -3,6 +3,18 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-12 — LAN congestion: cubic, DSCP, ECN, no 802.3x pause (ADR-088)
+
+A Mistral copy from kakapo to the seven fabric hosts filled the single 10G
+LAN port in front of them (about 7 Gb/s): 50–70% ping loss, leases of all
+three off-grid hosts flapping, and the plan ending on "not serving right
+now". Cause: a host-wide BBR (the engine's `90-cuteafd.conf`, 2026-10-25)
+on 28 lanes, sharing one queue with the off-grid hosts' control traffic.
+sparknest's sockets now set cubic and a DSCP (control AF41, lanes CS1);
+`tools/lan-tcp/sparknest-lan-tcp` sets `tcp_ecn=1` and turns 802.3x pause
+off on each host's LAN NIC. CuteAFD was asked to drop its host-wide BBR and
+fq. Not yet measured: the same copy after the change.
+
 ## 2026-11-05 — Push group liveness follows actual delivery (ADR-087)
 
 A single-source Step-5 load exposed a rank-local idle timeout while other

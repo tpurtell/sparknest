@@ -576,6 +576,8 @@ impl Lanes {
         let s = s.into_std()?;
         s.set_nonblocking(false)?;
         watch_stalls(&s, self.cfg.stall_timeout)?;
+        // Cubic and lower-effort DSCP (ADR-088): bulk yields to control.
+        nest_rpc::sockopt::tune(&s, nest_rpc::sockopt::Traffic::Bulk);
         let (out, rx) = mpsc::channel();
         let lane = Arc::new(Lane {
             peer,
