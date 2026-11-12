@@ -3082,3 +3082,11 @@ until they reconnect: a daemon restart takes the change. With a marking
 switch (the new MikroTik between the halves), cubic plus ECN should keep
 queues short with no drops; strict priority on AF41 protects leases even
 while bulk fills the link.
+
+**Amendment (2026-11-12, before release).** The host tool is the cluster's
+one TCP policy: it also writes cubic and `fq_codel` as host defaults, in
+`/etc/sysctl.d/99-sparknest-tcp.conf` (read after `90-cuteafd.conf`;
+it replaces `90-sparknest-tcp.conf`), and replaces the LAN NIC's qdiscs so
+they take it. cuteafd drops its `net.*` lines (it needs none: its serving
+path is RDMA). `--skip-pause` leaves the 802.3x change, which can drop the
+link for a moment, for a quiet time.

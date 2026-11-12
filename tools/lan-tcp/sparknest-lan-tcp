@@ -1,26 +1,35 @@
 #!/usr/bin/env bash
-# Host TCP settings for SparkNest's 10G LAN (ADR-088).
+# Host TCP settings for SparkNest's cluster (ADR-088).
 #
-#   sparknest-lan-tcp check            show this host's settings; exit 1 if any differ
-#   sparknest-lan-tcp apply [--dry-run]  set them, now and at every boot (root)
+#   sparknest-lan-tcp check              show this host's settings; exit 1 if any differ
+#   sparknest-lan-tcp apply [--dry-run] [--skip-pause]
+#                                        set them, now and at every boot (root);
+#                                        --skip-pause leaves 802.3x pause for later
 #
-# The policy:
+# The cluster's one TCP policy; other tools should not set net.*:
 #   - net.ipv4.tcp_ecn = 1: ask for ECN on outgoing connections, so a switch
 #     that marks can slow senders before it drops (2, the default, only
 #     answers a peer that asks);
 #   - net.ipv4.tcp_slow_start_after_idle = 0 (benchmarks/M10-LAN-TCP.md);
-#   - 802.3x pause off on the LAN NIC (the one routing to the LAN peers): a
-#     pause stops the whole port, every flow on it, and the LAN is not
-#     lossless; ECN and drops are its congestion signals.
+#   - cubic and fq_codel, the kernel's own defaults, stated so another
+#     snippet's BBR (v1 ignores loss and ECN) and fq cannot win; the LAN
+#     NIC's qdisc is replaced now, since default_qdisc only applies to new
+#     ones;
+#   - 802.3x pause off on the LAN NIC (the one routing to raptor's LAN
+#     address): a pause stops every flow on a port, and the LAN is not
+#     lossless; ECN and drops are its congestion signals. A pause change can
+#     drop the link for a moment.
 #
-# Congestion control is not a host setting here: sparknestd sets cubic on
-# each of its sockets, whatever the host default. A host default of BBR (v1)
-# still affects every other program's TCP.
+# sparknestd sets cubic and a DSCP on each of its own sockets regardless.
 set -euo pipefail
 
-SYSCTL=/etc/sysctl.d/90-sparknest-tcp.conf
+# 99- so it is read after any other snippet (90-cuteafd.conf set BBR and fq).
+SYSCTL=/etc/sysctl.d/99-sparknest-tcp.conf
+OLD_SYSCTL=/etc/sysctl.d/90-sparknest-tcp.conf
 UNIT=/etc/systemd/system/sparknest-lan-pause.service
 PEER=${SPARKNEST_LAN_PEER:-172.22.2.12}
+WANT=(net.ipv4.tcp_ecn=1 net.ipv4.tcp_slow_start_after_idle=0
+      net.ipv4.tcp_congestion_control=cubic net.core.default_qdisc=fq_codel)
 
 lan_nic() {
   local dev
@@ -34,37 +43,36 @@ lan_nic() {
 
 pause_state() { ethtool -a "$1" 2>/dev/null | awk '/^RX:/{r=$2} /^TX:/{t=$2} END{print r"/"t}'; }
 
+# The NIC's leaf qdiscs (under mq, or the root itself), one per line.
+leaf_qdiscs() { tc qdisc show dev "$1" | awk '$1=="qdisc" && $2!="mq" {print $2}'; }
+
 check() {
-  local ok=0 dev
-  for kv in net.ipv4.tcp_ecn=1 net.ipv4.tcp_slow_start_after_idle=0; do
-    local k=${kv%=*} want=${kv#*=} have
-    have=$(sysctl -n "$k")
-    if [ "$have" = "$want" ]; then echo "ok      $k = $have"; else echo "differs $k = $have (want $want)"; ok=1; fi
+  local ok=0 dev kv k want have
+  for kv in "${WANT[@]}"; do
+    k=${kv%=*}; want=${kv#*=}; have=$(sysctl -n "$k")
+    if [ "$have" = "$want" ]; then echo "ok      $k = $have"
+    else echo "differs $k = $have (want $want)"; ok=1; fi
   done
-  echo "info    net.ipv4.tcp_congestion_control = $(sysctl -n net.ipv4.tcp_congestion_control) (host default; sparknestd sets cubic per socket)"
   dev=$(lan_nic)
   if [ -z "$dev" ]; then echo "differs no LAN NIC found (route to $PEER)"; return 1; fi
+  if leaf_qdiscs "$dev" | grep -qv '^fq_codel$'; then
+    echo "differs $dev qdiscs: $(leaf_qdiscs "$dev" | sort | uniq -c | xargs) (want fq_codel)"; ok=1
+  else echo "ok      $dev qdiscs fq_codel"; fi
   local p; p=$(pause_state "$dev")
   case "$p" in
-    off/off|/) echo "ok      $dev 802.3x pause ${p:-unsupported}" ;;
+    off/off|/) echo "ok      $dev 802.3x pause ${p/#\//unsupported}" ;;
     *) echo "differs $dev 802.3x pause rx/tx $p (want off/off)"; ok=1 ;;
   esac
   return $ok
 }
 
-apply() {
-  local run=() dev
-  [ "${1:-}" = --dry-run ] && run=(echo)
-  dev=$(lan_nic)
-  [ -n "$dev" ] || { echo "no LAN NIC found (route to $PEER)" >&2; exit 1; }
-  "${run[@]}" install -m 0644 /dev/stdin "$SYSCTL" <<EOF
-# sparknest (ADR-088, benchmarks/M10-LAN-TCP.md): keep the TCP window after
-# idle; ask for ECN so a marking switch slows senders before it drops.
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_ecn = 1
-EOF
-  "${run[@]}" sysctl -q -p "$SYSCTL"
-  "${run[@]}" install -m 0644 /dev/stdin "$UNIT" <<EOF
+sysctl_text() {
+  echo "# sparknest (ADR-088, benchmarks/M10-LAN-TCP.md): the cluster's TCP policy."
+  for kv in "${WANT[@]}"; do echo "${kv%=*} = ${kv#*=}"; done
+}
+
+unit_text() {
+  cat <<UNIT_EOF
 [Unit]
 Description=802.3x pause off on SparkNest's LAN NIC (ADR-088)
 Wants=network-online.target
@@ -72,22 +80,53 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=-/usr/sbin/ethtool -A $dev autoneg off rx off tx off
+ExecStart=-/usr/sbin/ethtool -A $1 autoneg off rx off tx off
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
-  "${run[@]}" systemctl daemon-reload
-  "${run[@]}" systemctl enable --now sparknest-lan-pause.service
-  # A NIC whose pause is already off (or that has none) refuses the
-  # unchanged setting; that is fine.
-  "${run[@]}" ethtool -A "$dev" autoneg off rx off tx off 2>/dev/null || true
-  [ ${#run[@]} -gt 0 ] || check
+UNIT_EOF
+}
+
+apply() {
+  local dry=0 pause=1 dev a
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) dry=1 ;;
+      --skip-pause) pause=0 ;;
+      *) echo "unknown option $a" >&2; exit 2 ;;
+    esac
+  done
+  dev=$(lan_nic)
+  [ -n "$dev" ] || { echo "no LAN NIC found (route to $PEER)" >&2; exit 1; }
+  if [ $dry = 1 ]; then
+    echo "write $SYSCTL:"; sysctl_text | sed 's/^/    /'
+    echo "rm -f $OLD_SYSCTL; sysctl -q -p $SYSCTL"
+    echo "tc qdisc del dev $dev root (the kernel's default comes back)"
+    [ $pause = 1 ] && echo "write $UNIT (ethtool -A $dev autoneg off rx off tx off); systemctl enable --now"
+    return 0
+  fi
+  sysctl_text > "$SYSCTL"
+  rm -f "$OLD_SYSCTL"
+  sysctl -q -p "$SYSCTL"
+  # Recreate the NIC's qdiscs so they take the new default: deleting the
+  # root puts the kernel's default back (mq of fq_codel on a multiqueue
+  # NIC). Only queued packets go; the link stays up. Deleting a default
+  # root is refused, which is fine.
+  tc qdisc del dev "$dev" root 2>/dev/null || true
+  if [ $pause = 1 ]; then
+    unit_text "$dev" > "$UNIT"
+    systemctl daemon-reload
+    systemctl enable -q --now sparknest-lan-pause.service
+    # Run it now as well (enable --now does nothing when already active). A
+    # NIC without pause support refuses; that is fine.
+    ethtool -A "$dev" autoneg off rx off tx off 2>/dev/null || true
+  fi
+  check || true
 }
 
 case "${1:-}" in
   check) check ;;
   apply) shift; apply "$@" ;;
-  *) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

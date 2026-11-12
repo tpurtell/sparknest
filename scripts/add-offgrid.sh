@@ -64,7 +64,7 @@ if [ \$ok = 1 ]; then echo "\$(hostname -s): ready"; else
   echo "  sudo install -d -o \$(id -un) -g \$(id -gn) $STATE $MOUNT"
   echo "  grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf"
   echo "  sudo cp ~/.config/sparknest/sparknestd@$CLUSTER.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable sparknestd@$CLUSTER"
-  echo "  printf '%s\\n' '# sparknest (benchmarks/M10-LAN-TCP.md): keep the TCP window after idle' 'net.ipv4.tcp_slow_start_after_idle = 0' | sudo tee /etc/sysctl.d/90-sparknest-tcp.conf && sudo sysctl -q --system"
+  echo "  sudo tools/lan-tcp/sparknest-lan-tcp apply   # from a sparknest checkout (ADR-088)"
   echo "  sparknest-allow-restart $CLUSTER"
 fi
 CHECK
