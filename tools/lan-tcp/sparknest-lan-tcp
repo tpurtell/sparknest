@@ -102,18 +102,21 @@ apply() {
   if [ $dry = 1 ]; then
     echo "write $SYSCTL:"; sysctl_text | sed 's/^/    /'
     echo "rm -f $OLD_SYSCTL; sysctl -q -p $SYSCTL"
-    echo "tc qdisc del dev $dev root (the kernel's default comes back)"
+    echo "tc qdisc replace dev $dev root: a fresh mq (or fq_codel), so the queues take fq_codel"
     [ $pause = 1 ] && echo "write $UNIT (ethtool -A $dev autoneg off rx off tx off); systemctl enable --now"
     return 0
   fi
   sysctl_text > "$SYSCTL"
   rm -f "$OLD_SYSCTL"
   sysctl -q -p "$SYSCTL"
-  # Recreate the NIC's qdiscs so they take the new default: deleting the
-  # root puts the kernel's default back (mq of fq_codel on a multiqueue
-  # NIC). Only queued packets go; the link stays up. Deleting a default
-  # root is refused, which is fine.
-  tc qdisc del dev "$dev" root 2>/dev/null || true
+  # Recreate the NIC's qdiscs so they take the new default: a fresh mq
+  # root makes a default_qdisc child per queue (deleting the default mq is
+  # refused). Only queued packets go; the link stays up.
+  if tc qdisc show dev "$dev" root | grep -q '^qdisc mq '; then
+    tc qdisc replace dev "$dev" root handle 1: mq
+  else
+    tc qdisc replace dev "$dev" root fq_codel
+  fi
   if [ $pause = 1 ]; then
     unit_text "$dev" > "$UNIT"
     systemctl daemon-reload
