@@ -109,3 +109,28 @@ raw CSV).
 - Watch a live fabric link drop fail over to the LAN standby on real
   hardware (0.5.0 tested it in-process and on the trial cluster's
   start-up paths only; needs a quiet window).
+
+## Open bugs
+
+- **Push: a slow off-grid source is starved of grants** (2026-11-12).
+  Push groups 3467699263242264, 265 and 266 loaded
+  GLM-5.3-Flash-EXL3-K4-MC into two ranks on raptor. Of its blobs, 385
+  (22 GiB) were only on cassowary, so it was rightly their source. It sent
+  1–5 MiB/s for 15 minutes. Its four TCP lanes to raptor were healthy
+  (1 ms RTT, about 1 Gb/s delivery rate each), but stood idle up to a
+  second at a time. Both rings were nearly empty (127 and 120 of 128 slots
+  free), with only 1 and 8 grants outstanding. So the ranks granted it
+  about one slot per round trip, plus lane latency, and never the budget
+  share `grant()` means it to have. Suspects: whether `Want` from a TCP
+  source reaches the rank (`wanting()` empty → floor only), `KEEP`
+  hand-back, and the floor of 1. Reproduce in nest-testkit with one
+  source behind an added delay.
+- **Push: no progress deadline for a trickling source** (2026-11-12).
+  In the loads above, every fabric source finished in 6 s, and the group
+  then waited on cassowary until the engine's own 900 s readiness timeout
+  closed its rank. The hub never said why, and the engine had no early
+  signal. The hub should fail the group, or name the slow source, when
+  its rate falls far below what the rest of the plan needs. `stall_reason`
+  already tells "waits on sources" from "stopped releasing". The rate it
+  is sending at should be in `PushLoad`, so a loader can give up early or
+  re-plan.
