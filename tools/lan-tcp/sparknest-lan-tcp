@@ -33,6 +33,8 @@ WANT=(net.ipv4.tcp_ecn=1 net.ipv4.tcp_slow_start_after_idle=0
 
 lan_nic() {
   local dev
+  # apply passes the NIC it found on to check; look it up only once.
+  if [ -n "${SPARKNEST_LAN_NIC:-}" ]; then echo "$SPARKNEST_LAN_NIC"; return; fi
   dev=$(ip -o -4 route get "$PEER" 2>/dev/null | grep -o 'dev [^ ]*' | cut -d' ' -f2)
   # raptor routes its own address over lo; use the NIC that holds it.
   if [ "$dev" = lo ]; then
@@ -125,7 +127,7 @@ apply() {
     # NIC without pause support refuses; that is fine.
     ethtool -A "$dev" autoneg off rx off tx off 2>/dev/null || true
   fi
-  check || true
+  SPARKNEST_LAN_NIC=$dev check || true
 }
 
 case "${1:-}" in
