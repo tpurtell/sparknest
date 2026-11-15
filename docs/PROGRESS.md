@@ -3,6 +3,20 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-15 — hf import ends in the shared blob store
+
+Imports placed each repo's blobs in its own `blobs/`, the layout before
+huggingface_hub 1.32, so every CuteAFD quant (imported `--offline`) landed
+there and needed a `nest hf share` afterwards. An import now finishes by
+sharing each verified repo it put on hosts (not into an archive), noting
+per repo how many blobs moved; a repo hf cannot convert keeps its blobs
+and the import still succeeds. Offline sources without `trees/` get their
+file list from the Hub (a listing, no download). The seven quants left in
+the old layout (2.8 TiB) were shared by hand the same day, after a prune
+of 17 detached revisions and 19 incomplete downloads (140 GiB). The hub's
+`hf cache prune --dry-run` takes 6–8 minutes over the mount, past the
+web UI's request timeout, so Tidy hub is a command-line job for now.
+
 ## 2026-11-12 — RDMA links survive a GID renumbering; plans list disks
 
 The fabric switch lost power on 2026-11-11 (18:19–19:45). When the links

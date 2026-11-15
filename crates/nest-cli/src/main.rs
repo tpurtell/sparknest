@@ -435,8 +435,10 @@ enum HfCmd {
     /// huggingface_hub looks, then `hf download` finishes each snapshot,
     /// fetching only what the source never finished; offline (or when the
     /// Hub refuses), the source's snapshot links are mirrored. Refs are
-    /// copied and every file is verified. The source is left alone unless
-    /// --move.
+    /// copied and every file is verified. Last, each repo's blobs move into
+    /// the hub's shared store, as `nest hf share` does (not into an
+    /// archive; a repo whose files hf cannot name, offline and without
+    /// trees/, keeps them). The source is left alone unless --move.
     ///
     /// SRC is a hub cache (models--* inside), an HF_HOME (hub/ inside), or
     /// one models--org--name directory.

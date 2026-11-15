@@ -448,6 +448,9 @@ pub async fn run(
     let hub = opts.hub.trim_end_matches('/').to_string();
     let mut all_verified = true;
     let mut verified_dirs = Vec::new();
+    // Verified repos whose blobs are on hosts: converted to the shared
+    // store at the end (`share`).
+    let mut shared_names = Vec::new();
     for r in &repos {
         if progress.lock().cancelled {
             all_verified = false;
@@ -557,6 +560,9 @@ pub async fn run(
                 out.status = "done".into();
             }
             verified_dirs.push(r.dir.clone());
+            if archive.is_none() {
+                shared_names.push(r.name.clone());
+            }
         } else {
             all_verified = false;
             out.status = "failed".into();
@@ -609,12 +615,79 @@ pub async fn run(
             Err(e) => progress.lock().errors.push(format!("moving: {e}")),
         }
     }
+    // 5. Share: the blobs land in each repo's own blobs/ (the layout before
+    // huggingface_hub 1.32); convert them to the hub's shared store, as an
+    // hf ≥ 1.32 download would have left them. Renames on the mount: no
+    // data moves. Needs this node's mount and hf; a repo hf cannot convert
+    // keeps its blobs (`nest hf share` can retry it).
+    if let Some(mh) = &opts.mount_hub
+        && !shared_names.is_empty()
+        && !progress.lock().cancelled
+    {
+        share_imported(opts.hf.as_deref(), mh, &shared_names, &outcomes).await;
+    }
     if progress.lock().cancelled {
         return Err(NestError::Io(
             "cancelled; repos already imported stay, sources untouched".into(),
         ));
     }
     Ok(())
+}
+
+/// The import's last step: `share` each repo in `names` (directory names),
+/// noting on its outcome what moved into the shared store or why nothing
+/// did. Never fails the import: the files are in place either way.
+async fn share_imported(
+    hf: Option<&Path>,
+    mount_hub: &Path,
+    names: &[String],
+    outcomes: &Mutex<Vec<RepoOutcome>>,
+) {
+    for name in names {
+        // Only repos still holding their own blobs (an hf ≥ 1.32 source,
+        // or `hf download` finishing it, already shared them).
+        let (mh, n) = (mount_hub.to_path_buf(), name.clone());
+        let own = tokio::task::spawn_blocking(move || {
+            std::fs::read_dir(mh.join(&n).join("blobs")).is_ok_and(|d| {
+                d.flatten().any(|b| {
+                    b.file_type().is_ok_and(|t| t.is_file())
+                        && b.metadata().is_ok_and(|m| m.len() >= 1 << 20)
+                })
+            })
+        })
+        .await
+        .unwrap_or(false);
+        if !own {
+            continue;
+        }
+        let note = match share(hf, mount_hub, name, false, false, |_| {}).await {
+            Ok(o) if o.moved + o.linked > 0 => format!(
+                "{} blob(s) into the shared store{}",
+                o.moved + o.linked,
+                if o.skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} kept in the repo", o.skipped.len())
+                }
+            ),
+            Ok(o) if !o.skipped.is_empty() => format!(
+                "blobs kept in the repo ({}); `nest hf share` retries",
+                o.skipped[0]
+            ),
+            Ok(_) => continue,
+            Err(e) => format!("blobs kept in the repo: {e}"),
+        };
+        tracing::info!(repo = %name, %note, "hf import: shared");
+        if let Some((id, _)) = repo_meta(name) {
+            for x in outcomes.lock().iter_mut().filter(|x| x.repo == id) {
+                x.note = if x.note.is_empty() {
+                    note.clone()
+                } else {
+                    format!("{}; {note}", x.note)
+                };
+            }
+        }
+    }
 }
 
 fn used_blobs(r: &SrcRepo) -> Vec<&String> {
@@ -1757,6 +1830,65 @@ mod rm_tests {
         assert!(hub.join("models--org--b/blobs").join(sha).is_symlink());
         assert!(super::unshared_repos(&hub).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(hub.parent().unwrap());
+    }
+
+    /// With hf installed: an import's last step shares each repo still
+    /// holding its own blobs and says so on its outcome; a repo already
+    /// shared (or holding only small files) is left without a note.
+    #[tokio::test]
+    async fn an_import_ends_by_sharing_its_repos() {
+        let Some(_) = super::find_hf() else { return };
+        let drv = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/hf-fetch/sparknest-hf-fetch"
+        );
+        if super::fetch_driver().is_none() && std::env::var_os("SPARKNEST_HF_FETCH").is_none() {
+            // SAFETY: as in share_moves_xet_blobs_into_the_store.
+            unsafe { std::env::set_var("SPARKNEST_HF_FETCH", drv) };
+        }
+        let t = tempfile::tempdir().unwrap();
+        let hub = t.path().join("hub");
+        let xet = "cd".repeat(32);
+        let weights = vec![9u8; 2 << 20];
+        let sha = "1a4d7e1a1ffa2b4d8f8d1d0b3c5a6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f";
+        let r = hub.join("models--org--big");
+        std::fs::create_dir_all(r.join("blobs")).unwrap();
+        std::fs::create_dir_all(r.join("snapshots/c0ffee")).unwrap();
+        std::fs::create_dir_all(r.join("trees")).unwrap();
+        std::fs::write(r.join("blobs").join(sha), &weights).unwrap();
+        std::os::unix::fs::symlink(
+            format!("../../blobs/{sha}"),
+            r.join("snapshots/c0ffee/model.bin"),
+        )
+        .unwrap();
+        let tree = serde_json::json!({"format_version": 1, "files": {
+            "model.bin": {"size": weights.len(), "blob_id": "x", "lfs_sha256": sha, "xet_hash": xet},
+        }});
+        std::fs::write(r.join("trees/c0ffee.json"), tree.to_string()).unwrap();
+        let small = hub.join("models--org--small");
+        std::fs::create_dir_all(small.join("blobs")).unwrap();
+        std::fs::write(small.join("blobs/g1"), b"{}").unwrap();
+
+        let outcomes = parking_lot::Mutex::new(
+            ["org/big", "org/small"]
+                .map(|r| super::RepoOutcome {
+                    repo: r.into(),
+                    status: "mirrored".into(),
+                    ..Default::default()
+                })
+                .to_vec(),
+        );
+        let names = ["models--org--big".to_string(), "models--org--small".into()];
+        super::share_imported(None, &hub, &names, &outcomes).await;
+        let o = outcomes.lock();
+        assert_eq!(o[0].note, "1 blob(s) into the shared store", "{o:?}");
+        assert!(o[1].note.is_empty(), "{o:?}");
+        assert!(r.join("blobs").join(sha).is_symlink());
+        assert_eq!(
+            std::fs::read(hub.join("blobs").join(&xet[..2]).join(&xet)).unwrap(),
+            weights
+        );
+        assert!(super::unshared_repos(&hub).unwrap().is_empty());
     }
 
     /// With hf installed: a dry run reports, a delete removes the repo.
