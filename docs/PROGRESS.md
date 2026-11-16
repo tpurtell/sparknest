@@ -12,7 +12,11 @@ at 6, the rest 3 or 4). Every daemon kept the index it read at start, so
 for two days no RDMA link could be made between any pair and remote reads
 ran over TCP on the LAN. Released as 0.8.5 with cacd35f (the GID index
 looked up at each connect), the Plans page's disks (ba75196) and imports
-ending in the shared blob store (233a176).
+ending in the shared blob store (233a176). Bottles `bottles-20261116-1`
+(tap CI green on 9b3485f); the tap formula now also installs
+`sparknest-fabric-qos`, which the template had since 0.8.0. Rolled the
+same day: cassowary, maxq, kakapo, rhea, moa, then the four pool Sparks,
+then raptor at 15:29; raptor linked to emu over RDMA within 2 s.
 
 ## 2026-11-15 — hf import ends in the shared blob store
 
