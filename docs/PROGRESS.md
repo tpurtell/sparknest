@@ -3,6 +3,17 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-16 — 0.8.5: RDMA links survive a switch reboot
+
+The fabric switch upgraded itself to RouterOS 7.25.1 on 2026-11-14
+(12:49 CST); the reboot flapped every port and the kernels re-added each
+host's IPv4 RoCE v2 GID at a new index (ostrich 5, raptor's 10.55.0.22
+at 6, the rest 3 or 4). Every daemon kept the index it read at start, so
+for two days no RDMA link could be made between any pair and remote reads
+ran over TCP on the LAN. Released as 0.8.5 with cacd35f (the GID index
+looked up at each connect), the Plans page's disks (ba75196) and imports
+ending in the shared blob store (233a176).
+
 ## 2026-11-15 — hf import ends in the shared blob store
 
 Imports placed each repo's blobs in its own `blobs/`, the layout before
