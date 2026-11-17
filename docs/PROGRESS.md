@@ -15,7 +15,9 @@ far slower than the rest over 15 s and gives its remainder to a fresh one,
 checks the sha256, and publishes the blob to the shared store with hf's
 own helper. The same shard: 136 s (36 MB/s) on raptor, and hf's dry run
 counts it as cached. Anything the direct path can't do falls back to hf;
-`SPARKNEST_HF_XET=1` turns it off. Ships with the next release.
+`SPARKNEST_HF_XET=1` turns it off. Copied into every host's 0.8.5
+libexec on 2026-11-18 (the daemon runs the driver per fetch, so no
+restart); released in 0.8.6, installed but not restarted onto.
 
 ## 2026-11-16 — 0.8.5: RDMA links survive a switch reboot
 
