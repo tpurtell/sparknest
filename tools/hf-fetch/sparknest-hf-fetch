@@ -13,8 +13,13 @@ stdout.
 
   sparknest-hf-fetch fetch REPO --revision COMMIT --cache-dir HUB [--repo-type T]
       file names, one per line, on stdin; downloads them one after another
-      (hf_xet already spreads one file over several connections) into the hub
-      cache, and prints as it goes:
+      into the hub cache. A Xet file of 64 MiB or more comes over plain HTTP
+      from the Hub's CDN (the address hf would redirect to) in 32 MiB ranges
+      on 8 connections; a connection that falls far behind the others, or
+      below 128 KiB/s, over 15 s is dropped and its range goes to a new one.
+      The file is checked against its sha256 and published to the shared
+      blob store as hf publishes a Xet download (ADR-089). Smaller files, git
+      files and SPARKNEST_HF_XET=1 go through hf (and hf_xet). Prints:
       {"file": F, "done": BYTES, "total": BYTES}   progress, at most twice a second
       {"file": F, "ok": true}                       finished (or already cached)
       {"file": F, "error": MESSAGE}                 failed; the next file follows
@@ -35,13 +40,26 @@ stdout.
 SPDX-License-Identifier: MIT OR Apache-2.0
 """
 import argparse
+import collections
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
 
 _out = threading.Lock()
+
+# Direct downloads (ADR-089).
+DIRECT_MIN = int(os.environ.get("SPARKNEST_HF_DIRECT_MIN", 64 << 20))
+CONNECTIONS = int(os.environ.get("SPARKNEST_HF_CONNECTIONS", 8))
+PIECE = 32 << 20
+WINDOW = 15.0  # seconds a connection's speed is judged over
+FLOOR = 128 << 10  # bytes/s below which a connection is always replaced
+SLOW_SHARE = 0.25  # ... or below this share of the others' median
+READ_TIMEOUT = 20.0  # silence that ends a request
+MAX_MISSES = 32  # attempts in a row that brought nothing: give up
 
 
 def emit(obj):
@@ -95,13 +113,348 @@ def refs(args):
     emit({"branches": [ref(b) for b in r.branches], "tags": [ref(t) for t in r.tags]})
 
 
+class Spans:
+    """Byte ranges [start, end) received so far, merged."""
+
+    def __init__(self):
+        self.spans = []
+
+    def add(self, s, e):
+        if s >= e:
+            return
+        out, placed = [], False
+        for a, b in self.spans:
+            if b < s or a > e:
+                out.append([a, b])
+            else:
+                s, e = min(a, s), max(b, e)
+        out.append([s, e])
+        out.sort()
+        self.spans = out
+
+    def prefix(self):
+        """End of the span that starts at 0 (0 if none does)."""
+        return self.spans[0][1] if self.spans and self.spans[0][0] == 0 else 0
+
+    def total(self):
+        return sum(b - a for a, b in self.spans)
+
+
+class Lane:
+    """One connection's state, shared between its worker and the monitor."""
+
+    def __init__(self, i):
+        self.i = i
+        self.pos = 0  # next byte this lane writes
+        self.end = 0  # end of its range; the monitor may lower it (a split)
+        self.busy = False
+        self.drop = False  # set by the monitor: reconnect, requeue the rest
+        self.since = 0.0  # when its current connection started
+        self.got = 0  # bytes on its current connection
+        self.samples = collections.deque()  # (time, got), the monitor's
+
+
+def ranged_download(size, open_range, write, *, connections=CONNECTIONS, piece=PIECE,
+                    on_progress=None, on_done=None, clock=time.monotonic, tick=0.5,
+                    window=WINDOW, floor=FLOOR, slow_share=SLOW_SHARE, max_misses=MAX_MISSES):
+    """Fetch bytes [0, size) as ranges over `connections` lanes.
+
+    open_range(start, end) -> (iterator of bytes, close()) asks for bytes
+    [start, end); write(offset, data) stores them; on_progress(bytes) is called
+    each tick; on_done(spans) after each write lands. A connection slower
+    than `floor`, or than `slow_share` of the median speed of recent
+    connections (finished and running), over its last `window` seconds is
+    dropped and the rest of its range goes to a fresh connection.
+    When nothing is queued, an idle lane takes the second half of the largest
+    range still running, so one slow connection cannot hold up the end.
+    """
+    lock = threading.Lock()
+    queue = collections.deque((s, min(s + piece, size)) for s in range(0, size, piece))
+    spans = Spans()
+    lanes = [Lane(i) for i in range(connections)]
+    state = {"misses": 0, "error": None}
+    recent = collections.deque(maxlen=4 * connections)  # bytes/s of finished connections
+    flush = 4 << 20
+
+    def take(lane):
+        with lock:
+            if state["error"]:
+                return None
+            if queue:
+                return queue.popleft()
+            # Split the running range with the most left, if worth it.
+            best = max((l for l in lanes if l.busy and l is not lane), default=None,
+                       key=lambda l: l.end - l.pos)
+            if best is not None and best.end - best.pos >= 4 << 20:
+                mid = best.pos + (best.end - best.pos) // 2
+                r = (mid, best.end)
+                best.end = mid
+                return r
+            return None
+
+    def worker(lane):
+        while True:
+            r = take(lane)
+            if r is None:
+                with lock:
+                    if state["error"] or (not queue and not any(l.busy for l in lanes)):
+                        return
+                time.sleep(0.05)
+                continue
+            s, e = r
+            with lock:
+                lane.pos, lane.end, lane.busy, lane.drop = s, e, True, False
+                lane.since, lane.got = clock(), 0
+                lane.samples.clear()
+            buf, at, close, ok = bytearray(), s, None, False
+            try:
+                chunks, close = open_range(s, e)
+                for c in chunks:
+                    with lock:
+                        room = lane.end - (at + len(buf))
+                        drop = lane.drop
+                    if room <= 0 or drop:
+                        break
+                    c = c[:room]
+                    buf += c
+                    with lock:
+                        lane.got += len(c)
+                        # A split never takes bytes this lane already holds.
+                        lane.pos = at + len(buf)
+                    if len(buf) >= flush:
+                        write(at, bytes(buf))
+                        with lock:
+                            spans.add(at, at + len(buf))
+                            lane.pos = at + len(buf)
+                        at += len(buf)
+                        buf.clear()
+                        if on_done:
+                            on_done(spans)
+                ok = True
+            except Exception as ex:  # a dropped or failed connection: requeue the rest
+                state["last"] = f"{type(ex).__name__}: {ex}"
+            finally:
+                if close:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            if buf:
+                write(at, bytes(buf))
+                with lock:
+                    spans.add(at, at + len(buf))
+                at += len(buf)
+                if on_done:
+                    on_done(spans)
+            with lock:
+                took = clock() - lane.since
+                if lane.got >= piece // 4 and not lane.drop:
+                    recent.append(lane.got / max(took, 1e-3))
+                lane.pos, lane.busy = at, False
+                if at < lane.end:
+                    # Unfinished (dropped, failed or cut short): the rest goes
+                    # to the front of the queue for a new connection.
+                    queue.appendleft((at, lane.end))
+                if lane.got:
+                    state["misses"] = 0
+                elif not ok or at < lane.end:
+                    state["misses"] += 1
+                    if state["misses"] >= max_misses:
+                        state["error"] = state.get("last") or "no bytes from the Hub"
+            if not lane.got and not ok:
+                time.sleep(min(5.0, 0.5 * state["misses"]))
+
+    threads = [threading.Thread(target=worker, args=(l,), daemon=True) for l in lanes]
+    for t in threads:
+        t.start()
+    while any(t.is_alive() for t in threads):
+        time.sleep(tick)
+        now = clock()
+        speeds = {}
+        with lock:
+            for l in lanes:
+                if not l.busy:
+                    continue
+                l.samples.append((now, l.got))
+                while l.samples and l.samples[0][0] < now - window:
+                    l.samples.popleft()
+                if now - l.since >= window and l.samples:
+                    t0, g0 = l.samples[0]
+                    speeds[l.i] = (l.got - g0) / max(now - t0, 1e-6)
+            for i, v in speeds.items():
+                ref = sorted([*recent, *(w for j, w in speeds.items() if j != i)])
+                median = ref[len(ref) // 2] if len(ref) >= 2 else None
+                if v < floor or (median is not None and v < slow_share * median):
+                    lanes[i].drop = True
+            done = spans.total()
+        if on_progress:
+            on_progress(done)
+    if state["error"]:
+        raise OSError(state["error"])
+    if spans.prefix() != size:
+        raise OSError(f"incomplete: {spans.prefix()} of {size} bytes")
+
+
+def direct(args, name, progress):
+    """Fetch one Xet file over HTTP ranges into the cache as hf would lay it
+    out (ADR-089). Returns False to leave the file to hf."""
+    import secrets
+    import httpx2
+    from huggingface_hub import constants, get_hf_file_metadata, hf_hub_url
+    from huggingface_hub import file_download as fd
+    from huggingface_hub.utils import WeakFileLock, build_hf_headers
+    from huggingface_hub.utils import _shared_blobs as sb
+
+    url = hf_hub_url(args.repo, name, repo_type=args.repo_type, revision=args.revision)
+    meta = get_hf_file_metadata(url, retry_on_errors=True)
+    size, etag, xet = meta.size, meta.etag, meta.xet_file_data
+    # Only an LFS file (its etag is its sha256, which is checked) of a size
+    # worth splitting.
+    if (xet is None or not size or size < DIRECT_MIN or not etag
+            or not re.fullmatch(r"[0-9a-f]{64}", etag)):
+        return False
+    commit = meta.commit_hash or args.revision
+    folder = fd.repo_folder_name(repo_id=args.repo, repo_type=args.repo_type)
+    storage = os.path.join(args.cache_dir, folder)
+    blob = os.path.join(storage, "blobs", etag)
+    pointer = fd._get_pointer_path(storage, commit, name)
+    if os.path.exists(pointer):
+        return True
+    os.makedirs(os.path.dirname(blob), exist_ok=True)
+    os.makedirs(os.path.dirname(pointer), exist_ok=True)
+    lock_path = os.path.join(args.cache_dir, ".locks", folder, f"{etag}.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    shared = (sb.shared_blobs_enabled() and fd.are_symlinks_supported(args.cache_dir))
+
+    with WeakFileLock(lock_path):
+        if os.path.exists(blob) or (shared and sb.try_link_from_shared_store(
+                blob_path=blob, xet_hash=xet.file_hash, cache_dir=args.cache_dir,
+                expected_size=size)):
+            if not os.path.exists(pointer):
+                fd._create_symlink(blob, pointer, new_blob=False)
+            return True
+
+        where = {"url": meta.location, "at": time.monotonic()}
+        where_lock = threading.Lock()
+        hub_headers = build_hf_headers()
+
+        def refresh(seen):
+            # A signed CDN address expires; ask the Hub for a new one once.
+            with where_lock:
+                if where["url"] == seen and time.monotonic() - where["at"] > 5:
+                    m = get_hf_file_metadata(url, retry_on_errors=True)
+                    where["url"], where["at"] = m.location, time.monotonic()
+
+        def open_range(s, e):
+            target = where["url"]
+            # Hub credentials go to the Hub only, never to the CDN.
+            h = dict(hub_headers) if target.startswith(constants.ENDPOINT) else {}
+            h["Range"] = f"bytes={s}-{e - 1}"
+            h["Accept-Encoding"] = "identity"
+            # One client per range: a dropped connection is a new TCP
+            # connection, perhaps to another CDN edge.
+            client = httpx2.Client(follow_redirects=True, http2=False,
+                                   timeout=httpx2.Timeout(READ_TIMEOUT, connect=10.0))
+            try:
+                req = client.build_request("GET", target, headers=h)
+                resp = client.send(req, stream=True)
+                if resp.status_code in (401, 403, 410):
+                    resp.close()
+                    refresh(target)
+                    raise OSError(f"HTTP {resp.status_code} (address refreshed)")
+                if resp.status_code != 206:
+                    resp.close()
+                    raise OSError(f"HTTP {resp.status_code} for a range request")
+            except BaseException:
+                client.close()
+                raise
+
+            def close():
+                resp.close()
+                client.close()
+
+            return resp.iter_raw(), close
+
+        tmp = f"{blob}.{secrets.token_hex(4)}.incomplete"
+        fdw = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        sha = hashlib.sha256()
+        hashed = [0]
+        hash_lock = threading.Lock()
+
+        def write(off, data):
+            v = memoryview(data)
+            while v:
+                n = os.pwrite(fdw, v, off)
+                v, off = v[n:], off + n
+
+        def on_done(spans):
+            # Hash what has arrived in order, while the rest comes.
+            if not hash_lock.acquire(blocking=False):
+                return
+            try:
+                end = spans.prefix()
+                while hashed[0] < end:
+                    n = min(8 << 20, end - hashed[0])
+                    sha.update(os.pread(fdw, n, hashed[0]))
+                    hashed[0] += n
+            finally:
+                hash_lock.release()
+
+        last = [0.0]
+
+        def on_progress(done):
+            now = time.monotonic()
+            if now - last[0] >= 0.5:
+                last[0] = now
+                progress(done, size)
+
+        ok = False
+        try:
+            ranged_download(size, open_range, write, on_progress=on_progress, on_done=on_done)
+            with hash_lock:
+                while hashed[0] < size:
+                    n = min(8 << 20, size - hashed[0])
+                    sha.update(os.pread(fdw, n, hashed[0]))
+                    hashed[0] += n
+            if sha.hexdigest() != etag:
+                raise OSError(f"sha256 {sha.hexdigest()} does not match {etag}")
+            os.fsync(fdw)
+            ok = True
+        finally:
+            os.close(fdw)
+            if not ok:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        os.replace(tmp, blob)
+        # Checked against its sha256, so the bytes are exactly the file the
+        # Xet hash names: published like an hf_xet download.
+        is_shared = shared and sb.publish_blob_to_shared_store(
+            blob_path=blob, xet_hash=xet.file_hash, cache_dir=args.cache_dir,
+            expected_size=size)
+        if not os.path.exists(pointer):
+            fd._create_symlink(blob, pointer, new_blob=not is_shared)
+    return True
+
+
 def fetch(args):
     from huggingface_hub import hf_hub_download
 
+    use_xet = os.environ.get("SPARKNEST_HF_XET") == "1"
     for line in sys.stdin:
         name = line.rstrip("\n")
         if not name:
             continue
+        report = lambda d, t, name=name: emit({"file": name, "done": d, "total": t})
+        if not use_xet:
+            try:
+                if direct(args, name, report):
+                    emit({"file": name, "ok": True})
+                    continue
+            except Exception as e:  # hf (and hf_xet) gets its turn
+                emit({"file": name, "warning": f"direct download failed, using hf: "
+                                                f"{type(e).__name__}: {e}"})
         try:
             hf_hub_download(
                 args.repo,

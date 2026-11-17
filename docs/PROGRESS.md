@@ -3,6 +3,20 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-17 — Hugging Face downloads: plain HTTP ranges, slow connections replaced
+
+`nest hf download` had been crawling through hf_xet for months. Today a
+4.96 GB Kimi-K3.1-Pro-DSpark shard took 16 minutes: hf_xet got every range
+answered in 45 s, then the bodies trickled and its concurrency fell from
+64 to 1. Three hosts gave up on it before raptor finished. ADR-089:
+`sparknest-hf-fetch` now fetches Xet files of 64 MiB or more itself, as
+32 MiB ranges on 8 connections from the Hub's CDN, drops any connection
+far slower than the rest over 15 s and gives its remainder to a fresh one,
+checks the sha256, and publishes the blob to the shared store with hf's
+own helper. The same shard: 136 s (36 MB/s) on raptor, and hf's dry run
+counts it as cached. Anything the direct path can't do falls back to hf;
+`SPARKNEST_HF_XET=1` turns it off. Ships with the next release.
+
 ## 2026-11-16 — 0.8.5: RDMA links survive a switch reboot
 
 The fabric switch upgraded itself to RouterOS 7.25.1 on 2026-11-14

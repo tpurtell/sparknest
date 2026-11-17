@@ -3090,3 +3090,54 @@ it replaces `90-sparknest-tcp.conf`), and replaces the LAN NIC's qdiscs so
 they take it. cuteafd drops its `net.*` lines (it needs none: its serving
 path is RDMA). `--skip-pause` leaves the 802.3x change, which can drop the
 link for a moment, for a quiet time.
+
+## ADR-089 — Large Xet files come over plain HTTP ranges, and slow connections are replaced (2026-11-17; amends ADR-045)
+
+**Context.** Downloads through hf_xet have stalled for months. On
+2026-11-17 a 4.96 GB file took 16 minutes: hf_xet had the answers to all
+97 of its range requests within 45 s, then their bodies trickled in, and
+its adaptive concurrency fell from 64 connections to 1 ("connection
+struggling") and stayed there. Moa, ostrich and dodo each gave up on the
+same file after 90 s without progress. The placer's stall check
+(ADR-045) cannot see a trickle (any byte is progress) and cannot act
+inside hf_xet: it can only kill the whole fetch. The same file, asked for
+over plain HTTP from the address the Hub redirects to (its Xet bridge on
+the CDN), came at 36 MB/s on 8 connections from raptor.
+
+**Decision.**
+- `sparknest-hf-fetch fetch` downloads a file itself when the Hub
+  reports a Xet hash, an LFS sha256 etag and a size of at least 64 MiB.
+  Everything else (git files, small files) still goes through
+  `hf_hub_download`.
+- It asks for 32 MiB ranges on 8 connections, one new TCP connection per
+  range. Each connection's speed over its last 15 s is compared with the
+  median of recent connections (finished and running). One below a
+  quarter of that, or below 128 KiB/s, is dropped, and the rest of its
+  range goes back to the front of the queue for a fresh connection
+  (perhaps another CDN edge). With nothing queued, an idle connection
+  takes the second half of the largest range still running, so the end
+  of a file never waits on one slow connection. 20 s of silence ends a
+  request; 32 attempts in a row that bring nothing fail the file.
+- The file is hashed as it arrives in order and must match its sha256
+  etag. Only then is it renamed to `blobs/<etag>` and published to the
+  shared store with hf's own `publish_blob_to_shared_store`, under hf's
+  lock, exactly as hf publishes an hf_xet download (ADR-010). hf's dry
+  run then counts it as cached.
+- Any failure of the direct path falls back to `hf_hub_download` for that
+  file, with a warning line. `SPARKNEST_HF_XET=1` turns the direct path
+  off; `SPARKNEST_HF_CONNECTIONS` and `SPARKNEST_HF_DIRECT_MIN` tune it.
+
+**Alternatives.** Tuning hf_xet (`HF_XET_CLIENT_AC_*`, a fixed
+concurrency): the connections it holds still trickle, and it gives no
+handle to replace one. `HF_HUB_DISABLE_XET=1`: hf then downloads over one
+connection, and by design does not publish non-Xet downloads to the
+shared store. Killing and restarting the whole fetch from the placer:
+loses the file's progress each time.
+
+**Consequences.** A file's bytes no longer go through hf_xet's
+chunk-level dedup, which only saves anything when a local Xet chunk cache
+already holds them (ours does not). The shared-store layout depends on
+hf's private `_shared_blobs` helpers; a change there makes the direct
+path fail, and the file falls back to hf rather than landing wrong.
+Measured: the 4.96 GB file in 136 s (36 MB/s) on raptor, against 16 min
+through hf_xet the same afternoon.
