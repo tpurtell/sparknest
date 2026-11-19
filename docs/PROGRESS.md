@@ -3,6 +3,14 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-19 — 0.9.0: off-grid hosts in a container; adopt; host-held backups
+
+0.9.0 carries ADR-090 (metadata backups on hosts, `nest store adopt`, held
+hosts and `nest cluster release`) and the container image
+(`packaging/docker`, published to `ghcr.io/tpurtell/sparknest` from each
+release). The adoption's new metadata command needs every host on 0.9.0,
+so this release rolls with restarts.
+
 ## 2026-11-19 — Metadata backups on hosts; `nest store adopt` (ADR-090)
 
 Groundwork for running sparknestd on the NAS (aviary, a QNAP 855X: Atom
