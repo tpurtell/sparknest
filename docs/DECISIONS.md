@@ -3181,8 +3181,8 @@ the archive's copies.
    backups or if both stores list a copy of the same generation. It emits
    `StoreAdopted`, which refreshes replica views and drops gateways'
    handles on the archive, and asks nobody to delete anything. Hosts
-   before 0.8.7 cannot decode it, so it is refused until every host runs
-   0.8.7 or later (a dry run is not). A copy offloaded between the check
+   before 0.9.0 cannot decode it, so it is refused until every host runs
+   0.9.0 or later (a dry run is not). A copy offloaded between the check
    and the command is adopted unchecked; the host's next fsck checks it.
 3. **Held hosts (amended before release, 2026-11-19).** A host whose
    first start (no metadata applied yet) finds objects already in its

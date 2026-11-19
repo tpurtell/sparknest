@@ -21,7 +21,9 @@ brew install tpurtell/local-ai/sparknest
 ```
 
 Or unpack a release tarball and put `bin/sparknestd` and `bin/nest` on your
-PATH; the tarball's binaries use the system `libibverbs`. Homebrew core has
+PATH; the tarball's binaries use the system `libibverbs`. For a NAS or
+another Docker host that stores and serves as an off-grid host, use the
+container image instead: `packaging/docker/README.md`. Homebrew core has
 an unrelated `nest` formula that also installs a `nest` executable; the two
 cannot be linked together.
 
@@ -195,7 +197,10 @@ metadata no longer knows go to `/.lost+found/<date-time>/<host>/<path>`.
 
 ## Disaster recovery
 
-Archive stores receive metadata snapshots every six hours
-(`<store>/meta/`). Without any daemon running, `sparknestd export --meta
-SNAPSHOT --objects DIR... --out DIR` rebuilds the namespace, or a subtree
-of it, as ordinary files from any surviving object directories.
+Every six hours the leader has each backup host write a metadata backup
+from its own replica into `<state_dir>/backups/meta/` (14 kept): the members
+of the `meta-backups` group (`nest group set meta-backups HOST...`), else the
+three hosts with the most free space. `nest backup meta` writes one now.
+Without any daemon running, `sparknestd export --meta BACKUP --objects
+DIR... --out DIR` rebuilds the namespace, or a subtree of it, as ordinary
+files from any surviving object directories.

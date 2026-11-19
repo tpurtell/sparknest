@@ -269,8 +269,8 @@ pub enum Command {
     /// step (ADR-090): the objects already sit in `into`'s folder, so no
     /// bytes move. Refused while `from` keeps backups, if `into` already
     /// holds a copy of the same generation, or unless `from` is an archive
-    /// and `into` a host's store. Hosts before 0.8.7 cannot decode it: it
-    /// is proposed only once every host runs 0.8.7 or later.
+    /// and `into` a host's store. Hosts before 0.9.0 cannot decode it: it
+    /// is proposed only once every host runs 0.9.0 or later.
     AdoptStore {
         from: StoreId,
         into: StoreId,

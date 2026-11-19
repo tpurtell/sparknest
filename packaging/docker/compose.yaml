@@ -1,0 +1,40 @@
+# sparknestd as an off-grid host (ADR-047), for any Docker host with a
+# folder to give it: a NAS above all. See README.md beside this file.
+#
+#   1. Make the state folder (STATE below) and put node.toml and
+#      cluster.secret in it.
+#   2. From a running host of the cluster: nest cluster add ID ADDR --offgrid
+#   3. docker compose up -d
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+services:
+  sparknest:
+    image: ghcr.io/tpurtell/sparknest:${SPARKNEST_VERSION:-latest}
+    container_name: sparknest
+    restart: unless-stopped
+    # The host's own address: the cluster dials it there (LAN), with no port
+    # mapping to keep in step with node.toml.
+    network_mode: host
+    # The owner of the state folder's files (on a NAS, the share's user):
+    # `id -u USER` and `id -g USER` there.
+    user: "${SPARKNEST_UID:-1000}:${SPARKNEST_GID:-1000}"
+    volumes:
+      # The state dir: node.toml, cluster.secret, metadata and this host's
+      # objects. Keep it on the disks it should serve from.
+      - ${STATE:-./state}:/srv/sparknest
+    # Stopped cleanly, it starts again without a check of its objects.
+    stop_grace_period: 60s
+    ulimits:
+      nofile: 1048576
+
+    # Optional: mount the namespace inside the container too (a NAS that
+    # only stores and serves needs no mount: leave `mountpoint` out of
+    # node.toml and these out of here). FUSE needs the device and
+    # CAP_SYS_ADMIN, and AppArmor must allow mount(2):
+    # devices:
+    #   - /dev/fuse
+    # cap_add:
+    #   - SYS_ADMIN
+    # security_opt:
+    #   - apparmor:unconfined

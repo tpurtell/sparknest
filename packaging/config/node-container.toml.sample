@@ -1,0 +1,32 @@
+# sparknest node configuration for a container (packaging/docker): an
+# off-grid host (ADR-047) that stores and serves, on a NAS or any Docker
+# host. It joins as a non-voting learner over the LAN; the others dial it at
+# `addr` below (the container uses the host's network).
+#
+# Before its first start, add it from a running host of the cluster:
+#   nest cluster add 9 172.22.1.10:7400 --offgrid
+# then list it in `members` here and on every other host (as voter = false).
+
+[node]
+id = 9
+name = "aviary"
+role = "offgrid"
+# Inside the container; the folder mounted there holds everything.
+state_dir = "/srv/sparknest"
+# No mountpoint: the namespace is not mounted in the container (a host that
+# only stores and serves needs none). To mount it, see compose.yaml.
+listen = "0.0.0.0:7400"
+api_listen = "0.0.0.0:7401"
+# Free space kept on the state folder's filesystem for metadata and the
+# Raft log; on a shared NAS pool, also what the rest of the pool keeps.
+data_reserve_gib = 64
+
+[cluster]
+name = "sparknest"
+secret_file = "/srv/sparknest/cluster.secret"
+# Every voting host at its LAN address, and this host as a learner.
+members = [
+  { id = 1, name = "raptor",  addr = "172.22.2.12:7400" },
+  { id = 2, name = "ostrich", addr = "172.22.2.1:7400" },
+  { id = 9, name = "aviary",  addr = "172.22.1.10:7400", voter = false },
+]

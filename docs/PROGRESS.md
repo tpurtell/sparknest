@@ -21,7 +21,7 @@ itself (`<state_dir>/HOLD`): it removes nothing for being unlisted until
 command's refusals, the whole adoption (held first start and restart, a
 wrong host and a missing object refused, release, reads from another
 host, a stray swept once released), and backups landing on the chosen
-hosts. Needs 0.8.7 on every host.
+hosts. Needs 0.9.0 on every host.
 
 ## 2026-11-17 — Hugging Face downloads: plain HTTP ranges, slow connections replaced
 

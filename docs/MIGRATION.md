@@ -126,5 +126,8 @@ Offloaded files stay in the namespace and stream from raptor when read;
 ## Afterwards
 
 - Retire the trial: `scripts/trial.sh wipe` removes only trial state.
-- Metadata snapshots land in each archive every six hours; `docs/INSTALL.md`
-  describes recovery with `sparknestd export`.
+- Metadata backups land on three hosts (or the `meta-backups` group) every
+  six hours; `docs/INSTALL.md` describes recovery with `sparknestd export`.
+- The NAS archive can later become a host of its own, serving its disks
+  without SMB and with no data copied: `packaging/docker/README.md`
+  ("Moving an SMB archive onto the NAS that holds it").

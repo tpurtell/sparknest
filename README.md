@@ -49,6 +49,12 @@ brew install tpurtell/local-ai/sparknest
 Linux x86_64 and arm64. Binary tarballs are on the releases page. Setup,
 configuration and service units: [`docs/INSTALL.md`](docs/INSTALL.md).
 
+On a NAS, or any machine that should store and serve without joining the
+fabric, run the container image `ghcr.io/tpurtell/sparknest` as an off-grid
+host: [`packaging/docker/README.md`](packaging/docker/README.md). It also
+covers moving an SMB archive on the NAS onto sparknest running there, with
+no data copied.
+
 ## A short tour
 
 ```sh
@@ -66,6 +72,8 @@ nest ui                                       # link to the web UI
 
 - [`docs/INSTALL.md`](docs/INSTALL.md): installing and running a cluster.
 - [`docs/MIGRATION.md`](docs/MIGRATION.md): moving existing caches in.
+- [`packaging/docker/README.md`](packaging/docker/README.md): a NAS (or any
+  Docker host) as an off-grid host, and moving an SMB archive onto it.
 - [`docs/LOSSLESS.md`](docs/LOSSLESS.md): tuning hosts and switch for
   SparkNest's fabric class.
 - [`PROPOSAL.md`](PROPOSAL.md): the design.
