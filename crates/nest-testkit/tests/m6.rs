@@ -755,27 +755,17 @@ async fn cancel_stops_a_file_mid_copy() {
 }
 
 /// ADR-090: an archive whose folder becomes a host's state dir (a NAS that
-/// runs sparknest itself) is adopted by that host. Only the metadata
-/// changes; the host keeps every object, before and after the adoption,
-/// and serves them.
+/// runs sparknest itself). The host's first start on that folder holds it:
+/// it keeps the archive's objects. Adopting hands them to it (only the
+/// metadata changes) and releases it; it then serves them and sweeps
+/// normally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_host_adopts_the_archive_in_its_own_folder() {
     let mut c = ready(3).await;
-    c.add_offgrid(4).await;
-    c.eventually("n4 serving", Duration::from_secs(8), |c| {
-        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
-    })
-    .await;
-    c.eventually("n4 named", Duration::from_secs(8), |c| {
-        c.node(1)
-            .placer
-            .nodes()
-            .is_ok_and(|v| v.iter().any(|h| h.name == "n4"))
-    })
-    .await;
-    // The archive lives in n4's state dir and n1 reaches it (raptor over
-    // SMB, with the NAS's folder).
+    // The archive lives in the folder n4 will start on; n1 reaches it
+    // (raptor over SMB, with the NAS's folder).
     let folder = c.state_dir(4);
+    std::fs::create_dir_all(&folder).unwrap();
     let p = c.node(1).placer.clone();
     let r = p
         .add_store("nas", folder.to_str().unwrap(), &["n1".into()])
@@ -812,57 +802,72 @@ async fn a_host_adopts_the_archive_in_its_own_folder() {
     for (f, _) in &files {
         assert_eq!(stores_of(&c, *f), vec![nas.0]);
     }
+    let keys: Vec<nest_store::ObjectKey> = files
+        .iter()
+        .map(|(f, _)| nest_store::ObjectKey::new(*f, c.attr(1, *f).unwrap().generation))
+        .collect();
 
-    // n4 restarts before the adoption: the archive's objects sit in its
-    // objects/, unlisted as its own, and must survive.
-    c.stop(4).await;
-    c.restart(4).await;
-    c.eventually("n4 back", Duration::from_secs(8), |c| {
-        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
+    // n4's first start on the folder: held, and it keeps the objects, also
+    // across a restart.
+    c.add_offgrid(4).await;
+    let serving =
+        |c: &TestCluster| c.node(4).data.caught_up() && c.node(4).data.session().is_some();
+    c.eventually("n4 serving", Duration::from_secs(8), serving)
+        .await;
+    c.eventually("n4 named", Duration::from_secs(8), |c| {
+        c.node(1)
+            .placer
+            .nodes()
+            .is_ok_and(|v| v.iter().any(|h| h.name == "n4"))
     })
     .await;
-    for (f, _) in &files {
-        let a = c.attr(1, *f).unwrap();
+    assert!(c.node(4).data.held());
+    assert!(folder.join(nest_data::HOLD_FILE).exists());
+    c.stop(4).await;
+    c.restart(4).await;
+    c.eventually("n4 back", Duration::from_secs(8), serving)
+        .await;
+    assert!(c.node(4).data.held());
+    for k in &keys {
         assert!(
-            c.node(4)
-                .data
-                .store()
-                .exists(nest_store::ObjectKey::new(*f, a.generation)),
-            "n4's start removed an archive object"
+            c.node(4).data.store().exists(*k),
+            "a held start removed {k:?}"
         );
     }
+    // Released by hand now, it would remove them: a dry run says so.
+    let dry = p.release_host("n4", true).await.unwrap();
+    assert!(dry.was_held && dry.unlisted == 2, "{dry:?}");
+    assert!(c.node(4).data.held());
 
     // A host that does not see the archive's folder (n3) cannot adopt it.
     let e = p.adopt_store("nas", "n3", true).await.unwrap_err();
     assert!(e.to_string().contains("no marker"), "{e}");
     // A dry run only checks; a missing object stops it, changing nothing.
     assert_eq!(p.adopt_store("nas", "n4", true).await.unwrap(), 2);
-    let (f0, _) = files[0];
-    let a0 = c.attr(1, f0).unwrap();
-    let obj = c
-        .node(4)
-        .data
-        .store()
-        .path(nest_store::ObjectKey::new(f0, a0.generation));
+    let obj = c.node(4).data.store().path(keys[0]);
     let aside = obj.with_extension("aside");
     std::fs::rename(&obj, &aside).unwrap();
     let e = p.adopt_store("nas", "n4", false).await.unwrap_err();
     assert!(e.to_string().contains("not in its folder"), "{e}");
-    assert_eq!(stores_of(&c, f0), vec![nas.0]);
+    assert_eq!(stores_of(&c, files[0].0), vec![nas.0]);
     std::fs::rename(&aside, &obj).unwrap();
 
-    // Adopted: n4 holds them, the archive is gone.
+    // Adopted: n4 holds them, the archive is gone, n4 is released and its
+    // folder is like any host's.
     assert_eq!(p.adopt_store("nas", "n4", false).await.unwrap(), 2);
     c.converge().await;
     for (f, _) in &files {
         assert_eq!(stores_of(&c, *f), vec![4]);
     }
     assert!(p.stores().await.unwrap().is_empty());
-    // The folder is n4's own now, without the archive's marker.
+    assert!(!c.node(4).data.held());
+    assert!(!folder.join(nest_data::HOLD_FILE).exists());
     assert!(!folder.join(nest_store::MARKER).exists());
+    for k in &keys {
+        assert!(c.node(4).data.store().exists(*k));
+    }
 
-    // Read from a fabric host (n3 has no copy: n4 serves it), and n4 keeps
-    // them across another restart.
+    // n3 (no copy) reads them from n4.
     for (f, byte) in &files {
         let v3 = &c.node(3).vfs;
         let (fh, _) = v3.open(*f, 0).await.unwrap();
@@ -870,21 +875,24 @@ async fn a_host_adopts_the_archive_in_its_own_folder() {
         assert_eq!(b, vec![*byte; 4]);
         v3.release(fh, None).await;
     }
+
+    // Released, n4 sweeps as any host does: its own objects stay, an object
+    // nothing lists goes.
+    let stray = nest_store::ObjectKey::new(FileId(999_999), Generation(1));
+    let st = c.node(4).data.store().begin_staging(stray).unwrap();
+    c.node(4).data.store().commit_staging(st).unwrap();
     c.stop(4).await;
     c.restart(4).await;
-    c.eventually("n4 back again", Duration::from_secs(8), |c| {
-        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
-    })
-    .await;
-    for (f, _) in &files {
-        let a = c.attr(1, *f).unwrap();
-        assert!(
-            c.node(4)
-                .data
-                .store()
-                .exists(nest_store::ObjectKey::new(*f, a.generation))
-        );
+    c.eventually("n4 back again", Duration::from_secs(8), serving)
+        .await;
+    assert!(!c.node(4).data.held());
+    for k in &keys {
+        assert!(c.node(4).data.store().exists(*k));
     }
+    assert!(
+        !c.node(4).data.store().exists(stray),
+        "a released host kept a stray object"
+    );
 }
 
 /// ADR-090: metadata backups go to hosts, into each one's own state dir:

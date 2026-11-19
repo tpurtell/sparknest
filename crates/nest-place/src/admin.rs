@@ -70,6 +70,12 @@ pub struct NodeInfo {
     /// wait, read).
     #[serde(default)]
     pub fabric_timing: [u64; 7],
+    /// Held (ADR-090): keeping objects nothing lists here until released,
+    /// and how many the last sweep kept for that.
+    #[serde(default)]
+    pub held: bool,
+    #[serde(default)]
+    pub held_objects: u64,
 }
 
 /// One of a host's stores as it reports it: its live store or an extra
@@ -275,6 +281,12 @@ pub(crate) enum AdminReq {
         identity: String,
         finish: bool,
     },
+    /// Release this held host (ADR-090): remove what nothing lists here.
+    /// With `dry_run`, only count it. Answers `Released`; older hosts with
+    /// an error.
+    Release {
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,6 +333,7 @@ pub(crate) enum AdminResp {
     /// Objects missing from an archive's folder or of another size, with
     /// why (`CheckArchive`).
     Checked(Vec<(FileId, String)>),
+    Released(nest_data::ReleaseReport),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -555,6 +568,8 @@ impl Admin {
                 })
                 .unwrap_or_default(),
             link_bps: self.vfs.link_bps(),
+            held: d.held(),
+            held_objects: d.held_objects(),
         }
     }
 
@@ -941,6 +956,10 @@ impl Handler for AdminService {
                     identity,
                     finish,
                 } => a.adopt_here(into, &identity, finish),
+                AdminReq::Release { dry_run } => match a.vfs.data().release(dry_run).await {
+                    Ok(r) => AdminResp::Released(r),
+                    Err(e) => AdminResp::Err(e.to_string()),
+                },
                 AdminReq::StartReplicate {
                     job,
                     files,

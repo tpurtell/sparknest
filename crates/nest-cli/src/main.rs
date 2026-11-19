@@ -862,6 +862,19 @@ enum ClusterCmd {
         #[arg(long, required_if_eq("role", "fabric"))]
         addr: Option<String>,
     },
+    /// Release a held host: remove what nothing lists in its stores.
+    ///
+    /// A host holds itself when it first starts on a folder that already has
+    /// objects (a store's folder brought to it, a moved disk): it keeps
+    /// whatever the metadata does not list there until released. `nest
+    /// status` shows it held. `nest store adopt` releases the host it hands
+    /// an archive to.
+    Release {
+        host: String,
+        /// Only count what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Add (or re-add) a node by id and control address (ip:port).
     Add {
         id: u64,
@@ -1285,10 +1298,13 @@ async fn main() -> Result<()> {
                         Some(i) => println!(
                             "{:<9} {:<8} {:>10} {:>10} {:>8} {:>10}  {}",
                             n["name"].as_str().unwrap_or("?"),
-                            if i["serving"].as_bool() == Some(true) {
-                                "yes"
-                            } else {
-                                "no"
+                            match (
+                                i["serving"].as_bool() == Some(true),
+                                i["held"].as_bool() == Some(true),
+                            ) {
+                                (true, false) => "yes",
+                                (true, true) => "held",
+                                _ => "no",
                             },
                             human(i["free_bytes"].as_u64().unwrap_or(0)),
                             human(i["total_bytes"].as_u64().unwrap_or(0)),
@@ -1308,6 +1324,16 @@ async fn main() -> Result<()> {
                             n["name"].as_str().unwrap_or("?"),
                             n["error"].as_str().unwrap_or("")
                         ),
+                    }
+                }
+                for n in v["nodes"].as_array().into_iter().flatten() {
+                    if n["info"]["held"].as_bool() == Some(true) {
+                        println!(
+                            "{} is held: keeping {} objects nothing lists there (nest cluster release {} removes them)",
+                            n["name"].as_str().unwrap_or("?"),
+                            n["info"]["held_objects"],
+                            n["name"].as_str().unwrap_or("?"),
+                        );
                     }
                 }
                 return Ok(());
@@ -2152,6 +2178,31 @@ async fn main() -> Result<()> {
                             } else {
                                 "learner"
                             }
+                        );
+                    }
+                    return Ok(());
+                }
+                v
+            }
+            ClusterCmd::Release { host, dry_run } => {
+                let v = c
+                    .post(
+                        "/v1/cluster/release",
+                        json!({ "host": host, "dry_run": dry_run }),
+                    )
+                    .await?;
+                if !cli.json {
+                    let unlisted = v["unlisted"].as_u64().unwrap_or(0);
+                    if v["was_held"].as_bool() != Some(true) {
+                        println!("{host} is not held ({unlisted} objects nothing lists there)");
+                    } else if *dry_run {
+                        println!(
+                            "{host} is held; releasing would remove {unlisted} objects nothing lists there"
+                        );
+                    } else {
+                        println!(
+                            "{host} released: removed {} objects nothing listed there",
+                            v["removed"].as_u64().unwrap_or(0)
                         );
                     }
                     return Ok(());

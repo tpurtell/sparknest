@@ -1298,7 +1298,60 @@ impl Placer {
         if let Err(e) = self.adopt_here(host, src, dest, &identity, true).await {
             tracing::warn!(error = %e, "adopted, but the archive's marker is still in the folder");
         }
+        // Its objects are listed as its own now: a host held on this folder
+        // can sweep normally again. It must have applied the adoption first.
+        let name = place
+            .name
+            .split(':')
+            .next()
+            .unwrap_or(&place.name)
+            .to_string();
+        let mut released = Err(NestError::Busy("not tried".into()));
+        for _ in 0..30 {
+            released = self.release_host(&name, false).await;
+            if released.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        if let Err(e) = released {
+            tracing::warn!(host = %name, error = %e, "adopted, but the host is still held: run nest cluster release");
+        }
         Ok(files.len() as u64)
+    }
+
+    /// Release a held host (ADR-090): it removes what nothing lists in its
+    /// stores. With `dry_run`, it only counts that.
+    pub async fn release_host(
+        &self,
+        host: &str,
+        dry_run: bool,
+    ) -> NestResult<nest_data::ReleaseReport> {
+        let h = self
+            .resolve_hosts(&[host.to_string()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NestError::Invalid(format!("unknown host {host:?}")))?;
+        if h.node == self.vfs.data().id() {
+            return self
+                .vfs
+                .data()
+                .release(dry_run)
+                .await
+                .map_err(|e| NestError::Busy(e.to_string()));
+        }
+        match admin::call(
+            self.rpc(),
+            h.node,
+            &AdminReq::Release { dry_run },
+            Duration::from_secs(3600),
+        )
+        .await?
+        {
+            AdminResp::Released(r) => Ok(r),
+            AdminResp::Err(e) => Err(NestError::Busy(e)),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
     }
 
     /// Ask the adopting host about (or, with `finish`, remove) the archive's

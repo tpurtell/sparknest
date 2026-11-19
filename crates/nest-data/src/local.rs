@@ -114,6 +114,19 @@ pub struct ReconcileReport {
     pub recreated: Vec<ObjectKey>,
     /// Replicas metadata says we hold but the disk does not.
     pub missing: Vec<ObjectKey>,
+    /// Objects nothing lists here, kept because the host is held (ADR-090).
+    pub held: usize,
+}
+
+/// What releasing a held host did (ADR-090).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReleaseReport {
+    /// It was held (false: nothing to release).
+    pub was_held: bool,
+    /// Objects removed by the sweep that followed.
+    pub removed: u64,
+    /// Objects nothing listed here when asked.
+    pub unlisted: u64,
 }
 
 pub struct DataNode {
@@ -155,8 +168,16 @@ pub struct DataNode {
     archives: Mutex<HashMap<StoreId, Arc<Archive>>>,
     /// This host's extra disks (ADR-073), opened on first use.
     disks: Mutex<HashMap<StoreId, Arc<Archive>>>,
+    /// Held (ADR-090): nothing the metadata does not list here is removed
+    /// from this host's stores until it is released.
+    held: std::sync::atomic::AtomicBool,
+    /// Objects the last sweep kept only because the host is held.
+    held_objects: AtomicU64,
     weak: Weak<DataNode>,
 }
+
+/// The file in a host's state dir that holds it (ADR-090).
+pub const HOLD_FILE: &str = "HOLD";
 
 struct Handler(Weak<DataNode>);
 
@@ -208,6 +229,8 @@ impl DataNode {
             readers: Mutex::new(Vec::new()),
             archives: Mutex::new(HashMap::new()),
             disks: Mutex::new(HashMap::new()),
+            held: std::sync::atomic::AtomicBool::new(false),
+            held_objects: AtomicU64::new(0),
         });
         for rx in receivers {
             tokio::spawn(worker(Arc::downgrade(&d), rx, d.gate.subscribe()));
@@ -589,6 +612,97 @@ impl DataNode {
         self.caught_up.load(Ordering::SeqCst)
     }
 
+    /// Whether this host is held (ADR-090): it keeps objects nothing lists
+    /// here instead of removing them.
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    /// Objects the last sweep kept only because the host is held.
+    pub fn held_objects(&self) -> u64 {
+        self.held_objects.load(Ordering::Relaxed)
+    }
+
+    /// Hold this host from now (its state dir's `HOLD` says so across
+    /// restarts), or not. Called before `attach`.
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+    }
+
+    /// Release a held host (ADR-090): remove its `HOLD` file, then sweep,
+    /// removing what nothing lists here. Refused until it has caught up
+    /// with the cluster. With `dry_run`, only count what would go.
+    pub async fn release(&self, dry_run: bool) -> anyhow::Result<ReleaseReport> {
+        if !self.caught_up() || !self.admitted.load(Ordering::SeqCst) {
+            anyhow::bail!("not caught up with the cluster yet: try again shortly");
+        }
+        // Judge against everything committed before the release was asked
+        // for (an adoption just before it, above all).
+        self.meta()
+            .barrier()
+            .await
+            .map_err(|e| anyhow::anyhow!("reaching the cluster: {e}"))?;
+        let held = self.held();
+        let unlisted = self.unlisted().await?;
+        if dry_run || !held {
+            return Ok(ReleaseReport {
+                was_held: held,
+                removed: 0,
+                unlisted: unlisted.len() as u64,
+            });
+        }
+        let hold = self.store.root().join(HOLD_FILE);
+        match std::fs::remove_file(&hold) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("removing {}: {e}", hold.display()),
+        }
+        self.held.store(false, Ordering::SeqCst);
+        let _ = self.gate.send(false);
+        let r = self.reconcile().await;
+        let _ = self.gate.send(true);
+        let r = r?;
+        tracing::warn!(
+            removed = r.deleted.len(),
+            "released: removed what nothing lists here"
+        );
+        Ok(ReleaseReport {
+            was_held: true,
+            removed: r.deleted.len() as u64,
+            unlisted: unlisted.len() as u64,
+        })
+    }
+
+    /// Objects in this host's stores that nothing lists here.
+    async fn unlisted(&self) -> anyhow::Result<Vec<(StoreId, ObjectKey)>> {
+        let meta = self.meta().clone();
+        let me = self.id;
+        let mut stores: Vec<(StoreId, Arc<ObjectStore>)> =
+            vec![(me.live_store(), self.store.clone())];
+        stores.extend(self.disks().into_iter().map(|d| (d.id, d.store.clone())));
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let c = meta.open_reader()?;
+            let owned: HashSet<ObjectKey> = query::owned_by(&c, me)?
+                .into_iter()
+                .map(|a| ObjectKey::new(a.id, a.generation))
+                .collect();
+            let mut out = Vec::new();
+            for (id, st) in stores {
+                let listed: HashSet<ObjectKey> = query::store_inventory(&c, id)?
+                    .into_iter()
+                    .map(|(f, g)| ObjectKey::new(f, g))
+                    .collect();
+                for o in st.scan()? {
+                    if !listed.contains(&o.key) && !owned.contains(&o.key) {
+                        out.push((id, o.key));
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
     /// Wire up the meta node, reconcile local objects with committed
     /// metadata, open the workers, and start background duties.
     /// Start serving on top of `meta`. With `trust_local` the local metadata
@@ -870,6 +984,7 @@ impl DataNode {
         let me = self.id;
         let disks: Vec<Arc<Archive>> = self.disks();
         let m2 = meta.clone();
+        let held = self.held();
         // Each usable disk first (ADR-073); copies on a disk that is not
         // mounted stay listed and unread until it is back. A disk keeps the
         // working objects of files written there (ADR-077), so the
@@ -879,9 +994,11 @@ impl DataNode {
         let mut disk_report = ReconcileReport::default();
         for d in disks {
             let (m, st, id) = (m2.clone(), d.store.clone(), d.id);
-            match tokio::task::spawn_blocking(move || reconcile_disk(&m, &st, id, me)).await? {
+            match tokio::task::spawn_blocking(move || reconcile_disk(&m, &st, id, me, held)).await?
+            {
                 Ok((r, working)) => {
                     disk_report.kept += r.kept;
+                    disk_report.held += r.held;
                     disk_report.deleted.extend(r.deleted.iter().copied());
                     disk_missing.extend(r.missing.into_iter().map(|k| (id, k)));
                     on_disks.extend(working.into_iter().map(|k| (k, id)));
@@ -890,10 +1007,20 @@ impl DataNode {
             }
         }
         let elsewhere: HashSet<ObjectKey> = on_disks.keys().copied().collect();
-        let mut report =
-            tokio::task::spawn_blocking(move || reconcile_blocking(&meta, &store, me, &elsewhere))
-                .await??;
+        let mut report = tokio::task::spawn_blocking(move || {
+            reconcile_blocking(&meta, &store, me, &elsewhere, held)
+        })
+        .await??;
         report.kept += disk_report.kept;
+        report.held += disk_report.held;
+        self.held_objects
+            .store(report.held as u64, Ordering::Relaxed);
+        if report.held > 0 {
+            tracing::warn!(
+                objects = report.held,
+                "held: kept objects nothing lists here (nest host release removes them)"
+            );
+        }
         report.deleted.extend(disk_report.deleted);
         self.retire_disk_missing(disk_missing);
         let mut st = self.st.lock();
@@ -1075,6 +1202,7 @@ fn reconcile_blocking(
     store: &ObjectStore,
     me: NodeId,
     elsewhere: &HashSet<ObjectKey>,
+    held: bool,
 ) -> anyhow::Result<ReconcileReport> {
     let c = meta.open_reader()?;
     let expected: HashSet<ObjectKey> = query::store_inventory(&c, me.live_store())?
@@ -1082,11 +1210,10 @@ fn reconcile_blocking(
         .map(|(f, g)| ObjectKey::new(f, g))
         .collect();
     let owned = query::owned_by(&c, me)?;
-    let archived = archived_keys(&c)?;
     drop(c);
     let disk: HashSet<ObjectKey> = store.scan()?.into_iter().map(|o| o.key).collect();
     let mut report = ReconcileReport::default();
-    let mut keep: HashSet<ObjectKey> = archived;
+    let mut keep: HashSet<ObjectKey> = HashSet::new();
     for a in &owned {
         let key = ObjectKey::new(a.id, a.generation);
         keep.insert(key);
@@ -1113,11 +1240,14 @@ fn reconcile_blocking(
     for k in &disk {
         if expected.contains(k) || keep.contains(k) {
             report.kept += 1;
-        } else if !report
+        } else if report
             .rekeyed
             .iter()
             .any(|r| r.file == k.file && r.generation.0 == k.generation.0 + 1)
         {
+        } else if held {
+            report.held += 1;
+        } else {
             store.delete(*k)?;
             report.deleted.push(*k);
         }
@@ -1132,15 +1262,6 @@ fn reconcile_blocking(
     Ok(report)
 }
 
-/// Objects an archive store lists: never swept from a host's folder, which
-/// may be that archive's (ADR-090, before the host adopts it).
-fn archived_keys(c: &rusqlite::Connection) -> anyhow::Result<HashSet<ObjectKey>> {
-    Ok(query::archive_inventory(c)?
-        .into_iter()
-        .map(|(f, g)| ObjectKey::new(f, g))
-        .collect())
-}
-
 /// A disk holds copies and the working objects of new files written to
 /// it (ADR-077): keep what metadata lists and what this host still owns,
 /// remove the rest, report what is missing. Returns the working objects
@@ -1150,6 +1271,7 @@ fn reconcile_disk(
     store: &ObjectStore,
     id: StoreId,
     me: NodeId,
+    held: bool,
 ) -> anyhow::Result<(ReconcileReport, Vec<ObjectKey>)> {
     let c = meta.open_reader()?;
     let expected: HashSet<ObjectKey> = query::store_inventory(&c, id)?
@@ -1160,17 +1282,18 @@ fn reconcile_disk(
         .into_iter()
         .map(|a| ObjectKey::new(a.id, a.generation))
         .collect();
-    let archived = archived_keys(&c)?;
     drop(c);
     let disk: HashSet<ObjectKey> = store.scan()?.into_iter().map(|o| o.key).collect();
     let mut report = ReconcileReport::default();
     let mut working = Vec::new();
     for k in &disk {
-        if expected.contains(k) || archived.contains(k) {
+        if expected.contains(k) {
             report.kept += 1;
         } else if owned.contains(k) {
             report.kept += 1;
             working.push(*k);
+        } else if held {
+            report.held += 1;
         } else {
             store.delete(*k)?;
             report.deleted.push(*k);

@@ -1252,6 +1252,52 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/cluster/release:
+    post:
+      tags: [cluster]
+      summary: Release a held host
+      description: >-
+        A host holds itself when it first starts on a folder that already
+        has objects (ADR-090): it keeps anything the metadata does not list
+        in its stores. Releasing removes its `HOLD` file and sweeps once,
+        removing what nothing lists there. Refused until the host has caught
+        up. A dry run only counts it.
+      operationId: clusterRelease
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [host]
+              properties:
+                host:
+                  type: string
+                dry_run:
+                  type: boolean
+      responses:
+        "200":
+          description: What it found and removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [host, dry_run, was_held, unlisted, removed]
+                properties:
+                  host:
+                    type: string
+                  dry_run:
+                    type: boolean
+                  was_held:
+                    type: boolean
+                  unlisted:
+                    type: integer
+                    description: Objects nothing listed in its stores.
+                  removed:
+                    type: integer
+        default:
+          $ref: "#/components/responses/Error"
+
   /v1/stores/adopt:
     post:
       tags: [stores]
@@ -2768,6 +2814,14 @@ components:
           maxItems: 7
           items:
             type: integer
+        held:
+          type: boolean
+          description: >-
+            Held (ADR-090): keeping objects the metadata does not list in
+            its stores until `POST /v1/cluster/release`.
+        held_objects:
+          type: integer
+          description: Objects its last sweep kept only because it is held.
 
     IoWindow:
       type: object

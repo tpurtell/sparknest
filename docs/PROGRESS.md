@@ -15,11 +15,13 @@ its own replica into `<state_dir>/backups/meta/`. `nest store adopt FROM
 INTO` hands an archive's copies to the host whose folder already holds
 them, in one metadata step, after the host confirms it sees the archive's
 marker and a gateway checks every object's size; then the archive is gone.
-Hosts keep objects an archive lists in every sweep and fsck, so the NAS
-can start on the folder before the adoption; a new host with objects in
-its state dir catches up before judging them. Tests: the metadata
-command's refusals, the whole adoption with restarts on both sides of it,
-and backups landing on the chosen hosts. Needs 0.8.7 on every host.
+A host whose first start finds objects already in its state dir holds
+itself (`<state_dir>/HOLD`): it removes nothing for being unlisted until
+`nest cluster release`, which adopt runs at the end. Tests: the metadata
+command's refusals, the whole adoption (held first start and restart, a
+wrong host and a missing object refused, release, reads from another
+host, a stray swept once released), and backups landing on the chosen
+hosts. Needs 0.8.7 on every host.
 
 ## 2026-11-17 — Hugging Face downloads: plain HTTP ranges, slow connections replaced
 

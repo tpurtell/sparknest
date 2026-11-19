@@ -3184,25 +3184,36 @@ the archive's copies.
    before 0.8.7 cannot decode it, so it is refused until every host runs
    0.8.7 or later (a dry run is not). A copy offloaded between the check
    and the command is adopted unchecked; the host's next fsck checks it.
-3. **A host never sweeps an archive's copy.** The live store's and the
-   disks' sweeps, and fsck's orphan pass, keep any object an archive store
-   lists. So a host can start on an archive's folder before adopting it.
-   Once a copy is retired from the archive, the next sweep removes it as
-   before.
-4. **A new host with objects in its state dir** (no metadata applied yet)
-   starts as a recovering one: it catches up first, then fsck keeps what
-   the cluster lists there and quarantines the rest. Nothing is deleted
-   for want of metadata it has not received.
+3. **Held hosts (amended before release, 2026-11-19).** A host whose
+   first start (no metadata applied yet) finds objects already in its
+   state dir holds itself, recorded as `<state_dir>/HOLD`: a store's
+   folder brought to it (this NAS), a disk moved to it, a re-imaged host
+   on its old disk. While held it runs normally (catches up, serves what
+   is listed as its own, deletes copies retired from it) but never removes
+   an object for being unlisted: its startup sweeps and fsck count and
+   report those instead (`nest status` shows it held, with the count).
+   `nest cluster release HOST` (appended admin request `Release`; `--dry-run`
+   counts) takes a linearizable barrier, so it judges against everything
+   committed before it, removes `HOLD` and sweeps once. `nest store adopt`
+   ends by releasing the host it adopted into. There is no config option:
+   creating `HOLD` by hand holds a host, and releasing leaves nothing to
+   edit.
 
 **Alternatives.** Adding the host as a second gateway of the archive and
 keeping the archive (two paths to one folder, and the store stays an
 archive forever); per-gateway paths (needed only for that); hard-linking
 the objects into a separate host folder before publishing them as the
-host's (a second folder for no reason, once the sweep keeps archive
-copies); a backup-hosts setting (settings are numbers; a group already
-names hosts).
+host's (a second folder for no reason); every host's sweep keeping
+whatever any archive lists (first built: it fits only this migration,
+costs every sweep a look at every archive, and keeps objects silently); a
+new host with objects starting as a recovering one (its fsck would then
+quarantine the very objects it is about to adopt); a `hold` option in
+node.toml (a second place to turn off after release); a backup-hosts
+setting (settings are numbers; a group already names hosts).
 
 **Consequences.** The NAS joins as a standard off-grid host with its
-state dir on the `models` dataset, then `nest store adopt models aviary`;
-raptor stops touching the share. Metadata backups no longer depend on any
-archive. A host's sweep reads the archives' inventory once per pass.
+state dir on the `models` dataset (it starts held), then `nest store adopt
+models aviary` (which releases it); raptor stops touching the share.
+Metadata backups no longer depend on any archive. A held host that is
+never released keeps what it should have removed: harmless, but it costs
+space, so status shows it.

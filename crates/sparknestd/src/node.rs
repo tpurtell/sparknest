@@ -173,22 +173,6 @@ impl Node {
             crate::recovery::decide(&cfg, &rpc, &hello, &local, tuning.recovery_grace).await?;
         let mut trust_local = !prior.dirty();
         let mut quarantine = false;
-        // A host with no metadata yet whose state dir already holds objects
-        // (a store's folder adopted by this host, ADR-090; a disk moved
-        // here): its empty local metadata must never judge them. It catches
-        // up first, then fsck keeps what the cluster lists here and
-        // quarantines the rest; nothing is deleted.
-        if local.applied.is_none()
-            && nest_store::ObjectStore::open(&cfg.node.state_dir)
-                .and_then(|s| s.scan())
-                .is_ok_and(|o| !o.is_empty())
-        {
-            tracing::warn!(
-                "new host with objects already in its state dir: catching up before it looks at them"
-            );
-            trust_local = false;
-            quarantine = true;
-        }
         match &outcome {
             crate::recovery::Outcome::Normal => {}
             crate::recovery::Outcome::Join(_) => {
@@ -213,7 +197,28 @@ impl Node {
                 .window(4),
         );
         store.set_reserve(cfg.node.data_reserve_gib << 30);
+        // Held (ADR-090): a first start (no metadata yet) on a folder that
+        // already holds objects, which nothing here can judge yet: a store's
+        // folder brought to this host. `<state_dir>/HOLD` records it across
+        // restarts until `nest host release` removes it; creating the file
+        // by hand holds a host too. Set before the first sweep.
+        let hold_file = cfg.node.state_dir.join(nest_data::HOLD_FILE);
+        let first_on_objects = local.applied.is_none() && store.scan().is_ok_and(|o| !o.is_empty());
+        if first_on_objects && !hold_file.exists() {
+            std::fs::write(
+                &hold_file,
+                "held: objects not listed here are kept until `nest host release`\n",
+            )
+            .context("writing the HOLD file")?;
+        }
+        let held = hold_file.exists();
+        if held {
+            tracing::warn!(
+                "held: nothing in this host's stores is removed for being unlisted until `nest host release`"
+            );
+        }
         let (data, handler) = DataNode::new(id, store, tuning.lease);
+        data.set_held(held);
         let mut mc = MetaNodeConfig::new(id, cfg.node.state_dir.clone(), cfg.cluster.name.clone());
         mc.heartbeat_ms = tuning.heartbeat_ms;
         mc.election_min_ms = tuning.election_min_ms;

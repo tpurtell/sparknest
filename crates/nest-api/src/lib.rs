@@ -244,6 +244,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/cluster/remove", post(cluster_remove))
         .route("/v1/cluster/role", post(cluster_role))
         .route("/v1/cluster/add", post(cluster_add))
+        .route("/v1/cluster/release", post(cluster_release))
         .with_state(api)
 }
 
@@ -1634,6 +1635,29 @@ async fn add_store(State(api): State<Api>, Json(r): Json<AddStoreReq>) -> R<serd
         .map(|(g, r)| json!({ "gateway": g, "ok": r.is_ok(), "error": r.err() }))
         .collect();
     Ok(Json(json!({ "name": r.name, "gateways": gateways })))
+}
+
+#[derive(Deserialize)]
+struct ReleaseReq {
+    host: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Release a held host (ADR-090): it removes what nothing lists in its
+/// stores (a dry run only counts it).
+async fn cluster_release(
+    State(api): State<Api>,
+    Json(r): Json<ReleaseReq>,
+) -> R<serde_json::Value> {
+    let rep = api.placer.release_host(&r.host, r.dry_run).await?;
+    Ok(Json(json!({
+        "host": r.host,
+        "dry_run": r.dry_run,
+        "was_held": rep.was_held,
+        "unlisted": rep.unlisted,
+        "removed": rep.removed,
+    })))
 }
 
 #[derive(Deserialize)]

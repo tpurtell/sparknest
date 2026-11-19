@@ -377,18 +377,10 @@ impl Vfs {
             report.findings.push(Finding { issue, action });
         }
 
-        // Objects on disk that nothing refers to. An archive's copy is
-        // referred to: this folder may be that archive's, before this host
-        // adopts it (ADR-090).
-        let archived: HashSet<ObjectKey> = self
-            .q(query::archive_inventory)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(f, g)| ObjectKey::new(f, g))
-            .collect();
+        // Objects on disk that nothing refers to.
         let now = Timestamp::now();
         for (&key, &size) in &disk {
-            if expected.contains(&key) || working.contains(&key) || archived.contains(&key) {
+            if expected.contains(&key) || working.contains(&key) {
                 continue;
             }
             let fresh = store
@@ -423,7 +415,10 @@ impl Vfs {
                 size,
                 note,
             };
+            // A held host (ADR-090) keeps them until it is released.
+            let held = self.data().held();
             let action = match (opts.repair, opts.orphans) {
+                _ if held => Action::Reported,
                 (false, _) | (_, Orphans::Report) => Action::Reported,
                 (true, Orphans::Delete) => match store.delete(key) {
                     Ok(_) => Action::Deleted,
