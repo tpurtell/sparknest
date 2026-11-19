@@ -1056,7 +1056,9 @@ fn print_net(v: &serde_json::Value) {
     };
     for h in &hosts {
         let host = h["name"].as_str().unwrap_or("?");
-        let Some(r) = h["report"].as_object() else {
+        // Index the Value (null for a missing key), never the Map (panics).
+        let r = &h["report"];
+        if !r.is_object() {
             println!(
                 "{host}: {}",
                 h["error"]
@@ -1064,7 +1066,7 @@ fn print_net(v: &serde_json::Value) {
                     .unwrap_or("no answer (older than 0.5.0?)")
             );
             continue;
-        };
+        }
         let leader = r["leader"]
             .as_u64()
             .and_then(|l| names.get(&l).cloned())
@@ -1233,7 +1235,8 @@ async fn wait_job(c: &Client, id: u64) -> Result<Value> {
                 );
             }
         }
-        if let Some(ip) = v["import"].as_object() {
+        let ip = &v["import"];
+        if ip.is_object() {
             if ip["spread_files"].as_u64().unwrap_or(0) + ip["kept_files"].as_u64().unwrap_or(0) > 0
             {
                 line += &format!(
@@ -1294,8 +1297,12 @@ async fn main() -> Result<()> {
                     "host", "serving", "free", "total", "objects", "stored"
                 );
                 for n in v["nodes"].as_array().into_iter().flatten() {
-                    match n["info"].as_object() {
-                        Some(i) => println!(
+                    // Index the Value, not the Map: a key an older host does
+                    // not send (held, before 0.9.0) reads as null instead of
+                    // panicking.
+                    let i = &n["info"];
+                    match i.as_object() {
+                        Some(_) => println!(
                             "{:<9} {:<8} {:>10} {:>10} {:>8} {:>10}  {}",
                             n["name"].as_str().unwrap_or("?"),
                             match (

@@ -331,8 +331,8 @@ fn run_queue(
         }
     };
     let registered = (|| -> io::Result<()> {
-        for slot in 0..DEPTH {
-            let e = ring_cmd(fd, CMD_REGISTER, &q.iovs[slot], 0, qid, slot);
+        for (slot, iov) in q.iovs.iter().enumerate() {
+            let e = ring_cmd(fd, CMD_REGISTER, iov, 0, qid, slot);
             // SAFETY: the iovecs and buffers outlive the command.
             unsafe { ring.submission().push(&e) }.map_err(|_| io::Error::other("SQ full"))?;
         }

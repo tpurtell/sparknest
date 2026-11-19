@@ -11,6 +11,14 @@ hosts and `nest cluster release`) and the container image
 release). The adoption's new metadata command needs every host on 0.9.0,
 so this release rolls with restarts.
 
+Rolled 2026-11-19/20 through hwlock: cassowary, kakapo, maxq, the six
+Sparks, raptor last (05:15). Every host came back serving, none held, none
+deleted an object. Mid-roll, the 0.9.0 `nest status` panicked against a
+0.8.6 daemon: it indexed the info `Map` (`i["held"]`), which panics on a
+missing key, where indexing the `Value` reads null. Fixed in the CLI (the
+fabric report and import progress had the same pattern); it ships in the
+next release.
+
 ## 2026-11-19 — Metadata backups on hosts; `nest store adopt` (ADR-090)
 
 Groundwork for running sparknestd on the NAS (aviary, a QNAP 855X: Atom

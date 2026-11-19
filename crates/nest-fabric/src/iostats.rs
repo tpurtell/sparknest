@@ -117,18 +117,16 @@ impl IoStats {
 
     fn snap(&self) -> Snap {
         let mut cells = Vec::with_capacity(9);
-        for k in 0..3 {
-            for c in 0..3 {
-                let x = &self.cells[k][c];
-                let mut v = [0u64; BUCKETS + 3];
-                v[0] = x.count.load(Relaxed);
-                v[1] = x.bytes.load(Relaxed);
-                v[2] = x.us.load(Relaxed);
-                for (i, b) in x.buckets.iter().enumerate() {
-                    v[3 + i] = b.load(Relaxed);
-                }
-                cells.push(v);
+        // Row-major, as before: [k][c] in order.
+        for x in self.cells.iter().flatten() {
+            let mut v = [0u64; BUCKETS + 3];
+            v[0] = x.count.load(Relaxed);
+            v[1] = x.bytes.load(Relaxed);
+            v[2] = x.us.load(Relaxed);
+            for (i, b) in x.buckets.iter().enumerate() {
+                v[3 + i] = b.load(Relaxed);
             }
+            cells.push(v);
         }
         Snap {
             at: Instant::now(),

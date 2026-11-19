@@ -370,10 +370,8 @@ async fn call(
         Ok(r) => r,
         Err(e) => return (400, json!({ "error": e.to_string() })),
     };
-    let resp = match router.oneshot(req).await {
-        Ok(r) => r,
-        Err(e) => return (500, json!({ "error": e.to_string() })),
-    };
+    // axum's Router never fails (its error type is Infallible).
+    let Ok(resp) = router.oneshot(req).await;
     let status = resp.status().as_u16();
     let bytes = axum::body::to_bytes(resp.into_body(), 256 << 20)
         .await
