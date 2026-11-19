@@ -1018,7 +1018,7 @@ impl DataNode {
         if report.held > 0 {
             tracing::warn!(
                 objects = report.held,
-                "held: kept objects nothing lists here (nest host release removes them)"
+                "held: kept objects nothing lists here (nest cluster release removes them)"
             );
         }
         report.deleted.extend(disk_report.deleted);

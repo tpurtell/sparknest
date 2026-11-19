@@ -200,21 +200,21 @@ impl Node {
         // Held (ADR-090): a first start (no metadata yet) on a folder that
         // already holds objects, which nothing here can judge yet: a store's
         // folder brought to this host. `<state_dir>/HOLD` records it across
-        // restarts until `nest host release` removes it; creating the file
+        // restarts until `nest cluster release` removes it; creating the file
         // by hand holds a host too. Set before the first sweep.
         let hold_file = cfg.node.state_dir.join(nest_data::HOLD_FILE);
         let first_on_objects = local.applied.is_none() && store.scan().is_ok_and(|o| !o.is_empty());
         if first_on_objects && !hold_file.exists() {
             std::fs::write(
                 &hold_file,
-                "held: objects not listed here are kept until `nest host release`\n",
+                "held: objects not listed here are kept until `nest cluster release`\n",
             )
             .context("writing the HOLD file")?;
         }
         let held = hold_file.exists();
         if held {
             tracing::warn!(
-                "held: nothing in this host's stores is removed for being unlisted until `nest host release`"
+                "held: nothing in this host's stores is removed for being unlisted until `nest cluster release`"
             );
         }
         let (data, handler) = DataNode::new(id, store, tuning.lease);
