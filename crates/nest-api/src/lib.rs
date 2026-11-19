@@ -192,6 +192,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/import", post(import))
         .route("/v1/stores", get(stores).post(add_store))
+        .route("/v1/stores/adopt", post(adopt_store))
         .route("/v1/disks", get(disks).post(add_disk))
         .route("/v1/disks/{name}", delete(remove_disk))
         .route("/v1/disks/{name}/drain", post(drain_disk))
@@ -1635,6 +1636,29 @@ async fn add_store(State(api): State<Api>, Json(r): Json<AddStoreReq>) -> R<serd
     Ok(Json(json!({ "name": r.name, "gateways": gateways })))
 }
 
+#[derive(Deserialize)]
+struct AdoptStoreReq {
+    from: String,
+    into: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Give an archive store's copies to a host's store whose folder already
+/// holds them, and forget the archive (ADR-090).
+async fn adopt_store(State(api): State<Api>, Json(r): Json<AdoptStoreReq>) -> R<serde_json::Value> {
+    if !r.dry_run {
+        require_every_host_upgraded(&api, "adopting a store").await?;
+    }
+    let copies = api.placer.adopt_store(&r.from, &r.into, r.dry_run).await?;
+    Ok(Json(json!({
+        "from": r.from,
+        "into": r.into,
+        "copies": copies,
+        "dry_run": r.dry_run,
+    })))
+}
+
 /// Every host's stores: its live store and extra disks (ADR-073).
 async fn disks(State(api): State<Api>) -> R<serde_json::Value> {
     let hosts: Vec<serde_json::Value> = api
@@ -2146,13 +2170,29 @@ async fn backup_delete(State(api): State<Api>, Path(id): Path<u64>) -> R<serde_j
 
 #[derive(Deserialize)]
 struct MetaReq {
-    store: String,
+    /// An archive store to snapshot into; without it, the backup hosts
+    /// (ADR-090).
+    #[serde(default)]
+    store: Option<String>,
 }
 
 async fn meta_snapshot(State(api): State<Api>, Json(r): Json<MetaReq>) -> R<serde_json::Value> {
-    Ok(Json(
-        json!({ "snapshot": api.placer.meta_snapshot(&r.store).await? }),
-    ))
+    if let Some(store) = r.store {
+        return Ok(Json(
+            json!({ "snapshot": api.placer.meta_snapshot(&store).await? }),
+        ));
+    }
+    let hosts: Vec<serde_json::Value> = api
+        .placer
+        .meta_backup()
+        .await?
+        .into_iter()
+        .map(|(host, r)| match r {
+            Ok(path) => json!({ "host": host, "path": path, "error": null }),
+            Err(e) => json!({ "host": host, "path": null, "error": e }),
+        })
+        .collect();
+    Ok(Json(json!({ "hosts": hosts })))
 }
 
 /// A goal (`{"goal": "free" | "tidy" | "speedup", ...}`), or the older

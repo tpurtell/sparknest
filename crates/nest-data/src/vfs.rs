@@ -860,6 +860,7 @@ impl Vfs {
             e,
             Effect::ReplicaInvalidated { .. }
                 | Effect::ReplicaPublished { .. }
+                | Effect::StoreAdopted { .. }
                 | Effect::Finalized { .. }
                 | Effect::OwnershipGranted { .. }
                 | Effect::FileDeleted { .. }

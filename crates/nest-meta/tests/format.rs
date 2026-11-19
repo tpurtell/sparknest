@@ -272,6 +272,13 @@ fn format_is_pinned() {
             "SetSetting",
         ),
         (Command::DeleteStore { store: StoreId(1) }, "DeleteStore"),
+        (
+            Command::AdoptStore {
+                from: StoreId(1 << 20),
+                into: StoreId(1),
+            },
+            "AdoptStore",
+        ),
     ];
     for (i, (c, name)) in cmds.iter().enumerate() {
         assert_eq!(tag(c) as usize, i, "Command::{name} moved");

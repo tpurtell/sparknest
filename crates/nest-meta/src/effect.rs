@@ -73,4 +73,11 @@ pub enum Effect {
         generation: Generation,
         store: StoreId,
     },
+    /// Every copy recorded in the archive `from` now belongs to `into`
+    /// (ADR-090). The objects did not move: nobody deletes anything for
+    /// it; views and caches of where copies live refresh.
+    StoreAdopted {
+        from: StoreId,
+        into: StoreId,
+    },
 }

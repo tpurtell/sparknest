@@ -377,10 +377,18 @@ impl Vfs {
             report.findings.push(Finding { issue, action });
         }
 
-        // Objects on disk that nothing refers to.
+        // Objects on disk that nothing refers to. An archive's copy is
+        // referred to: this folder may be that archive's, before this host
+        // adopts it (ADR-090).
+        let archived: HashSet<ObjectKey> = self
+            .q(query::archive_inventory)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(f, g)| ObjectKey::new(f, g))
+            .collect();
         let now = Timestamp::now();
         for (&key, &size) in &disk {
-            if expected.contains(&key) || working.contains(&key) {
+            if expected.contains(&key) || working.contains(&key) || archived.contains(&key) {
                 continue;
             }
             let fresh = store

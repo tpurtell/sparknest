@@ -659,6 +659,115 @@ fn stores_register() {
 }
 
 #[test]
+fn a_host_adopts_an_archive_and_the_archive_is_gone() {
+    let mut db = Db::new();
+    let reg =
+        |db: &mut Db, name: &str, class, node: Option<u64>| match db.ok(Command::RegisterStore {
+            name: name.into(),
+            class,
+            node: node.map(NodeId),
+            config: "{}".into(),
+        }) {
+            Reply::Store(id) => id,
+            r => panic!("{r:?}"),
+        };
+    let host = reg(&mut db, "aviary", nest_meta::StoreClass::Live, Some(8));
+    let nas = reg(&mut db, "models", nest_meta::StoreClass::Archive, None);
+    let other = reg(&mut db, "scratch", nest_meta::StoreClass::Archive, None);
+    let a = db.file(FileId::ROOT, "a", 1, 10).id;
+    let b = db.file(FileId::ROOT, "b", 1, 10).id;
+    for f in [a, b] {
+        db.ok(Command::PublishReplica {
+            file: f,
+            generation: Generation(1),
+            store: nas,
+        });
+    }
+
+    // Only an archive is adopted, and only by a host's store.
+    for (from, into) in [(host, nas), (nas, other), (nas, StoreId(99))] {
+        assert!(
+            db.run(Command::AdoptStore { from, into }).0.is_err(),
+            "{from:?} -> {into:?}"
+        );
+    }
+    // A store keeping backups is not adopted.
+    db.ok(Command::RecordBackup {
+        name: "b1".into(),
+        store: nas,
+        selector: "/".into(),
+        files: 0,
+        bytes: 0,
+        now: Timestamp(1),
+    });
+    assert!(matches!(
+        db.run(Command::AdoptStore {
+            from: nas,
+            into: host
+        })
+        .0,
+        Err(NestError::Busy(_))
+    ));
+    let backup: i64 =
+        db.c.query_row(
+            "SELECT id FROM backups WHERE store = ?1",
+            [nas.0 as i64],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.ok(Command::DeleteBackup { id: backup as u64 });
+
+    // A file with a copy in both already: refused, nothing changes.
+    db.ok(Command::PublishReplica {
+        file: b,
+        generation: Generation(1),
+        store: host,
+    });
+    assert!(matches!(
+        db.run(Command::AdoptStore {
+            from: nas,
+            into: host
+        })
+        .0,
+        Err(NestError::Busy(_))
+    ));
+    // (Each file also has the copy its writer, node 1, made.)
+    assert_eq!(db.stores(a), vec![1, nas.0]);
+    db.ok(Command::RetireReplica {
+        file: b,
+        generation: Generation(1),
+        store: host,
+        allow_last: false,
+    });
+
+    // Adopted: every copy is the host's, the archive is gone, and nothing
+    // asks anyone to delete an object.
+    let (r, fx) = db.run(Command::AdoptStore {
+        from: nas,
+        into: host,
+    });
+    assert_eq!(r, Ok(Reply::Done));
+    assert_eq!(
+        fx,
+        vec![Effect::StoreAdopted {
+            from: nas,
+            into: host
+        }]
+    );
+    assert_eq!(db.stores(a), vec![1, host.0]);
+    assert_eq!(db.stores(b), vec![1, host.0]);
+    assert!(query::stores(&db.c).unwrap().iter().all(|s| s.id != nas));
+    assert_eq!(
+        db.run(Command::AdoptStore {
+            from: nas,
+            into: host
+        })
+        .0,
+        Err(NestError::NotFound)
+    );
+}
+
+#[test]
 fn disks_are_numbered_per_host_and_never_reused() {
     let mut db = Db::new();
     let disk = |db: &mut Db, name: &str, node: u64| {

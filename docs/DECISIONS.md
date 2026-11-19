@@ -3141,3 +3141,68 @@ hf's private `_shared_blobs` helpers; a change there makes the direct
 path fail, and the file falls back to hf rather than landing wrong.
 Measured: the 4.96 GB file in 136 s (36 MB/s) on raptor, against 16 min
 through hf_xet the same afternoon.
+
+## ADR-090 — Metadata backups live on hosts; a host adopts the archive in its folder (2026-11-19)
+
+**Context.** The `models` archive is the NAS's share, reached by raptor
+over SMB. The NAS can run sparknestd itself as an off-grid host (Docker,
+the same layout as kakapo), serving its disks directly over TCP. Its store
+would be the folder the archive already uses: the objects are where they
+need to be, and only the metadata should change. Two things stood in the
+way. The leader's 6-hourly metadata snapshots went only into archive
+stores (because those were the only shared folders when they were
+written, ADR-056), so losing the archive would lose them. And a host
+sweeps any object in its folder that the metadata does not list as its
+own: started on the archive's folder before the change, it would delete
+the archive's copies.
+
+**Decision.**
+1. **Metadata backups go to hosts.** Every 6 hours the leader asks each
+   backup host to write one from its own replica (`VACUUM INTO`, built in
+   `tmp-sqlite/`, then renamed into place) into `<state_dir>/backups/meta/`,
+   keeping 14. The backup hosts are the members of the `meta-backups`
+   group, else the three answering hosts with the most free space; any
+   host qualifies, on or off the fabric. Only the request crosses the
+   network. `nest backup meta` does it now; `--store` still writes into
+   an archive. `MetaBackupHere` is an appended admin request (older hosts
+   refuse it, and are skipped).
+2. **`nest store adopt FROM INTO`.** An archive store's copies become a
+   host's store's (`INTO`: a host, its primary, or `host:dN`, a disk),
+   and the archive is forgotten, when the archive's folder already is
+   where that store keeps its objects. The adopting host first confirms
+   the archive's marker is in that folder (`AdoptHere`, appended): it sees
+   the very folder the gateway reaches, under whatever path. A gateway of
+   the archive then checks every recorded object is in the folder with
+   its size (`CheckArchive`, appended); any miss stops it with nothing
+   changed. After the command the host removes the marker: a live store
+   has none, so the folder ends up like any host's.
+   Then one appended command, `AdoptStore { from, into }`, reassigns every
+   copy and deletes the archive's row, refused while the archive keeps
+   backups or if both stores list a copy of the same generation. It emits
+   `StoreAdopted`, which refreshes replica views and drops gateways'
+   handles on the archive, and asks nobody to delete anything. Hosts
+   before 0.8.7 cannot decode it, so it is refused until every host runs
+   0.8.7 or later (a dry run is not). A copy offloaded between the check
+   and the command is adopted unchecked; the host's next fsck checks it.
+3. **A host never sweeps an archive's copy.** The live store's and the
+   disks' sweeps, and fsck's orphan pass, keep any object an archive store
+   lists. So a host can start on an archive's folder before adopting it.
+   Once a copy is retired from the archive, the next sweep removes it as
+   before.
+4. **A new host with objects in its state dir** (no metadata applied yet)
+   starts as a recovering one: it catches up first, then fsck keeps what
+   the cluster lists there and quarantines the rest. Nothing is deleted
+   for want of metadata it has not received.
+
+**Alternatives.** Adding the host as a second gateway of the archive and
+keeping the archive (two paths to one folder, and the store stays an
+archive forever); per-gateway paths (needed only for that); hard-linking
+the objects into a separate host folder before publishing them as the
+host's (a second folder for no reason, once the sweep keeps archive
+copies); a backup-hosts setting (settings are numbers; a group already
+names hosts).
+
+**Consequences.** The NAS joins as a standard off-grid host with its
+state dir on the `models` dataset, then `nest store adopt models aviary`;
+raptor stops touching the share. Metadata backups no longer depend on any
+archive. A host's sweep reads the archives' inventory once per pass.

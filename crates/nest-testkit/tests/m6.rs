@@ -753,3 +753,196 @@ async fn cancel_stops_a_file_mid_copy() {
     })
     .await;
 }
+
+/// ADR-090: an archive whose folder becomes a host's state dir (a NAS that
+/// runs sparknest itself) is adopted by that host. Only the metadata
+/// changes; the host keeps every object, before and after the adoption,
+/// and serves them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_host_adopts_the_archive_in_its_own_folder() {
+    let mut c = ready(3).await;
+    c.add_offgrid(4).await;
+    c.eventually("n4 serving", Duration::from_secs(8), |c| {
+        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
+    })
+    .await;
+    c.eventually("n4 named", Duration::from_secs(8), |c| {
+        c.node(1)
+            .placer
+            .nodes()
+            .is_ok_and(|v| v.iter().any(|h| h.name == "n4"))
+    })
+    .await;
+    // The archive lives in n4's state dir and n1 reaches it (raptor over
+    // SMB, with the NAS's folder).
+    let folder = c.state_dir(4);
+    let p = c.node(1).placer.clone();
+    let r = p
+        .add_store("nas", folder.to_str().unwrap(), &["n1".into()])
+        .await
+        .unwrap();
+    assert!(r.iter().all(|(_, r)| r.is_ok()), "{r:?}");
+    let nas = p.stores().await.unwrap()[0].id;
+
+    // Two files live only in the archive.
+    let v2 = &c.node(2).vfs;
+    let mut files = Vec::new();
+    for (name, byte) in [("a.bin", 7u8), ("b.bin", 9u8)] {
+        let (a, fh, _) = v2
+            .create(FileId::ROOT, name.as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        v2.write(fh, 0, vec![byte; 3 << 20]).await.unwrap();
+        v2.release(fh, None).await;
+        files.push((a.id, byte));
+    }
+    c.eventually("stable", Duration::from_secs(5), |c| {
+        files.iter().all(|(f, _)| {
+            c.attr(1, *f)
+                .is_some_and(|x| x.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    for name in ["/a.bin", "/b.bin"] {
+        let sel = Selector::parse(name, "/hub").unwrap();
+        let j = wait_job(&c, p.offload(sel, "nas".into(), 4).await.unwrap()).await;
+        assert!(j.error.is_none(), "{j:?}");
+    }
+    c.converge().await;
+    for (f, _) in &files {
+        assert_eq!(stores_of(&c, *f), vec![nas.0]);
+    }
+
+    // n4 restarts before the adoption: the archive's objects sit in its
+    // objects/, unlisted as its own, and must survive.
+    c.stop(4).await;
+    c.restart(4).await;
+    c.eventually("n4 back", Duration::from_secs(8), |c| {
+        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
+    })
+    .await;
+    for (f, _) in &files {
+        let a = c.attr(1, *f).unwrap();
+        assert!(
+            c.node(4)
+                .data
+                .store()
+                .exists(nest_store::ObjectKey::new(*f, a.generation)),
+            "n4's start removed an archive object"
+        );
+    }
+
+    // A host that does not see the archive's folder (n3) cannot adopt it.
+    let e = p.adopt_store("nas", "n3", true).await.unwrap_err();
+    assert!(e.to_string().contains("no marker"), "{e}");
+    // A dry run only checks; a missing object stops it, changing nothing.
+    assert_eq!(p.adopt_store("nas", "n4", true).await.unwrap(), 2);
+    let (f0, _) = files[0];
+    let a0 = c.attr(1, f0).unwrap();
+    let obj = c
+        .node(4)
+        .data
+        .store()
+        .path(nest_store::ObjectKey::new(f0, a0.generation));
+    let aside = obj.with_extension("aside");
+    std::fs::rename(&obj, &aside).unwrap();
+    let e = p.adopt_store("nas", "n4", false).await.unwrap_err();
+    assert!(e.to_string().contains("not in its folder"), "{e}");
+    assert_eq!(stores_of(&c, f0), vec![nas.0]);
+    std::fs::rename(&aside, &obj).unwrap();
+
+    // Adopted: n4 holds them, the archive is gone.
+    assert_eq!(p.adopt_store("nas", "n4", false).await.unwrap(), 2);
+    c.converge().await;
+    for (f, _) in &files {
+        assert_eq!(stores_of(&c, *f), vec![4]);
+    }
+    assert!(p.stores().await.unwrap().is_empty());
+    // The folder is n4's own now, without the archive's marker.
+    assert!(!folder.join(nest_store::MARKER).exists());
+
+    // Read from a fabric host (n3 has no copy: n4 serves it), and n4 keeps
+    // them across another restart.
+    for (f, byte) in &files {
+        let v3 = &c.node(3).vfs;
+        let (fh, _) = v3.open(*f, 0).await.unwrap();
+        let b = v3.read(fh, (3 << 20) - 4, 16).await.unwrap();
+        assert_eq!(b, vec![*byte; 4]);
+        v3.release(fh, None).await;
+    }
+    c.stop(4).await;
+    c.restart(4).await;
+    c.eventually("n4 back again", Duration::from_secs(8), |c| {
+        c.node(4).data.caught_up() && c.node(4).data.session().is_some()
+    })
+    .await;
+    for (f, _) in &files {
+        let a = c.attr(1, *f).unwrap();
+        assert!(
+            c.node(4)
+                .data
+                .store()
+                .exists(nest_store::ObjectKey::new(*f, a.generation))
+        );
+    }
+}
+
+/// ADR-090: metadata backups go to hosts, into each one's own state dir:
+/// by default the hosts with the most room, else the `meta-backups`
+/// group. Each is a complete, readable copy of the metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn metadata_backups_land_on_the_chosen_hosts() {
+    let c = ready(4).await;
+    let p = c.node(1).placer.clone();
+    let v = &c.node(2).vfs;
+    let (a, fh, _) = v
+        .create(FileId::ROOT, b"kept.bin", 0o644, oflags::WRONLY)
+        .await
+        .unwrap();
+    v.write(fh, 0, b"in the backup".to_vec()).await.unwrap();
+    v.release(fh, None).await;
+    c.converge().await;
+
+    // No group: three hosts, each writing from its own replica.
+    let r = p.meta_backup().await.unwrap();
+    assert_eq!(r.len(), 3, "{r:?}");
+    for (host, out) in &r {
+        let path = out.as_ref().unwrap_or_else(|e| panic!("{host}: {e}"));
+        let id: u64 = host.trim_start_matches('n').parse().unwrap();
+        assert!(
+            path.starts_with(c.state_dir(id).join("backups/meta").to_str().unwrap()),
+            "{host} wrote {path}"
+        );
+        let db = rusqlite::Connection::open(path).unwrap();
+        let n: i64 = db
+            .query_row(
+                "SELECT count(*) FROM files WHERE id = ?1",
+                [a.id.0 as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{host}'s backup lacks the file");
+    }
+
+    // A group names them.
+    p.set_group(
+        nest_place::placer::META_BACKUP_GROUP,
+        vec!["n2".into(), "n4".into()],
+    )
+    .await
+    .unwrap();
+    let r = p.meta_backup().await.unwrap();
+    let hosts: Vec<&str> = r.iter().map(|(h, _)| h.as_str()).collect();
+    assert_eq!(hosts, ["n2", "n4"]);
+    assert!(r.iter().all(|(_, o)| o.is_ok()), "{r:?}");
+    // Each host keeps at most 14.
+    for _ in 0..15 {
+        p.meta_backup().await.unwrap();
+    }
+    let kept = std::fs::read_dir(c.state_dir(4).join("backups/meta"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("meta-"))
+        .count();
+    assert!(kept <= 14, "{kept} kept");
+}

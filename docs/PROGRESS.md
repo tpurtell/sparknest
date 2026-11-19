@@ -3,6 +3,24 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-19 — Metadata backups on hosts; `nest store adopt` (ADR-090)
+
+Groundwork for running sparknestd on the NAS (aviary, a QNAP 855X: Atom
+C5125, 128 GB, kernel 6.6, glibc 2.39, ZFS) as a standard off-grid host in
+Docker, with its state dir on the `models` dataset that already holds the
+`models` archive's 4.6 TiB of objects, so nothing is copied. Metadata
+backups no longer need an archive: the leader has each backup host (the
+`meta-backups` group, else the three with the most room) write one from
+its own replica into `<state_dir>/backups/meta/`. `nest store adopt FROM
+INTO` hands an archive's copies to the host whose folder already holds
+them, in one metadata step, after the host confirms it sees the archive's
+marker and a gateway checks every object's size; then the archive is gone.
+Hosts keep objects an archive lists in every sweep and fsck, so the NAS
+can start on the folder before the adoption; a new host with objects in
+its state dir catches up before judging them. Tests: the metadata
+command's refusals, the whole adoption with restarts on both sides of it,
+and backups landing on the chosen hosts. Needs 0.8.7 on every host.
+
 ## 2026-11-17 — Hugging Face downloads: plain HTTP ranges, slow connections replaced
 
 `nest hf download` had been crawling through hf_xet for months. Today a

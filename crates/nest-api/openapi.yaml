@@ -1252,10 +1252,65 @@ paths:
         default:
           $ref: "#/components/responses/Error"
 
+  /v1/stores/adopt:
+    post:
+      tags: [stores]
+      summary: Give an archive store's copies to a host's store, then forget the archive
+      description: >-
+        For an archive whose folder already is where a host (or one of its
+        disks) keeps its objects (ADR-090). A gateway of the archive checks
+        every recorded object is in the folder with its size; then one
+        metadata step hands every copy to `into` and removes the archive.
+        No bytes move. Needs every host on this version or later (409
+        otherwise), except for a dry run.
+      operationId: adoptStore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, into]
+              properties:
+                from:
+                  type: string
+                  description: The archive store.
+                into:
+                  type: string
+                  description: A host (its primary store) or a disk (`host:dN`).
+                dry_run:
+                  type: boolean
+                  description: Only check the folder.
+      responses:
+        "200":
+          description: Copies handed over (or that would be, in a dry run).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [from, into, copies, dry_run]
+                properties:
+                  from:
+                    type: string
+                  into:
+                    type: string
+                  copies:
+                    type: integer
+                  dry_run:
+                    type: boolean
+        default:
+          $ref: "#/components/responses/Error"
+
   /v1/backups/meta:
     post:
       tags: [stores]
-      summary: Snapshot the metadata into an archive store
+      summary: Write a metadata backup now
+      description: >-
+        Without `store`, each backup host (the `meta-backups` group's
+        members, else the three hosts with the most free space) writes one
+        from its own replica into `<state_dir>/backups/meta/`, as the leader
+        has them do every 6 hours (ADR-090). With `store`, a snapshot goes
+        into that archive store instead.
       operationId: metaSnapshot
       requestBody:
         required: true
@@ -1263,22 +1318,37 @@ paths:
           application/json:
             schema:
               type: object
-              required: [store]
               properties:
                 store:
                   type: string
+                  description: An archive store; omit for the backup hosts.
       responses:
         "200":
-          description: Where the snapshot was written.
+          description: >-
+            With `store`, where the snapshot was written (`snapshot`);
+            otherwise each backup host's outcome (`hosts`).
           content:
             application/json:
               schema:
                 type: object
-                required: [snapshot]
                 properties:
                   snapshot:
                     type: string
                     description: "`<store>:<path>`."
+                  hosts:
+                    type: array
+                    items:
+                      type: object
+                      required: [host, path, error]
+                      properties:
+                        host:
+                          type: string
+                        path:
+                          type: string
+                          nullable: true
+                        error:
+                          type: string
+                          nullable: true
         default:
           $ref: "#/components/responses/Error"
 

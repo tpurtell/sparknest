@@ -250,6 +250,31 @@ pub(crate) enum AdminReq {
     /// Bytes read so far from each of this host's stores (ADR-077), for
     /// per-disk rates. Answers `StoreReads`; older hosts with an error.
     StoreReads,
+    /// Write a metadata backup from this host's own replica into
+    /// `<state_dir>/backups/meta/`, keeping `keep` (ADR-090). Answers
+    /// `Path`; older hosts with an error.
+    MetaBackupHere {
+        keep: usize,
+    },
+    /// Check that each of these objects is in the archive store `store`'s
+    /// folder with this size, on this gateway (before an adoption,
+    /// ADR-090). Answers `Checked` with the ones that are not; older hosts
+    /// with an error.
+    CheckArchive {
+        store: StoreId,
+        files: Vec<(FileId, nest_types::Generation, u64)>,
+    },
+    /// On the host adopting the archive `store` into `into` (ADR-090): is
+    /// the archive's marker (`identity`) where `into` keeps its objects, so
+    /// this host sees the very folder the gateway checked? With `finish`,
+    /// remove that marker (after the adoption: the folder is the host's
+    /// now, and a live store has none). Answers `Started`, or an error.
+    AdoptHere {
+        store: StoreId,
+        into: StoreId,
+        identity: String,
+        finish: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -293,6 +318,9 @@ pub(crate) enum AdminResp {
     PushLoads(Vec<nest_data::push_record::Record>),
     Disks(Vec<DiskInfo>),
     StoreReads(Vec<(StoreId, u64)>),
+    /// Objects missing from an archive's folder or of another size, with
+    /// why (`CheckArchive`).
+    Checked(Vec<(FileId, String)>),
 }
 
 /// Installed by `sparknest-drop-page-cache --install` (root, setuid, mode
@@ -766,6 +794,80 @@ impl Admin {
         p
     }
 
+    /// Is the archive's marker (`identity`) in the folder where this host's
+    /// store `into` keeps its objects? With `finish`, remove it (ADR-090).
+    pub(crate) fn adopt_here(&self, into: StoreId, identity: &str, finish: bool) -> AdminResp {
+        let d = self.vfs.data();
+        if into.host() != Some(d.id()) {
+            return AdminResp::Err("that store is not this host's".into());
+        }
+        let Some(st) = d.store_for(into) else {
+            return AdminResp::Err("that store is not usable here".into());
+        };
+        let marker = st.root().join(nest_store::MARKER);
+        let found = std::fs::read_to_string(&marker).ok();
+        if finish {
+            // Removed once; a later run finds it gone, which is done too.
+            return match found {
+                Some(m) if m.trim() == identity.trim() => match std::fs::remove_file(&marker) {
+                    Ok(()) => AdminResp::Started,
+                    Err(e) => AdminResp::Err(format!("removing {}: {e}", marker.display())),
+                },
+                _ => AdminResp::Started,
+            };
+        }
+        match found {
+            Some(m) if m.trim() == identity.trim() => AdminResp::Started,
+            Some(m) => AdminResp::Err(format!(
+                "{} holds another store's marker ({}): not the archive's folder",
+                st.root().display(),
+                m.trim()
+            )),
+            None => AdminResp::Err(format!(
+                "{} has no marker: this host does not see the archive's folder there (is the state dir that folder?)",
+                st.root().display()
+            )),
+        }
+    }
+
+    /// The objects among `files` that are not in the archive `store`'s
+    /// folder with the recorded size (ADR-090).
+    pub(crate) async fn check_archive(
+        &self,
+        store: StoreId,
+        files: Vec<(FileId, nest_types::Generation, u64)>,
+    ) -> AdminResp {
+        let Some(arch) = self.vfs.data().archive(store) else {
+            return AdminResp::Err(
+                "this host cannot reach that archive (not a gateway, or its marker is missing)"
+                    .into(),
+            );
+        };
+        let st = arch.store.clone();
+        let bad = tokio::task::spawn_blocking(move || {
+            files
+                .into_iter()
+                .filter_map(|(file, generation, size)| {
+                    let key = nest_store::ObjectKey::new(file, generation);
+                    match std::fs::symlink_metadata(st.path(key)) {
+                        Ok(m) if m.is_file() && m.len() == size => None,
+                        Ok(m) if m.is_file() => Some((
+                            file,
+                            format!("{} bytes in the folder, {size} recorded", m.len()),
+                        )),
+                        Ok(_) => Some((file, "not a regular file".into())),
+                        Err(e) => Some((file, format!("not in the folder: {e}"))),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        match bad {
+            Ok(b) => AdminResp::Checked(b),
+            Err(e) => AdminResp::Err(e.to_string()),
+        }
+    }
+
     async fn evict(&self, files: Vec<FileId>, store: StoreId) -> AdminResp {
         let mut removed = 0;
         let mut refused = Vec::new();
@@ -820,6 +922,25 @@ impl Handler for AdminService {
                     a.start_move(job, files, from, to);
                     AdminResp::Started
                 }
+                AdminReq::MetaBackupHere { keep } => {
+                    let a = a.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::backup::meta_backup_here(&a.vfs, keep)
+                    })
+                    .await
+                    {
+                        Ok(Ok(p)) => AdminResp::Path(p.to_string_lossy().into_owned()),
+                        Ok(Err(e)) => AdminResp::Err(e.to_string()),
+                        Err(e) => AdminResp::Err(e.to_string()),
+                    }
+                }
+                AdminReq::CheckArchive { store, files } => a.check_archive(store, files).await,
+                AdminReq::AdoptHere {
+                    store: _,
+                    into,
+                    identity,
+                    finish,
+                } => a.adopt_here(into, &identity, finish),
                 AdminReq::StartReplicate {
                     job,
                     files,

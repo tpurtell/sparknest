@@ -393,6 +393,7 @@ fn exec(c: &Connection, cmd: &Command, fx: &mut Vec<Effect>) -> R<Reply> {
             config,
         } => register_store(c, name, *class, *node, config),
         Command::DeleteStore { store } => delete_store(c, *store),
+        Command::AdoptStore { from, into } => adopt_store(c, *from, *into, fx),
         Command::Batch(cmds) => {
             let mut out = Vec::with_capacity(cmds.len());
             for sub in cmds {
@@ -1434,6 +1435,56 @@ fn delete_store(c: &Connection, store: StoreId) -> R<Reply> {
     if n == 0 {
         return err(NestError::NotFound);
     }
+    Ok(Reply::Done)
+}
+
+fn adopt_store(c: &Connection, from: StoreId, into: StoreId, fx: &mut Vec<Effect>) -> R<Reply> {
+    if !from.is_archive() {
+        return err(NestError::Invalid(
+            "only an archive store can be adopted".into(),
+        ));
+    }
+    if into.host().is_none() {
+        return err(NestError::Invalid(
+            "a host's store or disk adopts it, not another archive".into(),
+        ));
+    }
+    let known = |id: StoreId| -> R<bool> {
+        Ok(c.prepare_cached("SELECT 1 FROM stores WHERE id = ?1")?
+            .query_row(params![id.0 as i64], |_| Ok(()))
+            .optional()?
+            .is_some())
+    };
+    if !known(from)? {
+        return err(NestError::NotFound);
+    }
+    if !known(into)? {
+        return err(NestError::Invalid(
+            "the adopting store is not registered".into(),
+        ));
+    }
+    let backups: i64 = c
+        .prepare_cached("SELECT count(*) FROM backups WHERE store = ?1")?
+        .query_row(params![from.0 as i64], |r| r.get(0))?;
+    if backups > 0 {
+        return err(NestError::Busy(format!("{backups} backups are kept in it")));
+    }
+    let clash: i64 = c
+        .prepare_cached(
+            "SELECT count(*) FROM replicas a JOIN replicas b \
+             ON a.file = b.file AND a.gen = b.gen WHERE a.store = ?1 AND b.store = ?2",
+        )?
+        .query_row(params![from.0 as i64, into.0 as i64], |r| r.get(0))?;
+    if clash > 0 {
+        return err(NestError::Busy(format!(
+            "{clash} files have a copy in both stores already"
+        )));
+    }
+    c.prepare_cached("UPDATE replicas SET store = ?2 WHERE store = ?1")?
+        .execute(params![from.0 as i64, into.0 as i64])?;
+    c.prepare_cached("DELETE FROM stores WHERE id = ?1")?
+        .execute(params![from.0 as i64])?;
+    fx.push(Effect::StoreAdopted { from, into });
     Ok(Reply::Done)
 }
 

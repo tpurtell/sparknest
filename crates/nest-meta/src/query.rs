@@ -211,6 +211,24 @@ pub fn store_inventory(
 /// Files currently OWNED by `node`: the working objects it must hold.
 /// Live copies held by `store` and their total size (from the metadata;
 /// no directory scan).
+/// Every (file, generation) an archive store lists (ADR-090). A host's
+/// sweep keeps these even in its own folder: an archive's folder can be the
+/// state dir of the host about to adopt it.
+pub fn archive_inventory(c: &Connection) -> rusqlite::Result<Vec<(FileId, Generation)>> {
+    let mut st =
+        c.prepare_cached("SELECT file, gen FROM replicas WHERE store >= ?1 AND store < ?2")?;
+    let rows = st.query_map(
+        params![StoreId::ARCHIVE_BASE as i64, StoreId::DISK_BASE as i64],
+        |r| {
+            Ok((
+                FileId(r.get::<_, i64>(0)? as u64),
+                Generation(r.get::<_, i64>(1)? as u64),
+            ))
+        },
+    )?;
+    rows.collect()
+}
+
 pub fn store_usage(c: &Connection, store: StoreId) -> rusqlite::Result<(u64, u64)> {
     c.prepare_cached(
         "SELECT count(*), coalesce(sum(f.size), 0) FROM replicas r \

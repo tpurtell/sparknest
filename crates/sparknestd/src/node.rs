@@ -173,6 +173,22 @@ impl Node {
             crate::recovery::decide(&cfg, &rpc, &hello, &local, tuning.recovery_grace).await?;
         let mut trust_local = !prior.dirty();
         let mut quarantine = false;
+        // A host with no metadata yet whose state dir already holds objects
+        // (a store's folder adopted by this host, ADR-090; a disk moved
+        // here): its empty local metadata must never judge them. It catches
+        // up first, then fsck keeps what the cluster lists here and
+        // quarantines the rest; nothing is deleted.
+        if local.applied.is_none()
+            && nest_store::ObjectStore::open(&cfg.node.state_dir)
+                .and_then(|s| s.scan())
+                .is_ok_and(|o| !o.is_empty())
+        {
+            tracing::warn!(
+                "new host with objects already in its state dir: catching up before it looks at them"
+            );
+            trust_local = false;
+            quarantine = true;
+        }
         match &outcome {
             crate::recovery::Outcome::Normal => {}
             crate::recovery::Outcome::Join(_) => {

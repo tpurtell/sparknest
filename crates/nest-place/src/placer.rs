@@ -167,8 +167,15 @@ pub struct Placer {
     dirty: Arc<tokio::sync::Notify>,
 }
 
-/// The leader snapshots metadata into every healthy archive store this often.
+/// The leader has metadata backups written this often (ADR-090).
 const META_SNAPSHOT_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+/// The group naming the hosts that keep metadata backups (ADR-090).
+pub const META_BACKUP_GROUP: &str = "meta-backups";
+/// Without that group: this many hosts, those with the most free space.
+const META_BACKUP_HOSTS: usize = 3;
+/// Backups each host keeps.
+const META_BACKUP_KEEP: usize = 14;
 
 async fn auto_meta_snapshots(p: std::sync::Weak<Placer>) {
     loop {
@@ -177,10 +184,10 @@ async fn auto_meta_snapshots(p: std::sync::Weak<Placer>) {
         if p.vfs.data().meta().leader() != Some(p.vfs.data().id()) {
             continue;
         }
-        for (_, name, _) in p.archive_stores().unwrap_or_default() {
-            match p.meta_snapshot(&name).await {
-                Ok(path) => tracing::info!(%path, "metadata snapshot written"),
-                Err(e) => tracing::warn!(store = %name, error = %e, "metadata snapshot failed"),
+        for (host, r) in p.meta_backup().await.unwrap_or_default() {
+            match r {
+                Ok(path) => tracing::info!(%host, %path, "metadata backup written"),
+                Err(e) => tracing::warn!(%host, error = %e, "metadata backup failed"),
             }
         }
     }
@@ -1176,6 +1183,155 @@ impl Placer {
             .map_or_else(|| format!("node{host}"), |h| h.name);
         self.move_local_job(format!("drain {dname}"), hname, host, files, id, vec![dest])
             .await
+    }
+
+    /// Give an archive store's copies to a host's own store, and forget the
+    /// archive (ADR-090). The archive's folder must already be where `into`
+    /// keeps its objects (that host's state dir, or the disk's folder): only
+    /// the metadata changes, no bytes move. A gateway of the archive first
+    /// checks every recorded object is in the folder with its size; any
+    /// that is not stops the adoption. With `dry_run`, only that check.
+    /// Returns the copies handed over.
+    pub async fn adopt_store(&self, from: &str, into: &str, dry_run: bool) -> NestResult<u64> {
+        let (src, sname, cfg) = self
+            .archive_stores()?
+            .into_iter()
+            .find(|(_, n, _)| n == from)
+            .ok_or_else(|| NestError::Invalid(format!("no archive store named {from:?}")))?;
+        let place = self
+            .resolve_places(&[into.to_string()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NestError::Invalid(format!("unknown host or disk {into:?}")))?;
+        let dest = crate::plan::store_of(place.node);
+        let host = crate::plan::host_of(place.node);
+        // The adopting host must see the archive's folder where it keeps
+        // its objects: the archive's marker is there.
+        let identity = self.vfs.data().store_identity(src, &sname);
+        self.adopt_here(host, src, dest, &identity, false).await?;
+        let c = self.conn()?;
+        let files: Vec<(FileId, nest_types::Generation, u64)> = query::store_inventory(&c, src)
+            .map_err(sql)?
+            .into_iter()
+            .filter_map(|(f, g)| {
+                let a = query::getattr(&c, f).ok()??;
+                (a.generation == g).then_some((f, g, a.size))
+            })
+            .collect();
+        drop(c);
+        // The first gateway that answers checks the folder.
+        let me = self.vfs.data().id();
+        let mut last = NestError::Unavailable(format!("no gateway of {sname} answered"));
+        let mut checked = None;
+        for &gw in &cfg.gateways {
+            let mut bad = Vec::new();
+            let mut ok = true;
+            for chunk in files.chunks(4096) {
+                let r = if gw == me {
+                    self.admin.check_archive(src, chunk.to_vec()).await
+                } else {
+                    match admin::call(
+                        self.rpc(),
+                        gw,
+                        &AdminReq::CheckArchive {
+                            store: src,
+                            files: chunk.to_vec(),
+                        },
+                        Duration::from_secs(600),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last = e;
+                            ok = false;
+                            break;
+                        }
+                    }
+                };
+                match r {
+                    AdminResp::Checked(b) => bad.extend(b),
+                    AdminResp::Err(e) => {
+                        last = NestError::Unavailable(e);
+                        ok = false;
+                        break;
+                    }
+                    other => {
+                        last = NestError::Io(format!("unexpected {other:?}"));
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                checked = Some(bad);
+                break;
+            }
+        }
+        let bad = checked.ok_or(last)?;
+        if !bad.is_empty() {
+            let sample: Vec<String> = bad
+                .iter()
+                .take(5)
+                .map(|(f, why)| format!("file {f}: {why}"))
+                .collect();
+            return Err(NestError::Invalid(format!(
+                "{} of {} copies in {sname} are not in its folder as recorded ({}); nothing changed",
+                bad.len(),
+                files.len(),
+                sample.join("; ")
+            )));
+        }
+        if dry_run {
+            return Ok(files.len() as u64);
+        }
+        self.vfs
+            .data()
+            .meta()
+            .propose(Command::AdoptStore {
+                from: src,
+                into: dest,
+            })
+            .await?;
+        // The folder is the host's now: drop the archive's marker. If the
+        // host cannot be reached for it, the marker only lingers.
+        if let Err(e) = self.adopt_here(host, src, dest, &identity, true).await {
+            tracing::warn!(error = %e, "adopted, but the archive's marker is still in the folder");
+        }
+        Ok(files.len() as u64)
+    }
+
+    /// Ask the adopting host about (or, with `finish`, remove) the archive's
+    /// marker in its store's folder (ADR-090).
+    async fn adopt_here(
+        &self,
+        host: NodeId,
+        store: StoreId,
+        into: StoreId,
+        identity: &str,
+        finish: bool,
+    ) -> NestResult<()> {
+        let r = if host == self.vfs.data().id() {
+            self.admin.adopt_here(into, identity, finish)
+        } else {
+            admin::call(
+                self.rpc(),
+                host,
+                &AdminReq::AdoptHere {
+                    store,
+                    into,
+                    identity: identity.to_string(),
+                    finish,
+                },
+                Duration::from_secs(30),
+            )
+            .await?
+        };
+        match r {
+            AdminResp::Started => Ok(()),
+            AdminResp::Err(e) => Err(NestError::Invalid(e)),
+            other => Err(NestError::Io(format!("unexpected {other:?}"))),
+        }
     }
 
     /// Run a `MoveLocal` on `host` as a cluster job.
@@ -3664,6 +3820,80 @@ impl Placer {
 
     pub fn backups(&self) -> NestResult<Vec<query::BackupRow>> {
         query::backups(&self.conn()?).map_err(sql)
+    }
+
+    /// The hosts that keep metadata backups (ADR-090): the `meta-backups`
+    /// group's members, else the `META_BACKUP_HOSTS` answering hosts with
+    /// the most free space.
+    pub async fn meta_backup_hosts(&self) -> NestResult<Vec<HostRef>> {
+        let named = query::groups(&self.conn()?)
+            .map_err(sql)?
+            .into_iter()
+            .any(|(g, _)| g == META_BACKUP_GROUP);
+        if named {
+            return self.resolve_hosts(&[format!("@{META_BACKUP_GROUP}")]);
+        }
+        let mut room: Vec<(u64, HostRef)> = self
+            .status()
+            .await?
+            .into_iter()
+            .filter_map(|s| {
+                let free = s.info.as_ref()?.free_bytes;
+                Some((
+                    free,
+                    HostRef {
+                        node: s.node,
+                        name: s.name,
+                        offgrid: s.offgrid,
+                    },
+                ))
+            })
+            .collect();
+        room.sort_by_key(|(free, h)| (std::cmp::Reverse(*free), h.node));
+        Ok(room
+            .into_iter()
+            .take(META_BACKUP_HOSTS)
+            .map(|(_, h)| h)
+            .collect())
+    }
+
+    /// Have each backup host write a metadata backup from its own replica
+    /// into its state dir (ADR-090): nothing crosses the network but the
+    /// request. Each host's outcome: where it wrote, or why it did not.
+    pub async fn meta_backup(&self) -> NestResult<Vec<(String, Result<String, String>)>> {
+        let hosts = self.meta_backup_hosts().await?;
+        let me = self.vfs.data().id();
+        let out = futures::future::join_all(hosts.into_iter().map(|h| async move {
+            let r = if h.node == me {
+                let vfs = self.vfs.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::backup::meta_backup_here(&vfs, META_BACKUP_KEEP)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()))
+                .map(|p| p.to_string_lossy().into_owned())
+            } else {
+                match admin::call(
+                    self.rpc(),
+                    h.node,
+                    &AdminReq::MetaBackupHere {
+                        keep: META_BACKUP_KEEP,
+                    },
+                    Duration::from_secs(600),
+                )
+                .await
+                {
+                    Ok(AdminResp::Path(p)) => Ok(p),
+                    Ok(AdminResp::Err(e)) => Err(e),
+                    Ok(other) => Err(format!("unexpected {other:?}")),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            (h.name, r)
+        }))
+        .await;
+        Ok(out)
     }
 
     /// Snapshot metadata into an archive store (through a healthy gateway).

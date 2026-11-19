@@ -683,6 +683,11 @@ impl DataNode {
     fn on_effect(&self, e: &Effect) {
         let mine = self.id.live_store();
         match e {
+            // The archive is gone; its objects now belong to a host's store
+            // and stay where they are (ADR-090).
+            Effect::StoreAdopted { from, .. } => {
+                self.archives.lock().remove(from);
+            }
             Effect::ReplicaInvalidated {
                 file,
                 generation,
@@ -1077,10 +1082,11 @@ fn reconcile_blocking(
         .map(|(f, g)| ObjectKey::new(f, g))
         .collect();
     let owned = query::owned_by(&c, me)?;
+    let archived = archived_keys(&c)?;
     drop(c);
     let disk: HashSet<ObjectKey> = store.scan()?.into_iter().map(|o| o.key).collect();
     let mut report = ReconcileReport::default();
-    let mut keep: HashSet<ObjectKey> = HashSet::new();
+    let mut keep: HashSet<ObjectKey> = archived;
     for a in &owned {
         let key = ObjectKey::new(a.id, a.generation);
         keep.insert(key);
@@ -1126,6 +1132,15 @@ fn reconcile_blocking(
     Ok(report)
 }
 
+/// Objects an archive store lists: never swept from a host's folder, which
+/// may be that archive's (ADR-090, before the host adopts it).
+fn archived_keys(c: &rusqlite::Connection) -> anyhow::Result<HashSet<ObjectKey>> {
+    Ok(query::archive_inventory(c)?
+        .into_iter()
+        .map(|(f, g)| ObjectKey::new(f, g))
+        .collect())
+}
+
 /// A disk holds copies and the working objects of new files written to
 /// it (ADR-077): keep what metadata lists and what this host still owns,
 /// remove the rest, report what is missing. Returns the working objects
@@ -1145,12 +1160,13 @@ fn reconcile_disk(
         .into_iter()
         .map(|a| ObjectKey::new(a.id, a.generation))
         .collect();
+    let archived = archived_keys(&c)?;
     drop(c);
     let disk: HashSet<ObjectKey> = store.scan()?.into_iter().map(|o| o.key).collect();
     let mut report = ReconcileReport::default();
     let mut working = Vec::new();
     for k in &disk {
-        if expected.contains(k) {
+        if expected.contains(k) || archived.contains(k) {
             report.kept += 1;
         } else if owned.contains(k) {
             report.kept += 1;

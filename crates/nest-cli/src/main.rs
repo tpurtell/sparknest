@@ -757,10 +757,13 @@ enum BackupCmd {
     Rm {
         id: u64,
     },
-    /// Snapshot the metadata into an archive store now.
+    /// Write a metadata backup now: on each backup host (the
+    /// `meta-backups` group, else the three hosts with the most free
+    /// space), in its state dir's backups/meta/, as the leader has them do
+    /// every 6 hours. `--store` writes one into an archive store instead.
     Meta {
         #[arg(long)]
-        store: String,
+        store: Option<String>,
     },
 }
 
@@ -776,6 +779,21 @@ enum StoreCmd {
     },
     /// Archive stores with health and capacity per gateway.
     Ls,
+    /// Give an archive store's copies to a host whose objects folder
+    /// already holds them, and forget the archive. Only the metadata
+    /// changes. A gateway of the archive first checks every object is in
+    /// the folder with its recorded size. Use it for an archive's folder
+    /// that becomes a host's own store (a NAS running sparknest). Needs
+    /// every host on this version; start the host on that folder after.
+    Adopt {
+        /// The archive store.
+        from: String,
+        /// The host (or `host:dN`, one of its disks) that keeps the objects.
+        into: String,
+        /// Only check the folder.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1920,10 +1938,19 @@ async fn main() -> Result<()> {
                     .post("/v1/backups/meta", json!({ "store": store }))
                     .await?;
                 if !cli.json {
-                    println!(
-                        "metadata snapshot {}",
-                        v["snapshot"].as_str().unwrap_or("?")
-                    );
+                    if let Some(p) = v["snapshot"].as_str() {
+                        println!("metadata snapshot {p}");
+                    }
+                    for h in v["hosts"].as_array().into_iter().flatten() {
+                        let host = h["host"].as_str().unwrap_or("?");
+                        match h["path"].as_str() {
+                            Some(p) => println!("{host:<10} {p}"),
+                            None => println!(
+                                "{host:<10} failed: {}",
+                                h["error"].as_str().unwrap_or("?")
+                            ),
+                        }
+                    }
                     return Ok(());
                 }
                 v
@@ -1947,6 +1974,30 @@ async fn main() -> Result<()> {
                             None => println!("  {:<9} ok", g["gateway"].as_str().unwrap_or("")),
                             Some(e) => println!("  {:<9} {e}", g["gateway"].as_str().unwrap_or("")),
                         }
+                    }
+                    return Ok(());
+                }
+                v
+            }
+            StoreCmd::Adopt {
+                from,
+                into,
+                dry_run,
+            } => {
+                let v = c
+                    .post(
+                        "/v1/stores/adopt",
+                        json!({ "from": from, "into": into, "dry_run": dry_run }),
+                    )
+                    .await?;
+                if !cli.json {
+                    let n = v["copies"].as_u64().unwrap_or(0);
+                    if *dry_run {
+                        println!(
+                            "{n} copies of {from} are in its folder as recorded; {into} can adopt them"
+                        );
+                    } else {
+                        println!("{into} now holds {n} copies that were {from}'s; {from} is gone");
                     }
                     return Ok(());
                 }

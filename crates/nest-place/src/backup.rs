@@ -592,9 +592,25 @@ fn sweep_tmp(dir: &Path) {
     }
 }
 
+/// Where a host keeps its metadata backups (ADR-090), under its state dir.
+pub fn meta_backup_dir(vfs: &Vfs) -> PathBuf {
+    vfs.data().store().root().join("backups").join("meta")
+}
+
+/// Write a metadata backup from this host's own replica into its state
+/// dir's `backups/meta/`, keeping `keep` (ADR-090).
+pub fn meta_backup_here(vfs: &Vfs, keep: usize) -> NestResult<PathBuf> {
+    let dir = meta_backup_dir(vfs);
+    meta_snapshot_in(vfs, &dir, keep)
+}
+
 /// Write a metadata snapshot into `<archive root>/meta/`, keeping `keep`.
 pub fn meta_snapshot(vfs: &Vfs, archive_root: &Path, keep: usize) -> NestResult<PathBuf> {
-    let dir = archive_root.join("meta");
+    meta_snapshot_in(vfs, &archive_root.join("meta"), keep)
+}
+
+fn meta_snapshot_in(vfs: &Vfs, dir: &Path, keep: usize) -> NestResult<PathBuf> {
+    let dir = dir.to_path_buf();
     std::fs::create_dir_all(&dir).map_err(io)?;
     sweep_tmp(&dir);
     let local = local_scratch(vfs)?.join(format!("meta-{:016x}.sqlite", rand::random::<u64>()));
