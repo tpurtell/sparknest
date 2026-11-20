@@ -21,6 +21,11 @@ that left membership; a replication restarts a host's forgotten part
 on 0.9.0. Before the release, restarting kakapo, the NAS container and
 raptor cleared it in production.
 
+Released 2026-11-20 (tap bottles-20261120-1, image
+`ghcr.io/tpurtell/sparknest:0.9.1`); aviary's container moved first, then
+kakapo, cassowary, the Sparks and raptor through hwlock (11:40-11:41),
+nothing deleted. maxq stays on 0.9.0 while TJ's Hy4 quant reads its mount.
+
 ## 2026-11-20 — aviary serves the models archive itself
 
 The QNAP NAS (aviary) runs sparknest 0.9.0 in Container Station as
