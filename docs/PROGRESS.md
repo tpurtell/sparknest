@@ -12,9 +12,8 @@ aviary` (dry run, then for real) checked every object over raptor's SMB
 mount, moved the 857 copies to aviary and dropped the archive, and the
 host released with nothing removed. A file whose only copy is on aviary
 reads at 377 MB/s cold through raptor's mount, from the NAS over the LAN.
-The `models` SMB mount was then removed from every host (dodo still has
-it mounted: Tailscale logged out there, so agent-sudo could not reach its
-approver).
+The `models` SMB mount was then removed from every host's
+`mount-nas.sh` and unmounted.
 
 Lesson: the sample config said id 9, which was oliver's (retired with
 `--forget-copies`, its store record kept). `nest cluster add 9` brought
