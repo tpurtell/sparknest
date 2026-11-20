@@ -401,6 +401,13 @@ impl Node {
                             _ => lanes.dial_n(peer, "0.0.0.0:0".parse().unwrap(), 0),
                         }
                     }
+                    // A host that left membership (removed, or re-added
+                    // under another id) is dialled no more: an entry kept
+                    // for it would dial its address forever and drop each
+                    // lane on the handshake (ADR-091).
+                    for peer in departed(&lanes.dialled(), &known, &nodes) {
+                        lanes.dial_n(peer, "0.0.0.0:0".parse().unwrap(), 0);
+                    }
                     drop(lanes);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
@@ -704,5 +711,37 @@ impl Node {
         if let Err(e) = self.runstate.lock().end_clean() {
             tracing::warn!(error = %e, "could not record a clean shutdown");
         }
+    }
+}
+
+/// Dialled peers to stop dialling: in neither this host's `members` nor the
+/// cluster's membership (ADR-091).
+fn departed<V>(
+    dialled: &[nest_types::NodeId],
+    known: &std::collections::HashSet<nest_types::NodeId>,
+    membership: &BTreeMap<u64, V>,
+) -> Vec<nest_types::NodeId> {
+    dialled
+        .iter()
+        .copied()
+        .filter(|p| !known.contains(p) && !membership.contains_key(&p.0))
+        .collect()
+}
+
+#[cfg(test)]
+mod departed_tests {
+    use super::departed;
+    use nest_types::NodeId;
+    use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn a_peer_gone_from_membership_is_dialled_no_more() {
+        let known: HashSet<_> = [NodeId(1), NodeId(2)].into();
+        let membership: BTreeMap<u64, ()> = [(1, ()), (2, ()), (8, ()), (12, ())].into();
+        // 9 was added and removed (aviary's first id); 3 is in node.toml
+        // only and stays, whatever membership says.
+        let dialled = [NodeId(1), NodeId(3), NodeId(9), NodeId(12)];
+        let known: HashSet<_> = known.into_iter().chain([NodeId(3)]).collect();
+        assert_eq!(departed(&dialled, &known, &membership), vec![NodeId(9)]);
     }
 }

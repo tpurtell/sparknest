@@ -197,6 +197,10 @@ enum Out {
         service: u8,
         data: bytes::Bytes,
     },
+    /// The lane was killed: the writer exits. The lane keeps its own
+    /// sender (`out`), so the channel never closes while the writer holds
+    /// the lane; without this it would wait on `recv` forever.
+    Close,
 }
 
 /// Takes the messages peers send a service over lanes.
@@ -372,6 +376,11 @@ impl Lanes {
         } else {
             self.dial.lock().insert(peer, (addr, n));
         }
+    }
+
+    /// The peers this host keeps lanes open to.
+    pub fn dialled(&self) -> Vec<NodeId> {
+        self.dial.lock().keys().copied().collect()
     }
 
     /// Live lanes to `peer`.
@@ -689,6 +698,7 @@ impl Lane {
     fn kill(&self) {
         if !self.dead.swap(true, Ordering::SeqCst) {
             let _ = self.sock.shutdown(Shutdown::Both);
+            let _ = self.out.send(Out::Close);
         }
         for (_, tx) in self.pending.lock().drain() {
             let _ = tx.send(Err(NestError::Unavailable(format!(
@@ -882,6 +892,7 @@ fn writer(
                 return Ok(());
             }
             match o {
+                Out::Close => return Ok(()),
                 Out::Req {
                     id,
                     file,

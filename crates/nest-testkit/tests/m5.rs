@@ -534,3 +534,111 @@ async fn forgetting_a_lost_hosts_copies_keeps_last_copies() {
     assert_eq!(stores(shared), vec![NodeId(1).live_store()]);
     assert_eq!(stores(only), vec![NodeId(3).live_store()]);
 }
+
+/// A target that restarts mid-copy forgets its part of the job (jobs live
+/// in memory). 0.9.0 polled it forever ("no job"); the job now starts what
+/// the host still lacks there and finishes with every copy (ADR-091).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replication_survives_its_target_restarting() {
+    let mut c = ready(3).await;
+    let n1 = c.node(1);
+    let dir = n1.vfs.mkdir(FileId::ROOT, b"data", 0o755).await.unwrap().id;
+    let mut files = Vec::new();
+    for i in 0..96u32 {
+        let (a, fh, _) = n1
+            .vfs
+            .create(dir, format!("f{i}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        n1.vfs.write(fh, 0, vec![i as u8; 4 << 20]).await.unwrap();
+        n1.vfs.release(fh, None).await;
+        files.push(a.id);
+    }
+    // Only stable files are replicated: wait for every one.
+    c.eventually("stable", Duration::from_secs(20), |c| {
+        files.iter().all(|f| {
+            c.attr(1, *f)
+                .is_some_and(|a| a.gen_state == GenState::Stable)
+        })
+    })
+    .await;
+    let sel = Selector::parse("/data", "/hub").unwrap();
+    let job = n1
+        .placer
+        .replicate(sel, vec!["n3".into()], 1)
+        .await
+        .unwrap();
+    // As soon as n3's part runs, restart n3: it forgets the part.
+    c.eventually("n3's part started", Duration::from_secs(10), |c| {
+        c.node(1)
+            .placer
+            .job(job)
+            .is_some_and(|j| j.hosts.contains_key("n3"))
+    })
+    .await;
+    c.stop(3).await;
+    assert!(
+        !c.node(1).placer.job(job).unwrap().finished,
+        "the copy finished before n3 stopped: make it longer"
+    );
+    c.restart(3).await;
+    c.eventually("replicated", Duration::from_secs(60), |c| {
+        c.node(1).placer.job(job).is_some_and(|j| j.finished)
+    })
+    .await;
+    let j = c.node(1).placer.job(job).unwrap();
+    assert_eq!(j.error, None, "{j:?}");
+    assert!(
+        j.notes.iter().any(|n| n.contains("n3 restarted")),
+        "the part was started again: {:?}",
+        j.notes
+    );
+    c.converge().await;
+    let r = c.node(1).meta.open_reader().unwrap();
+    for f in files {
+        assert_eq!(
+            nest_meta::query::replicas(&r, f).unwrap().len(),
+            2,
+            "file {f:?}"
+        );
+    }
+}
+
+/// A cancelled replication stops polling its hosts: 0.9.0 kept polling a
+/// host that had forgotten its part, twice a second, until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_cancelled_replication_finishes_while_its_target_is_down() {
+    let mut c = ready(3).await;
+    let n1 = c.node(1);
+    let dir = n1.vfs.mkdir(FileId::ROOT, b"data", 0o755).await.unwrap().id;
+    for i in 0..32u32 {
+        let (_, fh, _) = n1
+            .vfs
+            .create(dir, format!("f{i}").as_bytes(), 0o644, oflags::WRONLY)
+            .await
+            .unwrap();
+        n1.vfs.write(fh, 0, vec![i as u8; 4 << 20]).await.unwrap();
+        n1.vfs.release(fh, None).await;
+    }
+    c.converge().await;
+    let sel = Selector::parse("/data", "/hub").unwrap();
+    let job = n1
+        .placer
+        .replicate(sel, vec!["n3".into()], 1)
+        .await
+        .unwrap();
+    c.eventually("n3 copying", Duration::from_secs(10), |c| {
+        c.node(1)
+            .placer
+            .job(job)
+            .is_some_and(|j| j.hosts.contains_key("n3"))
+    })
+    .await;
+    // n3 goes away: polls fail; the cancel must still end the job.
+    c.stop(3).await;
+    let _ = c.node(1).placer.cancel_job(job).await;
+    c.eventually("cancelled job finished", Duration::from_secs(15), |c| {
+        c.node(1).placer.job(job).is_some_and(|j| j.finished)
+    })
+    .await;
+}

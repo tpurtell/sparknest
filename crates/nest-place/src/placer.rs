@@ -176,6 +176,9 @@ pub const META_BACKUP_GROUP: &str = "meta-backups";
 const META_BACKUP_HOSTS: usize = 3;
 /// Backups each host keeps.
 const META_BACKUP_KEEP: usize = 14;
+/// A replication job starts a host's part again this many times when the
+/// host restarts and forgets it (ADR-091), then fails.
+const HOST_PART_RESTARTS: u32 = 5;
 
 async fn auto_meta_snapshots(p: std::sync::Weak<Placer>) {
     loop {
@@ -1596,67 +1599,24 @@ impl Placer {
         hosts: Vec<Target>,
         parallel: usize,
     ) -> NestResult<()> {
-        let c = self.conn()?;
         job.lock().pending = m.entries.iter().filter(|e| !e.stable).count() as u64;
         let mut started = Vec::new();
         for h in &hosts {
             if job.lock().cancelled {
                 break;
             }
-            let files: Vec<(FileId, u64)> = m
-                .entries
-                .iter()
-                .filter(|e| e.stable)
-                .filter(|e| {
-                    !query::has_live_replica(&c, e.file, e.generation, h.store).unwrap_or(false)
-                })
-                .map(|e| (e.file, e.size))
-                .collect();
-            let hid = rand::random::<u64>();
-            job.lock().hosts.insert(
-                h.name.clone(),
-                JobProgress {
-                    total_files: files.len() as u64,
-                    total_bytes: files.iter().map(|f| f.1).sum(),
-                    finished: files.is_empty(),
-                    ..Default::default()
-                },
-            );
-            if files.is_empty() {
-                continue;
+            if let Some(hid) = self.start_host_part(job, &m, h, parallel).await? {
+                started.push((h.clone(), hid, 0u32));
             }
-            admin::call(
-                self.rpc(),
-                h.node,
-                &AdminReq::StartReplicate {
-                    job: hid,
-                    files,
-                    parallel,
-                    target: h.store,
-                },
-                Duration::from_secs(10),
-            )
-            .await?;
-            let late = {
-                let mut j = job.lock();
-                j.host_jobs.push((h.node, hid));
-                j.cancelled
-            };
-            if late {
-                // Cancelled while this host was starting: tell it too.
-                let _ = admin::call(
-                    self.rpc(),
-                    h.node,
-                    &AdminReq::CancelJob { job: hid },
-                    Duration::from_secs(5),
-                )
-                .await;
-            }
-            started.push((h.clone(), hid));
         }
         loop {
+            if job.lock().cancelled {
+                // The cancel reached the hosts' parts already (or reaches a
+                // part started meanwhile, in start_host_part): stop polling.
+                return Ok(());
+            }
             let mut all_done = true;
-            for (h, hid) in &started {
+            for (h, hid, restarts) in started.iter_mut() {
                 match admin::call(
                     self.rpc(),
                     h.node,
@@ -1670,17 +1630,111 @@ impl Placer {
                         job.lock().hosts.insert(h.name.clone(), p);
                     }
                     Ok(_) => {}
+                    Err(NestError::Io(e)) if e.starts_with("no job ") => {
+                        // The host restarted and forgot its part (jobs live
+                        // in memory): start what it still lacks (ADR-091).
+                        all_done = false;
+                        *restarts += 1;
+                        if *restarts > HOST_PART_RESTARTS {
+                            return Err(NestError::Unavailable(format!(
+                                "{} lost its part of the job {HOST_PART_RESTARTS} times",
+                                h.name
+                            )));
+                        }
+                        tracing::warn!(
+                            host = %h.name,
+                            restarts = *restarts,
+                            "host forgot its part of a replication job; starting it again"
+                        );
+                        job.lock()
+                            .notes
+                            .push(format!("{} restarted: its part started again", h.name));
+                        match self.start_host_part(job, &m, h, parallel).await {
+                            Ok(Some(n)) => *hid = n,
+                            // Every copy landed before it forgot: done there.
+                            Ok(None) => *hid = 0,
+                            Err(e) => tracing::warn!(
+                                host = %h.name,
+                                error = %e,
+                                "starting a host's part again failed"
+                            ),
+                        }
+                    }
                     Err(e) => {
                         all_done = false;
                         tracing::warn!(host = %h.name, error = %e, "polling replication job failed");
                     }
                 }
             }
+            started.retain(|(_, hid, _)| *hid != 0);
             if all_done {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Start, on `h`, the copies of `m`'s stable files it has no live copy
+    /// of; None (and its part marked finished) when it has them all.
+    async fn start_host_part(
+        &self,
+        job: &Mutex<ClusterJob>,
+        m: &Manifest,
+        h: &Target,
+        parallel: usize,
+    ) -> NestResult<Option<u64>> {
+        let files: Vec<(FileId, u64)> = {
+            let c = self.conn()?;
+            m.entries
+                .iter()
+                .filter(|e| e.stable)
+                .filter(|e| {
+                    !query::has_live_replica(&c, e.file, e.generation, h.store).unwrap_or(false)
+                })
+                .map(|e| (e.file, e.size))
+                .collect()
+        };
+        let hid = rand::random::<u64>();
+        job.lock().hosts.insert(
+            h.name.clone(),
+            JobProgress {
+                total_files: files.len() as u64,
+                total_bytes: files.iter().map(|f| f.1).sum(),
+                finished: files.is_empty(),
+                ..Default::default()
+            },
+        );
+        if files.is_empty() {
+            return Ok(None);
+        }
+        admin::call(
+            self.rpc(),
+            h.node,
+            &AdminReq::StartReplicate {
+                job: hid,
+                files,
+                parallel,
+                target: h.store,
+            },
+            Duration::from_secs(10),
+        )
+        .await?;
+        let late = {
+            let mut j = job.lock();
+            j.host_jobs.push((h.node, hid));
+            j.cancelled
+        };
+        if late {
+            // Cancelled while this host was starting: tell it too.
+            let _ = admin::call(
+                self.rpc(),
+                h.node,
+                &AdminReq::CancelJob { job: hid },
+                Duration::from_secs(5),
+            )
+            .await;
+        }
+        Ok(Some(hid))
     }
 
     /// Hand files this node just imported to the hosts with the most free

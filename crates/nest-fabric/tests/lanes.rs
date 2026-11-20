@@ -595,3 +595,55 @@ async fn lanes_carry_messages_to_their_service() {
         1
     );
 }
+
+/// Threads of this process named `name` (Linux: /proc/self/task/*/comm).
+fn threads_named(name: &str) -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .filter(|c| c.trim_end() == name)
+        .count()
+}
+
+/// A dialler expecting another node at this address (a stale entry, as
+/// kakapo had for the id aviary first got) drops each lane after the
+/// handshake and dials again. The accepting side's lane threads must end
+/// with each lane: in 0.9.0 its writer waited forever on a channel the
+/// lane itself kept open, one leaked thread per attempt, until the NAS
+/// ran out of thread stacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lanes_dropped_after_the_handshake_leave_no_threads() {
+    let core = Lanes::start(
+        NodeId(12),
+        "lanes-test".into(),
+        b"s".to_vec(),
+        LanesConfig::default(),
+        Some("127.0.0.1:0".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    // An id no other test here uses: the threads are counted by name, and
+    // the tests share this process.
+    let dialler = Lanes::start(
+        NodeId(77),
+        "lanes-test".into(),
+        b"s".to_vec(),
+        LanesConfig::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    // Expects node 9 there: every handshake answers 12, so every lane is
+    // dropped and dialled again, every half second.
+    dialler.dial(NodeId(9), core.local_addr().unwrap());
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    assert_eq!(dialler.connected(NodeId(9)), 0);
+    dialler.dial_n(NodeId(9), "0.0.0.0:0".parse().unwrap(), 0);
+    // Let the last attempts finish and their threads see the close.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (tx, rx) = (threads_named("lane-tx-77"), threads_named("lane-rx-77"));
+    assert!(
+        tx <= 1 && rx <= 1,
+        "lane threads left behind on the accepting side: {tx} writers, {rx} readers"
+    );
+}

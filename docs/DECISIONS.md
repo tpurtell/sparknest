@@ -3217,3 +3217,44 @@ models aviary` (which releases it); raptor stops touching the share.
 Metadata backups no longer depend on any archive. A held host that is
 never released keeps what it should have removed: harmless, but it costs
 space, so status shows it.
+
+## ADR-091 — Lanes, dials and host jobs end when what they serve is gone (2026-11-20)
+
+**Context.** The NAS host (aviary, 0.9.0) died every ~44 minutes during
+its first big offload: `failed to allocate an alternative stack` once it
+held ~16 000 threads. Three faults lined up:
+
+1. A TCP lane's writer thread waited on its channel, but the lane it
+   held owns that channel's sender, so killing the lane never closed it:
+   every lane that died left its writer behind. Lanes rarely die, so no
+   host had shown it.
+2. aviary was first added as id 9 (oliver's retired id), removed, and
+   added as 12. kakapo, the lower id, had started dialling "9" at the
+   NAS's address (ADR-071), and the dial loop only visits members, so the
+   entry outlived the removal: kakapo dialled every half second, the NAS
+   answered as 12, kakapo dropped each lane after the handshake. Four
+   leaked writers per attempt on the NAS.
+3. After each crash the replication job's poll asked the NAS for a part
+   it no longer knew (jobs live in memory) and logged `no job` twice a
+   second, forever; cancelling the job did not end the poll either.
+
+**Decision.**
+1. Killing a lane also sends its writer `Out::Close` (internal, not
+   persisted); the writer returns on it.
+2. An off-grid host's membership loop stops dialling any peer that is in
+   neither its `members` nor the cluster's membership.
+3. A replication's poll ends once the job is cancelled. A host answering
+   `no job` for its part has restarted: the job starts that host's part
+   again with what it still lacks (files whose copy landed are live there
+   and skipped), noting it on the job; after 5 restarts the job fails.
+   Hosts before 0.9.1 send the same `no job` text, so this works in a
+   mixed cluster.
+
+**Alternatives.** A writer that polls `dead` with a timeout (a periodic
+wake per lane, for nothing); failing the job on `no job` (an offload of a
+terabyte would start over by hand after any target restart); persisting
+host jobs (state to recover for what restarting the part does).
+
+**Consequences.** A lane's threads end with it. A removed member is
+dialled no more. A target restarting mid-copy costs the copies in flight,
+not the job.
