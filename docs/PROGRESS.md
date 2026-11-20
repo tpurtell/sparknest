@@ -3,6 +3,24 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-20 — 0.9.1: lane threads, stale dials and lost host jobs (ADR-091)
+
+The first big offload to aviary (Mistral-Large-4, 988 GiB) stalled: the
+NAS's daemon died every ~44 min holding ~9 000-16 000 `lane-tx-8`
+threads, and after each crash the job polled it for a part it had
+forgotten. Cause: kakapo kept dialling the id aviary first had (9) and
+dropped each lane after the handshake (the NAS answers as 12), and each
+dropped lane leaked its writer thread on the NAS. Fixed (ADR-091):
+a killed lane wakes its writer to exit; off-grid hosts stop dialling peers
+that left membership; a replication restarts a host's forgotten part
+(noting it on the job) and stops polling once cancelled. Tests:
+`lanes_dropped_after_the_handshake_leave_no_threads`,
+`a_peer_gone_from_membership_is_dialled_no_more`,
+`a_replication_survives_its_target_restarting`,
+`a_cancelled_replication_finishes_while_its_target_is_down`; each fails
+on 0.9.0. Before the release, restarting kakapo, the NAS container and
+raptor cleared it in production.
+
 ## 2026-11-20 — aviary serves the models archive itself
 
 The QNAP NAS (aviary) runs sparknest 0.9.0 in Container Station as
