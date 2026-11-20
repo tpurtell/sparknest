@@ -151,6 +151,11 @@ Tested on a TS-855X (Atom C5125, 128 GB, QuTS hero 5.2, kernel 6.6).
   fine for objects (each copy is checked against its size and the cluster
   keeps its own checks); with a UPS it is fine for the metadata too.
   Compression gains nothing on model weights.
+- **No io_uring.** QuTS hero 5.2's kernel is built without it (the
+  syscalls return ENOSYS on the host itself, seccomp or not), so the log's
+  `io_uring unavailable` warning is expected: transfer writes run on the
+  receiving thread. Loosening the container's seccomp profile changes
+  nothing.
 - **Network**: the container uses the NAS's address. Keep the NAS's IP fixed
   (DHCP reservation or a static address): the cluster dials it there.
 
