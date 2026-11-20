@@ -133,8 +133,13 @@ and `scripts/deploy-cluster.sh` write `lan` from `SPARKNEST_LAN`.
 
 ## Existing mounts relevant to sparknest
 
-- `/mnt/models`: `//aviary/models` CIFS 3.1.1 on all nodes (6.0T, 1.4T free).
-  → archive store, all nodes as gateways.
+- aviary (QNAP TS-855X, 172.22.1.10) runs sparknest in Container Station
+  as off-grid host 12 (`packaging/docker`), state dir
+  `/share/ZFS24_DATA/models/sparknest`, compose in `sparknest-container/`
+  beside it. It adopted the `models` archive on 2026-11-20 (ADR-090); the
+  `//aviary/models` SMB mount (`/mnt/models`) was then dropped from every
+  host's `~/.local/bin/mount-nas.sh` and unmounted. TJ Photos and Public
+  are still mounted by that script.
 - `/mnt/scratch` on raptor: `/dev/sda2` Samsung 870 7.3T, **ntfs3** (1.5T
   free). Exported as `10.55.0.22:/mnt/scratch` and mounted on Sparks at
   `/mnt/nfs/raptor-scratch` (NFSv4.2 over RDMA). → archive store, raptor as

@@ -3,6 +3,24 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-20 — aviary serves the models archive itself
+
+The QNAP NAS (aviary) runs sparknest 0.9.0 in Container Station as
+off-grid host 12, on the folder that was the `models` archive. Its first
+start held itself on the 857 objects it found; `nest store adopt models
+aviary` (dry run, then for real) checked every object over raptor's SMB
+mount, moved the 857 copies to aviary and dropped the archive, and the
+host released with nothing removed. A file whose only copy is on aviary
+reads at 377 MB/s cold through raptor's mount, from the NAS over the LAN.
+The `models` SMB mount was then removed from every host (dodo still has
+it mounted: Tailscale logged out there, so agent-sudo could not reach its
+approver).
+
+Lesson: the sample config said id 9, which was oliver's (retired with
+`--forget-copies`, its store record kept). `nest cluster add 9` brought
+back the name "oliver"; it was removed at once and aviary added as 12.
+The container docs now say to pick an id no host has had.
+
 ## 2026-11-19 — 0.9.0: off-grid hosts in a container; adopt; host-held backups
 
 0.9.0 carries ADR-090 (metadata backups on hosts, `nest store adopt`, held

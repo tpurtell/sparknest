@@ -49,16 +49,19 @@ On the NAS, with the folder you give sparknest (here `/share/sparknest`):
    chmod 600 /share/sparknest/cluster.secret
    ```
 
-   In `node.toml` set `id` (unused in the cluster), `name`, and `members`:
-   the cluster's `members` list plus this host as `voter = false` at its LAN
-   address. Add the same line to `members` in every other host's
+   In `node.toml` set `id`, `name`, and `members`. The id must be one no
+   host has ever had, above every id in `nest cluster ls` and any host
+   removed before: a removed host's id stays retired (re-adding it brings
+   back the old host's name). For `members`, copy the
+   cluster's list and add this host as `voter = false` at its LAN address.
+   Add the same line to `members` in every other host's
    `node.toml`; it takes effect at their next restart, and nothing needs it
    sooner.
 
 2. From any running host, add it:
 
    ```sh
-   nest cluster add 9 172.22.1.10:7400 --offgrid
+   nest cluster add 12 172.22.1.10:7400 --offgrid
    ```
 
 3. Start it: copy `compose.yaml` next to the folder, set `STATE`,

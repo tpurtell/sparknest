@@ -4,11 +4,13 @@
 # `addr` below (the container uses the host's network).
 #
 # Before its first start, add it from a running host of the cluster:
-#   nest cluster add 9 172.22.1.10:7400 --offgrid
+#   nest cluster add 12 172.22.1.10:7400 --offgrid
 # then list it in `members` here and on every other host (as voter = false).
 
 [node]
-id = 9
+# An id no host has had: `nest cluster ls` shows the ones in use, and a
+# removed host's id stays retired (its old store record keeps the name).
+id = 12
 name = "aviary"
 role = "offgrid"
 # Inside the container; the folder mounted there holds everything.
@@ -28,5 +30,5 @@ secret_file = "/srv/sparknest/cluster.secret"
 members = [
   { id = 1, name = "raptor",  addr = "172.22.2.12:7400" },
   { id = 2, name = "ostrich", addr = "172.22.2.1:7400" },
-  { id = 9, name = "aviary",  addr = "172.22.1.10:7400", voter = false },
+  { id = 12, name = "aviary", addr = "172.22.1.10:7400", voter = false },
 ]
