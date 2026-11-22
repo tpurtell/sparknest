@@ -16,7 +16,9 @@ not run. They now run on the blocking pool
 (`a_stalled_write_leaves_the_runtime_running` fails on 0.9.1). The NAS also
 had 802.3x pause on and ECN passive (no ADR-088 tuning): set off and 1 by
 hand (not yet persistent); TJ set its MTU to 9000 in the UI. Released as
-0.9.2 for aviary.
+0.9.2 (tap bottles-20261122-1); aviary's container runs it (13:07). The
+other hosts have the 0.9.2 keg but run 0.9.1 until their next restart: they
+have io_uring, so the change does not reach them.
 
 ## 2026-11-20 — 0.9.1: lane threads, stale dials and lost host jobs (ADR-091)
 
