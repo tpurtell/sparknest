@@ -24,7 +24,8 @@ raptor cleared it in production.
 Released 2026-11-20 (tap bottles-20261120-1, image
 `ghcr.io/tpurtell/sparknest:0.9.1`); aviary's container moved first, then
 kakapo, cassowary, the Sparks and raptor through hwlock (11:40-11:41),
-nothing deleted. maxq stays on 0.9.0 while TJ's Hy4 quant reads its mount.
+nothing deleted. maxq followed on 2026-11-22 (19:19), once the Hy4 quant had
+finished: every host runs 0.9.1.
 
 ## 2026-11-20 — aviary serves the models archive itself
 
