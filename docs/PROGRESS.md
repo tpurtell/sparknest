@@ -15,7 +15,8 @@ on the async workers, so a stalled disk held them all and the renewal could
 not run. They now run on the blocking pool
 (`a_stalled_write_leaves_the_runtime_running` fails on 0.9.1). The NAS also
 had 802.3x pause on and ECN passive (no ADR-088 tuning): set off and 1 by
-hand (not yet persistent); TJ set its MTU to 9000 in the UI.
+hand (not yet persistent); TJ set its MTU to 9000 in the UI. Released as
+0.9.2 for aviary.
 
 ## 2026-11-20 — 0.9.1: lane threads, stale dials and lost host jobs (ADR-091)
 
