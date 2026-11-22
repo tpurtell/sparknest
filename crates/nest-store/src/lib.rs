@@ -277,6 +277,7 @@ impl ObjectStore {
             direct: std::sync::OnceLock::new(),
             window: self.window,
             pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            shared: std::sync::OnceLock::new(),
         })
     }
 
@@ -458,8 +459,11 @@ pub struct Staging {
     /// `None` inside where the filesystem refuses O_DIRECT.
     direct: std::sync::OnceLock<Option<std::sync::Arc<File>>>,
     window: usize,
-    /// Direct writes in flight, oldest first.
+    /// Writes in flight (on the ring, or on the blocking pool), oldest
+    /// first.
     pending: std::sync::Mutex<std::collections::VecDeque<uring::Done>>,
+    /// The buffered file, shared with blocking-pool writes (no O_DIRECT).
+    shared: std::sync::OnceLock<std::sync::Arc<File>>,
 }
 
 impl Staging {
@@ -511,7 +515,7 @@ impl Staging {
                     .map_err(|_| io::Error::other("write ring stopped"))??;
             }
         }
-        self.submit(buf, off)
+        self.submit_async(buf, off)
     }
 
     /// `write` for a caller on a blocking thread.
@@ -530,6 +534,42 @@ impl Staging {
             }
         }
         self.submit(buf, off)
+    }
+
+    /// `submit` for an async caller: a write that would block this thread
+    /// (no io_uring, or no O_DIRECT) runs on the blocking pool, counted in
+    /// the window like a ring write. A disk that stalls for seconds (a NAS's
+    /// SSD collecting garbage) must not hold the runtime's workers: the
+    /// lease renewal and every other task share them (ADR-092).
+    fn submit_async(&self, buf: uring::AlignedBuf, off: u64) -> io::Result<()> {
+        let file = match (self.direct_file(), uring::ring()) {
+            (Some(_), Some(_)) => return self.submit(buf, off),
+            (Some(f), None) => f.clone(),
+            (None, _) => match self.shared.get() {
+                Some(f) => f.clone(),
+                None => {
+                    let f = std::sync::Arc::new(self.file().try_clone()?);
+                    self.shared.get_or_init(|| f).clone()
+                }
+            },
+        };
+        let direct = self.direct_file().is_some();
+        let (done, rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::FileExt;
+            let r = if direct {
+                uring::write_now(&file, off, &buf)
+            } else {
+                uring::test_delay();
+                file.write_all_at(buf.as_slice(), off)
+            };
+            let _ = done.send(r);
+        });
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(rx);
+        Ok(())
     }
 
     fn submit(&self, buf: uring::AlignedBuf, off: u64) -> io::Result<()> {

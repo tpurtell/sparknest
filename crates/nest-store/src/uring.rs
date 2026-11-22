@@ -113,15 +113,23 @@ pub struct WriteRing {
     wake: File,
 }
 
-/// The process's ring, if io_uring is available.
+/// The process's ring, if io_uring is available (and not turned off with
+/// `SPARKNEST_NO_IO_URING=1`, which runs the fallback: blocking writes on
+/// tokio's blocking pool).
 pub fn ring() -> Option<&'static WriteRing> {
     static RING: OnceLock<Option<WriteRing>> = OnceLock::new();
-    RING.get_or_init(|| match WriteRing::start() {
-        Ok(r) => Some(r),
-        Err(e) => {
-            tracing::warn!(error = %e, "io_uring unavailable: transfer writes run on the caller's thread");
+    RING.get_or_init(|| match std::env::var_os("SPARKNEST_NO_IO_URING") {
+        Some(v) if v == "1" => {
+            tracing::warn!("io_uring turned off (SPARKNEST_NO_IO_URING=1)");
             None
         }
+        _ => match WriteRing::start() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(error = %e, "io_uring unavailable: transfer writes run on the blocking pool");
+            None
+        }
+        },
     })
     .as_ref()
 }
@@ -168,7 +176,24 @@ impl WriteRing {
 /// Write on this thread (no io_uring): the whole padded extent.
 pub fn write_now(file: &File, off: u64, buf: &AlignedBuf) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
+    test_delay();
     file.write_all_at(buf.padded(), off)
+}
+
+static TEST_WRITE_DELAY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tests: make every blocking transfer write take this long (a stalling
+/// disk). Zero, the default, costs one relaxed load per write.
+#[doc(hidden)]
+pub fn set_test_write_delay(d: std::time::Duration) {
+    TEST_WRITE_DELAY_US.store(d.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn test_delay() {
+    let us = TEST_WRITE_DELAY_US.load(std::sync::atomic::Ordering::Relaxed);
+    if us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(us));
+    }
 }
 
 fn run(mut ring: IoUring, rx: std::sync::mpsc::Receiver<Req>, wake: File) {

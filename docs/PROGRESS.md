@@ -3,6 +3,20 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-22 — A stalling disk no longer stops a host's lease (ADR-092)
+
+Offloads to aviary stalled for 4-13 s every minute or two, and its lease
+lapsed with them (once for 13 s). Per-disk sampling on the NAS: its raidz1
+of eight SATA SSDs waits on two Transcend SSD230S that go 100% busy while
+writing nothing (garbage collection); two 870 QVO (QLC) run 80-100% busy
+and cap the pool near 1 GB/s. The disks are TJ's to replace; sparknest's
+part was the lease: without io_uring (QNAP's kernel) transfer writes ran
+on the async workers, so a stalled disk held them all and the renewal could
+not run. They now run on the blocking pool
+(`a_stalled_write_leaves_the_runtime_running` fails on 0.9.1). The NAS also
+had 802.3x pause on and ECN passive (no ADR-088 tuning): set off and 1 by
+hand (not yet persistent); TJ set its MTU to 9000 in the UI.
+
 ## 2026-11-20 — 0.9.1: lane threads, stale dials and lost host jobs (ADR-091)
 
 The first big offload to aviary (Mistral-Large-4, 988 GiB) stalled: the

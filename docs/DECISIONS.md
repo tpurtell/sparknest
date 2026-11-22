@@ -3258,3 +3258,30 @@ host jobs (state to recover for what restarting the part does).
 **Consequences.** A lane's threads end with it. A removed member is
 dialled no more. A target restarting mid-copy costs the copies in flight,
 not the job.
+
+## ADR-092 — Transfer writes never block the runtime's workers (2026-11-22)
+
+**Context.** The NAS host (aviary) stopped serving for up to 13 s at a time
+under a large offload. Its pool is a raidz1 of eight SATA SSDs, two of them
+Transcend SSD230S that collect garbage for 4-13 s under a long write; the
+whole stripe waits, so writes stall. Its kernel has no io_uring (ADR-042's
+ring is unavailable), and there `Staging::write`, an async function, wrote
+each chunk with `pwrite` on the calling tokio worker. A copy keeps a window
+of chunks in flight, so a few copies held every worker in a stalled `pwrite`
+and the lease renewal (a timer and a barrier on the same workers) could not
+run: the host's lease lapsed though the cluster was answering.
+
+**Decision.** Without the ring, or without O_DIRECT, an async transfer
+write runs on tokio's blocking pool and is counted in the transfer's window
+like a ring write (`pending`), so `flushed` and commit wait for it as
+before. `write_blocking` (callers already on blocking threads) is unchanged.
+`SPARKNEST_NO_IO_URING=1` turns the ring off, for this fallback's test and
+for comparing the two.
+
+**Alternatives.** More worker threads (moves the limit, does not remove
+it); a dedicated write thread per store (serializes what the window lets
+run in parallel); a longer lease (a cut-off host would serve for longer).
+
+**Consequences.** A slow disk slows its own transfers only. At most
+window × parallel copies (8 × 8) blocking threads per job, well under
+tokio's 512.
