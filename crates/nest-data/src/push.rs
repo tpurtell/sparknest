@@ -47,6 +47,8 @@ const STALL: Duration = Duration::from_secs(30);
 /// A group quiet this long when its coordinator leaves gets the stall's
 /// cause in its reason.
 const STALL_NOTE: Duration = Duration::from_secs(5);
+/// How often the hub logs a moving load's progress.
+const PROGRESS_LOG: Duration = Duration::from_secs(30);
 /// How long `Start` waits for every rank to join.
 const JOIN_WAIT: Duration = Duration::from_secs(60);
 /// RPC deadline between hosts.
@@ -284,6 +286,8 @@ struct HubGroup {
     no_progress: std::collections::HashSet<NodeId>,
     /// Hosts sent GroupProgress at least once (logged on the first).
     told_progress: std::collections::HashSet<NodeId>,
+    /// When the hub last logged this load's progress.
+    logged_at: tokio::time::Instant,
 }
 
 impl HubGroup {
@@ -1027,6 +1031,7 @@ impl Push {
                 owing: Vec::new(),
                 no_progress: Default::default(),
                 told_progress: Default::default(),
+                logged_at: tokio::time::Instant::now(),
             },
         );
         let (me, expect) = {
@@ -1487,7 +1492,22 @@ impl Push {
         };
         if advanced {
             g.progress_at = tokio::time::Instant::now();
-            let (done, total) = (g.delivered.iter().sum(), g.total);
+            let (done, total): (u64, u64) = (g.delivered.iter().sum(), g.total);
+            if g.logged_at.elapsed() >= PROGRESS_LOG {
+                // A slow load (an off-grid source, say) reads as moving, not
+                // stalled: the per-rank line above is logged only once.
+                g.logged_at = tokio::time::Instant::now();
+                let secs = g.t0.elapsed().as_secs_f64().max(0.001);
+                tracing::info!(
+                    group,
+                    done,
+                    total,
+                    pct = (done as f64 * 100.0 / total.max(1) as f64).round() as u64,
+                    elapsed_s = secs as u64,
+                    mb_per_s = (done as f64 / secs / 1e6).round() as u64,
+                    "push group progress"
+                );
+            }
             let _ = g.engine.send(Event::Progress { done, total });
             let hosts = g
                 .rank_hosts

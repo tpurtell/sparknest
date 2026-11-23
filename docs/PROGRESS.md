@@ -3,6 +3,22 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-23 — cassowary's root NVMe hang; a push's progress in the log
+
+cassowary's root NVMe stopped completing I/O at 18:24 (one write in flight,
+no interrupts, controller still "live", no driver timeout or reset); ext4's
+journal and everything behind it (PID 1, sshd, sparknestd's state dir, a
+FUSE read of sealed local files) hung until the box reset itself at 19:09.
+SMART, the error log and a short self-test are clean (88 h, 0% used):
+likely kernel/platform. If it repeats, try `nvme_core.default_ps_max_latency_us=0`
+(APST goes to PS3 after 100 ms idle).
+
+A Step-5 FP8 golden push read as stalled at 174 MB for 9 min: its only
+source was aviary (10GbE), and it was moving ~1 GB/s (514 of 591 GiB when
+it was killed). The only per-load line was "progress reaching this rank",
+logged once. The hub now logs "push group progress" (done, %, elapsed,
+MB/s) every 30 s while a load moves.
+
 ## 2026-11-22 — A stalling disk no longer stops a host's lease (ADR-092)
 
 Offloads to aviary stalled for 4-13 s every minute or two, and its lease
