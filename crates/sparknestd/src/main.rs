@@ -4,6 +4,13 @@ use sparknestd::config::Config;
 use sparknestd::{Node, Tuning};
 use std::path::PathBuf;
 
+/// jemalloc, not glibc's malloc (ADR-093): glibc kept the transfer buffers a
+/// busy host had freed (2.7 GB free of 2.86 GB heap on ostrich after four
+/// days), spread over 160 arenas it never trims on its own. jemalloc's
+/// background thread hands freed pages back after `dirty_decay_ms`.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "sparknestd", version, about = "sparknest node daemon")]
 struct Args {

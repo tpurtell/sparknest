@@ -49,6 +49,8 @@ prost = "0.14"
 bytes = "1"
 parking_lot = "0.12"
 libc = "0.2"
+# sparknestd's allocator (ADR-093): returns freed pages to the OS.
+tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 nix = { version = "0.31", features = ["fs", "user", "mount", "uio"] }
 rand = "0.9"
 tempfile = "3"

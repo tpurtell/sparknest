@@ -1,0 +1,8 @@
+# Build-time settings for jemalloc, sparknestd's allocator (ADR-093).
+[env]
+# jemalloc fixes its page size at build time and refuses a kernel with larger
+# pages. 64 KiB works on 4K, 16K and 64K kernels alike (aarch64 ships all three).
+JEMALLOC_SYS_WITH_LG_PAGE = "16"
+# Freed pages go back to the OS 10 s after use (background thread, enabled by
+# the crate feature); no lazy MADV_FREE stage, so RSS shows what is held.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "dirty_decay_ms:10000,muzzy_decay_ms:0"
