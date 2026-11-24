@@ -3285,3 +3285,36 @@ run in parallel); a longer lease (a cut-off host would serve for longer).
 **Consequences.** A slow disk slows its own transfers only. At most
 window × parallel copies (8 × 8) blocking threads per job, well under
 tokio's 512.
+
+## ADR-093 — sparknestd allocates with jemalloc (2026-11-24)
+
+**Context.** The Sparks' daemons held 3.1-3.8 GB after four days, against
+~1.0 GB of registered RDMA memory and 160 MB of live heap
+(`benchmarks/ALLOCATOR-JEMALLOC.md`). glibc's malloc grows its mmap
+threshold to the largest block freed (up to 32 MiB), so our 1-32 MiB
+transfer buffers come from its arenas after the first free. With ~130
+threads it runs its cap of 160 arenas, and it returns their free memory
+only from the top of each heap, or when `malloc_trim` is called. The heap
+settles at the busiest moment since the start: 2.7 GB free and held on
+ostrich.
+
+**Decision.** sparknestd's global allocator is jemalloc
+(`tikv-jemallocator`, background thread on). Freed pages go back to the OS
+10 s after use (`dirty_decay_ms:10000`), with no lazy MADV_FREE stage
+(`muzzy_decay_ms:0`), so RSS shows what is held. jemalloc's page size is
+fixed when it is built: 64 KiB (`JEMALLOC_SYS_WITH_LG_PAGE=16`,
+`.cargo/config.toml`), so one aarch64 build runs on 4K, 16K and 64K
+kernels. Registered RDMA regions are still allocated by the global
+allocator and freed only after deregistration, so returning pages never
+touches memory a NIC can still reach. The CLI keeps the system allocator.
+
+**Alternatives.** `MALLOC_ARENA_MAX` (fewer arenas each holding its peak;
+still never returned on its own). A periodic `malloc_trim(0)` (returned
+1.26 GB of 2.7 GB on ostrich: free space too fragmented inside 160 arenas).
+mimalloc (similar returns; jemalloc's decay is easier to read and tune on
+a running daemon).
+
+**Consequences.** On the trial push loads a Spark's daemon returned to its
+floor (~1.06 GB) within seconds of each load, against 1.32-1.43 GB kept
+under glibc, with no slower pushes. A C build dependency (jemalloc's
+configure and make, as SQLite's `bundled` is already).

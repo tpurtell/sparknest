@@ -3,6 +3,15 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-24 — sparknestd on jemalloc (ADR-093)
+
+The Sparks' daemons held 3.1-3.8 GB. ostrich's `malloc_info`: 160 glibc
+arenas, 2.72 GB free of a 2.86 GB heap, 160 MB live; a `malloc_trim(0)`
+by hand returned 1.26 GB. sparknestd now allocates with jemalloc. On the
+trial push loads (`benchmarks/ALLOCATOR-JEMALLOC.md`) each Spark's daemon
+returned to its ~1.06 GB floor after every load (glibc kept 1.32-1.43
+GB), and pushes were no slower (15.0-16.8 vs 13.4-13.5 GB/s).
+
 ## 2026-11-23 — cassowary's root NVMe hang; a push's progress in the log
 
 cassowary's root NVMe stopped completing I/O at 18:24 (one write in flight,
