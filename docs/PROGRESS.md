@@ -11,7 +11,9 @@ by hand returned 1.26 GB. sparknestd now allocates with jemalloc. On the
 trial push loads (`benchmarks/ALLOCATOR-JEMALLOC.md`) each Spark's daemon
 returned to its ~1.06 GB floor after every load (glibc kept 1.32-1.43
 GB), and pushes were no slower (15.0-16.8 vs 13.4-13.5 GB/s). Released
-as 0.9.3, with the hub's periodic push progress line.
+as 0.9.3 (tap bottles-20261124-1, image `ghcr.io/tpurtell/sparknest:0.9.3`),
+with the hub's periodic push progress line. Every host has the 0.9.3 keg;
+the daemons keep running 0.9.1/0.9.2 until their next restart.
 
 ## 2026-11-23 — cassowary's root NVMe hang; a push's progress in the log
 
