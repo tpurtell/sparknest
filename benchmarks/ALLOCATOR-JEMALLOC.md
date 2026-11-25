@@ -44,3 +44,21 @@ cold one (shards just written); the later loads (13.4-13.5 vs 15.0-16.8
 GB/s) are the like-for-like comparison. One trial per build: the gain is
 within the run-to-run spread seen before (M13), so read it as "no cost",
 not as a speed-up.
+
+## Production, 0.9.3 (2026-11-25)
+
+Rolled to the six Sparks by CuteAFD's `sparknest-093-roll` (hwlock
+sparks/rhea/moa, one Spark at a time, every container binding the mount
+stopped first: 504 in all). Daemon RSS:
+
+| Spark | 0.9.1, up 4 d 20 h | 0.9.3, idle 60 s after restart | 0.9.3, 4-16 min after |
+|---|---:|---:|---:|
+| ostrich | 3,078 MB | 1,031 MB | 1,042 MB |
+| dodo | 3,415 MB | 1,032 MB | 1,037 MB |
+| emu | 3,741 MB | 1,032 MB | 1,041 MB |
+| kiwi | 3,605 MB | 1,030 MB | 1,043 MB |
+| rhea | 3,031 MB | 1,030 MB | 1,045 MB |
+| moa | 3,223 MB | 1,029 MB | 1,042 MB |
+
+The floor is the registered RDMA memory, as on the trial. After a real
+weight load: pending, the next load to the Sparks.

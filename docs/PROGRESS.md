@@ -3,6 +3,16 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-25 — 0.9.3 on the Sparks
+
+CuteAFD rolled the six Sparks to 0.9.3 (hwlock, one at a time; every
+container binding the mount stopped first, since a restart replaces the
+io_uring FUSE mount, ADR-059). Daemon RSS went from 3.0-3.7 GB (0.9.1,
+up 4 d 20 h) to 1.03 GB at idle, the registered-memory floor
+(`benchmarks/ALLOCATOR-JEMALLOC.md`). The after-load census follows the
+next weight load. Off-grid hosts (kakapo, cassowary, maxq, aviary) stay on
+0.9.1/0.9.2 until their next restart.
+
 ## 2026-11-24 — sparknestd on jemalloc (ADR-093)
 
 The Sparks' daemons held 3.1-3.8 GB. ostrich's `malloc_info`: 160 glibc
