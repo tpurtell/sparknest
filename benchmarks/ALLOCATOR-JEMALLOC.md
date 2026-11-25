@@ -60,5 +60,17 @@ stopped first: 504 in all). Daemon RSS:
 | rhea | 3,031 MB | 1,030 MB | 1,045 MB |
 | moa | 3,223 MB | 1,029 MB | 1,042 MB |
 
-The floor is the registered RDMA memory, as on the trial. After a real
-weight load: pending, the next load to the Sparks.
+The floor is the registered RDMA memory, as on the trial.
+
+After real weight loads (20:45, 12.3 h after the roll; raptor hubbed many
+300-550 GB pushes to 4-8 ranks at 25-43 GB/s through the afternoon):
+
+| Spark | peak (VmHWM) | now |
+|---|---:|---:|
+| ostrich | 4,052 MB | 1,177 MB |
+| emu | 1,893 MB | 1,159 MB |
+| kiwi | 2,179 MB | 1,154 MB |
+| dodo / rhea / moa | | 1,167-1,172 MB |
+
+Every Spark is back within ~150 MB of its idle floor, where 0.9.1 kept
+3.0-3.7 GB.
