@@ -236,7 +236,8 @@ cannot reach the Ubuntu mirrors.
 - `docker compose pull && docker compose up -d`: upgrade. `docker stop`
   shuts it down cleanly (60 s grace), so it restarts without a check of its
   objects.
-- `docker run --rm -v STATE:/srv/sparknest IMAGE sparknestd fsck`: check
-  its objects with the daemon stopped.
+- `docker compose run --rm sparknest sparknestd --config
+  /srv/sparknest/node.toml fsck`: check its objects with the daemon
+  stopped (compose mounts the data folder too, when there is one).
 - A held host that should not be (a folder brought in by hand, say):
   `nest cluster release aviary --dry-run`, then without `--dry-run`.
