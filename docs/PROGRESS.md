@@ -3,6 +3,16 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-26 — eyrie: cold storage on a spinning disk
+
+eyrie (QNAP TS-X64, 172.22.1.11, 10 GbE) joined as off-grid host 13 on
+0.9.4, split from the start: state on its NVMe mirror
+(`/share/ZFS18_DATA/Container/sparknest/state`), copies on one 29 TB
+spinning disk (`/share/ZFS20_DATA/models/sparknest`), `disk_transfers = 2`.
+Its first start marked the data folder; it serves with 25.2 TiB free. A
+1.9 GiB, 22-file test copy took 29 s and was evicted. Not in any other
+host's `members` yet (it dials them; add it at their next config change).
+
 ## 2026-11-26 — A host's copies on disks of their own; copies at once per host (ADR-094)
 
 `node.data_dir` puts a host's `objects/` and `staging/` in a folder apart

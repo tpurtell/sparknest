@@ -134,12 +134,22 @@ and `scripts/deploy-cluster.sh` write `lan` from `SPARKNEST_LAN`.
 ## Existing mounts relevant to sparknest
 
 - aviary (QNAP TS-855X, 172.22.1.10) runs sparknest in Container Station
-  as off-grid host 12 (`packaging/docker`), state dir
-  `/share/ZFS24_DATA/models/sparknest`, compose in `sparknest-container/`
-  beside it. It adopted the `models` archive on 2026-11-20 (ADR-090); the
+  as off-grid host 12 (`packaging/docker`): compose, `.env`, README and
+  `state/` in `/share/ZFS19_DATA/Container/sparknest` (NVMe mirror), copies
+  (`data_dir`) in `/share/ZFS24_DATA/models/sparknest` (since 2026-11-26,
+  ADR-094). Login `litchi`; docker is
+  `/share/ZFS1_DATA/.qpkg/container-station/bin/docker`. It adopted the `models` archive on 2026-11-20 (ADR-090); the
   `//aviary/models` SMB mount (`/mnt/models`) was then dropped from every
   host's `~/.local/bin/mount-nas.sh` and unmounted. TJ Photos and Public
   are still mounted by that script.
+- eyrie (QNAP TS-X64, Celeron N5095, 16 GB, 172.22.1.11, 10 GbE) is cold
+  storage: off-grid host 13 in Container Station since 2026-11-26. Compose,
+  `.env`, README and `state/` in `/share/ZFS18_DATA/Container/sparknest`
+  (NVMe mirror, zpool1); copies in `/share/ZFS20_DATA/models/sparknest`
+  (one 29 TB spinning disk, zpool3), `disk_transfers = 2`. Login `bella`
+  (1000:100, the container's user); docker is
+  `/share/ZFS530_DATA/.qpkg/container-station/usr/bin/docker` (the
+  `bin/docker` wrappers point at a missing path).
 - `/mnt/scratch` on raptor: `/dev/sda2` Samsung 870 7.3T, **ntfs3** (1.5T
   free). Exported as `10.55.0.22:/mnt/scratch` and mounted on Sparks at
   `/mnt/nfs/raptor-scratch` (NFSv4.2 over RDMA). → archive store, raptor as
