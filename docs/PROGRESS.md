@@ -18,6 +18,7 @@ copies, refuse a missing or foreign marker, a new host split from the
 start, the cap held at 1 across two 8-wide jobs: 6 at once without it).
 For aviary: run 0.9.4 once as it is, then move its small files to the NVMe
 mirror (`/share/ZFS19_DATA`) and keep the 8.6 TB on ZFS24 as the data dir.
+Released as 0.9.4.
 
 ## 2026-11-25 — 0.9.3 on the Sparks
 
