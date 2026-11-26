@@ -22,6 +22,15 @@ Released as 0.9.4 (tap bottles-20261126-1, image
 `ghcr.io/tpurtell/sparknest:0.9.4`); every host has the 0.9.4 keg, the
 daemons keep running 0.9.3 (raptor older) until their next restart.
 
+aviary moved the same day: it ran 0.9.4 once as it was (marker written),
+then its state (647 MB: metadata, Raft log, snapshots, backups) went to
+the NVMe mirror at `/share/ZFS19_DATA/Container/sparknest/state`, with
+compose and `.env` beside it; the 8.5 TB of copies stay on ZFS24
+(`/share/ZFS24_DATA/models/sparknest`, `data_dir`). Down about a minute;
+serving, not held. The archive-era `meta/`, `staging-1/` and the old
+compose folder (renamed `sparknest-container.old-0.9.3`) are gone or
+retired. The copy across shares left the moved files 0777; reset.
+
 ## 2026-11-25 — 0.9.3 on the Sparks
 
 CuteAFD rolled the six Sparks to 0.9.3 (hwlock, one at a time; every

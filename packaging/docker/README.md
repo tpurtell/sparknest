@@ -158,7 +158,7 @@ everything in its state dir, so the marker is there):
 
    ```sh
    OLD=/share/ZFS24_DATA/models/sparknest      # copies stay here
-   NEW=/share/ZFS19_DATA/sparknest/state       # on the SSD mirror
+   NEW=/share/ZFS19_DATA/Container/sparknest/state  # on the SSD mirror
    mkdir -p "$NEW"
    cd "$OLD"
    mv node.toml cluster.secret meta.sqlite* raft.sqlite* snapshots \
@@ -168,6 +168,11 @@ everything in its state dir, so the marker is there):
 
    `mv` across filesystems copies, then removes: run it with the host
    stopped. Leave `objects/`, `staging/` and `.sparknest-host` in `OLD`.
+   On QNAP run it as the container's user (`docker run --rm --user
+   UID:GID --entrypoint /bin/sh -v $OLD:/old -v $NEW:/new` the image),
+   then check the modes: the copy onto another ZFS share can leave the
+   files 0777, `cluster.secret` included (`chmod 600 cluster.secret`,
+   `644` for the rest).
 3. In `NEW/node.toml` set `data_dir = "/srv/sparknest-data"`. In compose,
    `STATE=$NEW`, `DATA=$OLD`, and uncomment the second volume.
 4. `docker compose up -d`; `nest status` shows it serving, not held, with
