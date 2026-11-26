@@ -72,6 +72,11 @@ pub struct TestCluster {
     /// Fabric hosts also reachable on a "LAN" (ADR-057): nodes listen on
     /// every address, 127.0.0.1 plays the fabric and 127.0.0.2 the LAN.
     standby: bool,
+    /// Nodes whose objects live in a folder of their own
+    /// (`node.data_dir`), apart from their state dir.
+    split: std::collections::BTreeSet<u64>,
+    /// `node.disk_transfers` per node (unset: the default).
+    disk_transfers: BTreeMap<u64, usize>,
 }
 
 impl TestCluster {
@@ -103,6 +108,8 @@ impl TestCluster {
             offgrid: Default::default(),
             lanes: BTreeMap::new(),
             standby,
+            split: Default::default(),
+            disk_transfers: BTreeMap::new(),
         };
         if standby {
             // Pick every node's ports first, so each config names all the
@@ -149,6 +156,27 @@ impl TestCluster {
         self.dir.path().join(format!("node{id}"))
     }
 
+    /// Where node `id` keeps its objects: its own folder once
+    /// [`TestCluster::split_data`] was called for it, else its state dir.
+    pub fn data_dir(&self, id: u64) -> PathBuf {
+        if self.split.contains(&id) {
+            self.dir.path().join(format!("data{id}"))
+        } else {
+            self.state_dir(id)
+        }
+    }
+
+    /// From node `id`'s next start, keep its objects and staging in a
+    /// folder apart from its state dir (`node.data_dir`).
+    pub fn split_data(&mut self, id: u64) {
+        self.split.insert(id);
+    }
+
+    /// Set node `id`'s `node.disk_transfers` from its next start.
+    pub fn set_disk_transfers(&mut self, id: u64, n: usize) {
+        self.disk_transfers.insert(id, n);
+    }
+
     /// Where node `id` listens for an address of it: every address when
     /// there is a standby.
     fn listen_addr(&self, a: SocketAddr) -> SocketAddr {
@@ -177,6 +205,8 @@ impl TestCluster {
                 id: NodeId(id),
                 name: format!("n{id}"),
                 state_dir: self.state_dir(id),
+                data_dir: self.split.contains(&id).then(|| self.data_dir(id)),
+                disk_transfers: self.disk_transfers.get(&id).copied(),
                 mountpoint: None,
                 listen,
                 api_listen: None,
@@ -364,6 +394,21 @@ impl TestCluster {
     pub async fn restart(&mut self, id: u64) {
         let addr = self.listen_addr(self.addrs[&id]);
         self.boot(id, addr).await;
+    }
+
+    /// Restart a stopped node, returning its start error instead of
+    /// panicking (a start that must be refused).
+    pub async fn try_restart(&mut self, id: u64) -> anyhow::Result<()> {
+        let cfg = self.config(id, self.listen_addr(self.addrs[&id]));
+        let mut tuning = self.tuning.clone();
+        tuning.boot_id = Some(format!("test-boot-{}", self.boots.entry(id).or_insert(0)));
+        let node = Node::start(cfg, b"testkit-secret".to_vec(), tuning, false).await?;
+        self.addrs.insert(id, loopback(node.rpc.local_addr()));
+        if let Some(a) = node.vfs.lanes().and_then(|l| l.local_addr()) {
+            self.lanes.insert(id, loopback(a));
+        }
+        self.nodes.insert(id, node);
+        Ok(())
     }
 
     /// Copy a stopped node's state directory: what its disk holds at this

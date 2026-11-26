@@ -11,6 +11,13 @@ api_listen = "10.55.0.22:7411"
 # Free space object data must leave on the state_dir filesystem for the
 # metadata database and Raft log; writes past it fail with ENOSPC.
 data_reserve_gib = 4
+# Optional (ADR-094): keep this host's copies (objects/, staging/) on other
+# disks, the rest (metadata, Raft log, usage, backups) in state_dir. Free
+# space and the reserve are then the data dir's.
+# data_dir = "/srv/sparknest-data"
+# Copies written into each of this host's disks at once (default 8, for
+# SSDs); 2 on spinning disks.
+# disk_transfers = 2
 
 [cluster]
 name = "trial"

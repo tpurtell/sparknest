@@ -553,7 +553,7 @@ pub async fn delete(vfs: Arc<Vfs>, area: Arc<BackupArea>, id: u64) -> NestResult
 /// files on an SMB share ("database is locked"), so each is written on this
 /// host's own disk and copied in whole (ADR-056).
 fn local_scratch(vfs: &Vfs) -> NestResult<PathBuf> {
-    let dir = vfs.data().store().root().join("tmp-sqlite");
+    let dir = vfs.data().state_dir().join("tmp-sqlite");
     std::fs::create_dir_all(&dir).map_err(io)?;
     Ok(dir)
 }
@@ -594,7 +594,7 @@ fn sweep_tmp(dir: &Path) {
 
 /// Where a host keeps its metadata backups (ADR-090), under its state dir.
 pub fn meta_backup_dir(vfs: &Vfs) -> PathBuf {
-    vfs.data().store().root().join("backups").join("meta")
+    vfs.data().state_dir().join("backups").join("meta")
 }
 
 /// Write a metadata backup from this host's own replica into its state

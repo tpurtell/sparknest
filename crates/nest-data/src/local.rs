@@ -173,7 +173,31 @@ pub struct DataNode {
     held: std::sync::atomic::AtomicBool,
     /// Objects the last sweep kept only because the host is held.
     held_objects: AtomicU64,
+    /// Where this host keeps everything but its copies (ADR-094): HOLD,
+    /// usage, metadata backups, scratch, the disk read rate. The store's
+    /// root unless `node.data_dir` set the objects apart.
+    state_dir: std::path::PathBuf,
+    /// Copies written into each of this host's disks at once.
+    disk_transfers: usize,
     weak: Weak<DataNode>,
+}
+
+/// Copies written into one of a host's own disks at once unless
+/// `node.disk_transfers` says otherwise (ADR-073): enough to keep an NVMe
+/// busy, so a job spread over a host's disks fills them together.
+pub const DISK_TRANSFERS: usize = 8;
+
+/// The marker naming the host whose objects a folder holds (ADR-094).
+pub const HOST_MARKER: &str = ".sparknest-host";
+
+/// How a host lays out its state and how hard it drives its disks.
+#[derive(Clone, Debug, Default)]
+pub struct DataOptions {
+    /// State other than copies (default: the store's root).
+    pub state_dir: Option<std::path::PathBuf>,
+    /// Copies written into each own disk at once (default
+    /// [`DISK_TRANSFERS`]).
+    pub disk_transfers: Option<usize>,
 }
 
 /// The file in a host's state dir that holds it (ADR-090).
@@ -198,6 +222,17 @@ impl DataNode {
         store: Arc<ObjectStore>,
         lease: std::time::Duration,
     ) -> (Arc<DataNode>, Arc<dyn EffectHandler>) {
+        Self::with_options(id, store, lease, DataOptions::default())
+    }
+
+    /// [`DataNode::new`] with the host's layout and limits (ADR-094).
+    pub fn with_options(
+        id: NodeId,
+        store: Arc<ObjectStore>,
+        lease: std::time::Duration,
+        opts: DataOptions,
+    ) -> (Arc<DataNode>, Arc<dyn EffectHandler>) {
+        let state_dir = opts.state_dir.unwrap_or_else(|| store.root().to_path_buf());
         let (gate, _) = watch::channel(false);
         let (stopping, _) = watch::channel(false);
         let mut senders = Vec::with_capacity(SHARDS);
@@ -231,6 +266,8 @@ impl DataNode {
             disks: Mutex::new(HashMap::new()),
             held: std::sync::atomic::AtomicBool::new(false),
             held_objects: AtomicU64::new(0),
+            state_dir,
+            disk_transfers: opts.disk_transfers.unwrap_or(DISK_TRANSFERS).max(1),
         });
         for rx in receivers {
             tokio::spawn(worker(Arc::downgrade(&d), rx, d.gate.subscribe()));
@@ -245,6 +282,16 @@ impl DataNode {
 
     pub fn store(&self) -> &Arc<ObjectStore> {
         &self.store
+    }
+
+    /// Where this host keeps its state other than copies (ADR-094).
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+
+    /// Copies written into each of this host's disks at once.
+    pub fn disk_transfers(&self) -> usize {
+        self.disk_transfers
     }
 
     pub fn meta(&self) -> &Arc<MetaNode> {
@@ -651,7 +698,7 @@ impl DataNode {
                 unlisted: unlisted.len() as u64,
             });
         }
-        let hold = self.store.root().join(HOLD_FILE);
+        let hold = self.state_dir.join(HOLD_FILE);
         match std::fs::remove_file(&hold) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

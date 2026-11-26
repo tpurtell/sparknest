@@ -78,8 +78,23 @@ impl HfSection {
 pub struct NodeSection {
     pub id: NodeId,
     pub name: String,
-    /// Root of all node-local state (databases, objects, staging).
+    /// Root of all node-local state: databases, Raft log, snapshots,
+    /// usage, backups, sockets; and the objects too unless `data_dir`
+    /// names a folder for them.
     pub state_dir: PathBuf,
+    /// Where this host keeps its copies (`objects/`, `staging/`) when not
+    /// in `state_dir` (ADR-094): bulk data on its own disks, everything
+    /// else on the state dir's. Free space, the data reserve and the disk
+    /// read rate are those of this folder. It must carry this host's
+    /// marker (`.sparknest-host`, written on a start without `data_dir`):
+    /// a folder without it (an unmounted disk) is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PathBuf>,
+    /// Copies written into each of this host's disks at once (default 8,
+    /// for SSDs). On spinning disks 2: each file lands in long runs and
+    /// the disk never waits for the network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_transfers: Option<usize>,
     /// Where the filesystem is mounted. Omit to run without a mount
     /// (metadata/data service only).
     pub mountpoint: Option<PathBuf>,
@@ -88,8 +103,9 @@ pub struct NodeSection {
     /// Management API listener on the network (bearer auth). The Unix
     /// socket `<state_dir>/api.sock` is always served.
     pub api_listen: Option<SocketAddr>,
-    /// Space object data must leave free on the state directory's
-    /// filesystem for metadata and the Raft log (writes past it get ENOSPC).
+    /// Space object data must leave free on its filesystem (the data
+    /// dir's), for metadata and the Raft log when they share it (writes
+    /// past it get ENOSPC).
     #[serde(default = "default_reserve_gib")]
     pub data_reserve_gib: u64,
     /// `fabric` (default) or `offgrid`: a host reaching the cluster over
@@ -129,6 +145,18 @@ fn default_lanes_fabric() -> usize {
 }
 
 impl NodeSection {
+    /// The folder holding this host's objects and staging.
+    pub fn data_dir(&self) -> &Path {
+        self.data_dir.as_deref().unwrap_or(&self.state_dir)
+    }
+
+    /// True when the objects live apart from the state dir.
+    pub fn split(&self) -> bool {
+        self.data_dir
+            .as_deref()
+            .is_some_and(|d| d != self.state_dir)
+    }
+
     pub fn lanes_listen(&self) -> SocketAddr {
         self.lanes_listen
             .unwrap_or_else(|| port_plus_2(self.listen))
@@ -315,6 +343,9 @@ impl Config {
         }
         if self.node.id.0 == 0 {
             bail!("node.id must be non-zero");
+        }
+        if self.node.disk_transfers == Some(0) {
+            bail!("node.disk_transfers must be at least 1");
         }
         if let Some(a) = self.node.counters_listen
             && !a.ip().is_loopback()

@@ -3318,3 +3318,61 @@ a running daemon).
 floor (~1.06 GB) within seconds of each load, against 1.32-1.43 GB kept
 under glibc, with no slower pushes. A C build dependency (jemalloc's
 configure and make, as SQLite's `bundled` is already).
+
+## ADR-094 — A host's copies may live apart from its state; copies written at once are a host setting (2026-11-26)
+
+**Context.** A host keeps everything in its state dir: the metadata and Raft
+log (small, written all the time), and its copies (bulk). On the NAS host
+(aviary) that dir is on its pool of eight SATA SSDs, whose garbage
+collection stalls the whole stripe for seconds (ADR-092), while the NAS
+also has an NVMe mirror, nearly empty. A second NAS, with spinning disks
+(~275 MB/s, few IOPS), is to hold the coldest models; on it the SQLite
+files should not share the disks with the copies at all. And each of a
+host's disks took up to 8 copies at once (`DISK_TRANSFERS`, ADR-073): right
+for NVMe, but on spinning disks 8 interleaved writers seek between files,
+and each file ends up in short runs that a later read seeks through.
+
+**Decision.**
+1. **`node.data_dir`** names the folder for the host's copies: `objects/`
+   and `staging/`. Unset, it is the state dir, as before. Everything else
+   stays in the state dir: metadata, Raft log, snapshots, recovery
+   scratch, `run.json`, sockets, `HOLD`, `usage.sqlite`, metadata backups
+   (`backups/meta/`) and their scratch (`tmp-sqlite/`), the measured disk
+   rate and the deep fsck's list of verified copies. Free space, the data
+   reserve and the disk read rate are the data dir's. The rate and the
+   verified list record the data dir they are for, so pointing a host at
+   another folder measures and verifies afresh.
+2. **The data dir carries a marker naming its host**
+   (`.sparknest-host`, `cluster=<name> host=<id>`), written on any start
+   that finds none where none is needed: an unsplit host (the folder is
+   its by being its state dir; hosts before 0.9.4 get theirs this way), or
+   a first start (no metadata yet). A host with metadata whose data dir
+   has no marker, or another host's, does not start, before it binds a
+   port or tells the cluster it is starting: an unmounted disk's empty
+   mountpoint would otherwise make every copy it lists look lost, and the
+   reconcile would retire them all. The marker is not the archives'
+   `.sparknest-store` (ADR-019), so a folder being adopted (ADR-090) keeps
+   both until adoption drops the archive's.
+3. **`node.disk_transfers`** (default 8) caps the copies written into each
+   of the host's disks at once, across every job and source. A spinning
+   disk takes 2: a copy writes 256 MiB, then waits for its flush
+   (ADR-040); with 1 the disk idles while the next 256 MiB arrives, with 2
+   one file fills while the other is written, and each file still lands
+   in runs of up to 256 MiB.
+
+**Alternatives.** Bind-mounting `objects/` from another filesystem inside
+an unchanged state dir (statvfs would report the state dir's disk, and a
+finished copy's rename from `staging/` into `objects/` would cross
+mounts: EXDEV on every transfer); a symlinked `objects/` (the same rename
+problem, and free space still wrong); metadata backups in the data dir
+(the SSD mirror is safer than the bulk pool, the metadata is replicated on
+every host anyway, and on spinning disks nothing small should land there);
+the read side capped too (push loads already read one stream per store;
+left until restores from a cold host show the need).
+
+**Consequences.** aviary can keep its SQLite on its NVMe mirror and its
+8.6 TB where it is: run 0.9.4 once as it is (writing the marker), stop,
+move the small files to a new state dir, start with `data_dir` set (the
+container README's steps). A cold NAS on spinning disks runs with
+`disk_transfers = 2` and its state on an SSD. Hosts that set neither run
+as before, apart from the marker file in their state dir.

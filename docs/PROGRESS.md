@@ -3,6 +3,22 @@
 Newest first. One entry per meaningful step: what landed, what was measured,
 what is next. Keep entries short; link to benchmarks and ADRs.
 
+## 2026-11-26 — A host's copies on disks of their own; copies at once per host (ADR-094)
+
+`node.data_dir` puts a host's `objects/` and `staging/` in a folder apart
+from its state dir; everything else (metadata, Raft log, snapshots, usage,
+HOLD, metadata backups, the disk rate, fsck's verified list) stays in the
+state dir, and free space and the reserve are the data dir's. The data dir
+carries a `.sparknest-host` marker, written on a host's first 0.9.4 start;
+a host with metadata refuses a data dir without its marker (an unmounted
+disk) before binding a port. `node.disk_transfers` (default 8) caps the
+copies written into each disk at once; 2 for the spinning-disk NAS to come.
+Tests: `crates/nest-testkit/tests/datadir.rs` (move an existing host's
+copies, refuse a missing or foreign marker, a new host split from the
+start, the cap held at 1 across two 8-wide jobs: 6 at once without it).
+For aviary: run 0.9.4 once as it is, then move its small files to the NVMe
+mirror (`/share/ZFS19_DATA`) and keep the 8.6 TB on ZFS24 as the data dir.
+
 ## 2026-11-25 — 0.9.3 on the Sparks
 
 CuteAFD rolled the six Sparks to 0.9.3 (hwlock, one at a time; every

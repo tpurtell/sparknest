@@ -20,9 +20,13 @@ services:
     # `id -u USER` and `id -g USER` there.
     user: "${SPARKNEST_UID:-1000}:${SPARKNEST_GID:-1000}"
     volumes:
-      # The state dir: node.toml, cluster.secret, metadata and this host's
-      # objects. Keep it on the disks it should serve from.
+      # The state dir: node.toml, cluster.secret, metadata and, unless
+      # node.data_dir says otherwise, this host's objects.
       - ${STATE:-./state}:/srv/sparknest
+      # Optional (ADR-094): this host's copies on disks of their own, with
+      # `data_dir = "/srv/sparknest-data"` in node.toml. Uncomment and set
+      # DATA:
+      # - ${DATA}:/srv/sparknest-data
     # Stopped cleanly, it starts again without a check of its objects.
     stop_grace_period: 60s
     ulimits:

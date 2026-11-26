@@ -22,6 +22,10 @@ pub struct DiskBandwidth {
     pub bytes_per_s: u64,
     /// Unix seconds.
     pub measured_at: u64,
+    /// The folder measured, when it is not the one the file sits in
+    /// (ADR-094): a host pointed at another data dir measures afresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
 }
 
 fn file(dir: &Path) -> PathBuf {
@@ -30,6 +34,19 @@ fn file(dir: &Path) -> PathBuf {
 
 pub fn load(dir: &Path) -> Option<DiskBandwidth> {
     serde_json::from_slice(&std::fs::read(file(dir)).ok()?).ok()
+}
+
+/// The rate kept in `state` for the disk holding `data`: none if it was
+/// measured on another folder (ADR-094). With the objects in the state
+/// dir (`state == data`) an unlabelled measurement is this disk's.
+pub fn load_for(state: &Path, data: &Path) -> Option<DiskBandwidth> {
+    let b = load(state)?;
+    let here = data.display().to_string();
+    match &b.data_dir {
+        Some(d) if *d == here => Some(b),
+        None if state == data => Some(b),
+        _ => None,
+    }
 }
 
 pub fn save(dir: &Path, b: &DiskBandwidth) {

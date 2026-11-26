@@ -22,7 +22,10 @@ works; the QNAP notes below are for one we run.
 
 - **A folder for the state dir**, bind-mounted at `/srv/sparknest`. It holds
   `node.toml`, `cluster.secret`, the metadata and this host's objects, so put
-  it on the disks that should serve.
+  it on the disks that should serve. Or (ADR-094) keep the copies in a
+  second folder on the big disks, mounted at `/srv/sparknest-data`
+  (`DATA` in compose, `data_dir` in `node.toml`), and the state dir on
+  fast ones: below, "Copies on disks of their own".
 - **The host's network** (`network_mode: host`). The cluster dials the host
   at its LAN address on port 7400 (7401 for the API and web UI); there is no
   port mapping to keep in step with `node.toml`.
@@ -130,6 +133,45 @@ Every host must run 0.9.0 or later. With the archive `models` at
 Files that live only in that archive cannot be read between step 3's
 command and the host serving them; with the host already running and
 held, that gap is a moment.
+
+## Copies on disks of their own
+
+The state dir holds everything small and busy: the metadata and Raft log,
+snapshots, usage statistics, metadata backups, sockets. The copies are bulk.
+With `data_dir` they go in a folder of their own (`objects/`, `staging/`
+and its `.sparknest-host` marker), so a NAS can keep its SQLite files on an
+SSD mirror and its copies on the big pool. Free space, the data reserve and
+the measured disk read rate are then the data folder's.
+
+The data folder carries a marker naming its host, written on the host's
+first 0.9.4 start. A host that has metadata never starts on a data folder
+without it (an unmounted disk, a wrong path): it stops with an error, where
+otherwise every copy it lists would look lost.
+
+**Moving an existing host's copies** (it must have run 0.9.4 once, with
+everything in its state dir, so the marker is there):
+
+1. Stop it (`docker compose down`).
+2. Pick the two folders. To keep the copies where they are (no bulk move),
+   the old state dir becomes the data folder, and a new state dir gets
+   the rest:
+
+   ```sh
+   OLD=/share/ZFS24_DATA/models/sparknest      # copies stay here
+   NEW=/share/ZFS19_DATA/sparknest/state       # on the SSD mirror
+   mkdir -p "$NEW"
+   cd "$OLD"
+   mv node.toml cluster.secret meta.sqlite* raft.sqlite* snapshots \
+      usage.sqlite disk-bandwidth.json run.json backups tmp-sqlite \
+      "$NEW"/          # whichever exist; HOLD and fsck-verified too
+   ```
+
+   `mv` across filesystems copies, then removes: run it with the host
+   stopped. Leave `objects/`, `staging/` and `.sparknest-host` in `OLD`.
+3. In `NEW/node.toml` set `data_dir = "/srv/sparknest-data"`. In compose,
+   `STATE=$NEW`, `DATA=$OLD`, and uncomment the second volume.
+4. `docker compose up -d`; `nest status` shows it serving, not held, with
+   the data folder's free space.
 
 ## QNAP (QuTS hero / QTS 5, Container Station)
 

@@ -362,7 +362,8 @@ pub struct Vfs {
     /// gains nothing from more; dozens of queued offloads once pinned
     /// hundreds of threads on a 150 MB/s disk).
     archive_slots: Mutex<HashMap<nest_types::StoreId, Arc<tokio::sync::Semaphore>>>,
-    /// Transfers into each of this host's stores (`DISK_TRANSFERS`).
+    /// Transfers into each of this host's stores (`node.disk_transfers`,
+    /// default `DISK_TRANSFERS`).
     disk_slots: Mutex<HashMap<nest_types::StoreId, Arc<tokio::sync::Semaphore>>>,
     inflight_done: tokio::sync::Notify,
     fence_hooks: Mutex<Vec<FenceHook>>,
@@ -482,11 +483,12 @@ impl Vfs {
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             owned: Mutex::new(HashMap::new()),
-            usage: Arc::new(crate::usage::Usage::open(d.store().root())),
+            usage: Arc::new(crate::usage::Usage::open(d.state_dir())),
             balancer: Arc::new(crate::balance::Balancer::default()),
             io: Arc::default(),
             disk_bps: Arc::new(AtomicU64::new(
-                crate::diskprobe::load(d.store().root()).map_or(0, |b| b.bytes_per_s),
+                crate::diskprobe::load_for(d.state_dir(), d.store().root())
+                    .map_or(0, |b| b.bytes_per_s),
             )),
             fences: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
@@ -3163,7 +3165,7 @@ impl Vfs {
                 .disk_slots
                 .lock()
                 .entry(target)
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(DISK_TRANSFERS)))
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.d.disk_transfers())))
                 .clone();
             Some(
                 sem.acquire_owned()
@@ -3701,11 +3703,6 @@ impl Vfs {
 /// Transfers into one archive store at once.
 const ARCHIVE_TRANSFERS: usize = 2;
 
-/// Transfers into one of a host's own stores at once (ADR-073): enough to
-/// keep an NVMe busy, so a job spread over a host's disks fills them
-/// together.
-const DISK_TRANSFERS: usize = 8;
-
 /// How long a handle trusts a STABLE generation's attributes on the fast
 /// path.
 const ATTR_TTL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -3851,7 +3848,8 @@ async fn probe_disk(vfs: Weak<Vfs>) {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let last = crate::diskprobe::load(v.d.store().root()).map_or(0, |b| b.measured_at);
+        let last = crate::diskprobe::load_for(v.d.state_dir(), v.d.store().root())
+            .map_or(0, |b| b.measured_at);
         let due = now.saturating_sub(last) >= DAY;
         if due && v.balancer.idle() && v.handles.lock().is_empty() {
             let store = v.d.store().clone();
@@ -3863,8 +3861,9 @@ async fn probe_disk(vfs: Weak<Vfs>) {
                 let b = crate::diskprobe::DiskBandwidth {
                     bytes_per_s: bps,
                     measured_at: now,
+                    data_dir: Some(v.d.store().root().display().to_string()),
                 };
-                crate::diskprobe::save(v.d.store().root(), &b);
+                crate::diskprobe::save(v.d.state_dir(), &b);
                 v.disk_bps.store(bps, Ordering::Relaxed);
                 tracing::info!(bytes_per_s = bps, "disk read rate measured");
             }
@@ -3881,6 +3880,7 @@ async fn probe_disk(vfs: Weak<Vfs>) {
                     let b = crate::diskprobe::DiskBandwidth {
                         bytes_per_s: bps,
                         measured_at: now,
+                        data_dir: None,
                     };
                     crate::diskprobe::save(d.store.root(), &b);
                     tracing::info!(disk = %d.name, bytes_per_s = bps, "disk read rate measured");

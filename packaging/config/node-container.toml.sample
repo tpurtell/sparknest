@@ -13,8 +13,17 @@
 id = 12
 name = "aviary"
 role = "offgrid"
-# Inside the container; the folder mounted there holds everything.
+# Inside the container; the folder mounted there holds everything, unless
+# data_dir below puts the copies on other disks.
 state_dir = "/srv/sparknest"
+# Optional (ADR-094): this host's copies (objects/, staging/) in a folder of
+# their own, mounted at /srv/sparknest-data (DATA in compose.yaml): bulk
+# data on the big disks, metadata and the rest on fast ones. See README.md
+# for moving an existing host's copies there.
+# data_dir = "/srv/sparknest-data"
+# Copies written into this host's disks at once (default 8, for SSDs). On
+# spinning disks 2: each file lands in long runs, and the disk never waits.
+# disk_transfers = 2
 # No mountpoint: the namespace is not mounted in the container (a host that
 # only stores and serves needs none). To mount it, see compose.yaml.
 listen = "0.0.0.0:7400"

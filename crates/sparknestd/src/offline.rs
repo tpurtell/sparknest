@@ -35,7 +35,8 @@ pub fn fsck(cfg: &Config) -> anyhow::Result<OfflineReport> {
         .into_iter()
         .map(|a| ObjectKey::new(a.id, a.generation))
         .collect();
-    let store = ObjectStore::open_readonly(dir).context("opening the object store")?;
+    let store =
+        ObjectStore::open_readonly(cfg.node.data_dir()).context("opening the object store")?;
     let disk: HashMap<ObjectKey, u64> =
         store.scan()?.into_iter().map(|o| (o.key, o.size)).collect();
     let path = |k: &ObjectKey| {

@@ -28,8 +28,8 @@ pub mod usage;
 pub mod vfs;
 
 pub use local::{
-    ARCHIVE_STORE_BASE, Archive, ArchiveConfig, DataNode, DiskConfig, HOLD_FILE, ReconcileReport,
-    ReleaseReport, is_archive,
+    ARCHIVE_STORE_BASE, Archive, ArchiveConfig, DISK_TRANSFERS, DataNode, DataOptions, DiskConfig,
+    HOLD_FILE, HOST_MARKER, ReconcileReport, ReleaseReport, is_archive,
 };
 pub use vfs::{
     Copy, CopyKind, FenceHook, OpenMode, Passthrough, PushObject, PushRead, Vfs, VfsConfig,

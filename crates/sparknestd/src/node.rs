@@ -119,6 +119,11 @@ impl Node {
         let lanes_secret = secret.clone();
         std::fs::create_dir_all(&cfg.node.state_dir)
             .with_context(|| format!("creating {}", cfg.node.state_dir.display()))?;
+        // The objects' folder must be this host's (ADR-094), checked before
+        // the host binds a port or tells the cluster it is starting.
+        let first_start =
+            nest_raft::seed::applied_of(&cfg.node.state_dir.join("meta.sqlite")).is_none();
+        crate::datadir::check(&cfg, first_start)?;
         let rpc = Rpc::bind_with(
             RpcConfig {
                 node: id,
@@ -192,10 +197,11 @@ impl Node {
         // enough to saturate raptor's NVMe (6.7 GB/s measured; 3.5 at 1),
         // and nothing floods the page cache loaders rely on.
         let store = Arc::new(
-            ObjectStore::open(&cfg.node.state_dir)
+            ObjectStore::open(cfg.node.data_dir())
                 .context("opening object store")?
                 .window(4),
         );
+        crate::datadir::mark(&cfg)?;
         store.set_reserve(cfg.node.data_reserve_gib << 30);
         // Held (ADR-090): a first start (no metadata yet) on a folder that
         // already holds objects, which nothing here can judge yet: a store's
@@ -203,7 +209,7 @@ impl Node {
         // restarts until `nest cluster release` removes it; creating the file
         // by hand holds a host too. Set before the first sweep.
         let hold_file = cfg.node.state_dir.join(nest_data::HOLD_FILE);
-        let first_on_objects = local.applied.is_none() && store.scan().is_ok_and(|o| !o.is_empty());
+        let first_on_objects = first_start && store.scan().is_ok_and(|o| !o.is_empty());
         if first_on_objects && !hold_file.exists() {
             std::fs::write(
                 &hold_file,
@@ -217,7 +223,15 @@ impl Node {
                 "held: nothing in this host's stores is removed for being unlisted until `nest cluster release`"
             );
         }
-        let (data, handler) = DataNode::new(id, store, tuning.lease);
+        let (data, handler) = DataNode::with_options(
+            id,
+            store,
+            tuning.lease,
+            nest_data::DataOptions {
+                state_dir: Some(cfg.node.state_dir.clone()),
+                disk_transfers: cfg.node.disk_transfers,
+            },
+        );
         data.set_held(held);
         let mut mc = MetaNodeConfig::new(id, cfg.node.state_dir.clone(), cfg.cluster.name.clone());
         mc.heartbeat_ms = tuning.heartbeat_ms;

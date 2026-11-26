@@ -241,20 +241,38 @@ fn hf_sha256<'a>(path: &str, sha_of_xet: &'a HashMap<String, String>) -> Option<
 struct Verified {
     path: std::path::PathBuf,
     keys: HashSet<(u64, u64)>,
+    /// First line: the data dir the list is for.
+    header: String,
 }
 
 impl Verified {
-    fn load(root: &std::path::Path) -> Verified {
-        let path = root.join("fsck-verified");
-        let keys = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .lines()
+    /// Kept in the state dir, for the objects in `data` (ADR-094): a list
+    /// written for another data dir is not this one's and starts afresh.
+    fn load(state: &std::path::Path, data: &std::path::Path) -> Verified {
+        let path = state.join("fsck-verified");
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let here = format!("# data_dir {}", data.display());
+        let mut lines = text.lines().peekable();
+        let ok = match lines.peek() {
+            Some(l) if l.starts_with("# data_dir ") => *l == here,
+            _ => state == data,
+        };
+        if ok && lines.peek().is_some_and(|l| l.starts_with('#')) {
+            lines.next();
+        }
+        let lines: Vec<&str> = if ok { lines.collect() } else { Vec::new() };
+        let keys = lines
+            .into_iter()
             .filter_map(|l| {
                 let (f, g) = l.split_once('.')?;
                 Some((f.parse().ok()?, g.parse().ok()?))
             })
             .collect();
-        Verified { path, keys }
+        Verified {
+            path,
+            keys,
+            header: format!("{here}\n"),
+        }
     }
 
     fn contains(&self, k: ObjectKey) -> bool {
@@ -275,7 +293,8 @@ impl Verified {
             .retain(|(f, g)| disk.contains_key(&ObjectKey::new(FileId(*f), Generation(*g))));
         let mut keys: Vec<_> = self.keys.iter().collect();
         keys.sort();
-        let body: String = keys.iter().map(|(f, g)| format!("{f}.{g}\n")).collect();
+        let mut body = self.header.clone();
+        body.extend(keys.iter().map(|(f, g)| format!("{f}.{g}\n")));
         let tmp = self.path.with_extension("tmp");
         let r = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &self.path));
         if let Err(e) = r {
@@ -310,7 +329,7 @@ impl Vfs {
             objects: disk.len(),
             ..Default::default()
         };
-        let previous = previous_metadata(store.root());
+        let previous = previous_metadata(d.state_dir());
         // Deep: each shared-store blob's SHA-256, from the repo links, and
         // the copies verified before.
         let sha_of_xet: HashMap<String, String> = if opts.deep {
@@ -321,7 +340,9 @@ impl Vfs {
         } else {
             HashMap::new()
         };
-        let mut verified = opts.deep.then(|| Verified::load(store.root()));
+        let mut verified = opts
+            .deep
+            .then(|| Verified::load(d.state_dir(), store.root()));
         let path_of = |f: FileId| -> String {
             self.q(|c| query::path_of(c, f))
                 .ok()
