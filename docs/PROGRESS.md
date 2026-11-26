@@ -13,6 +13,12 @@ Its first start marked the data folder; it serves with 25.2 TiB free. A
 1.9 GiB, 22-file test copy took 29 s and was evicted. Not in any other
 host's `members` yet (it dials them; add it at their next config change).
 
+Copies onto its disk ran at 87 MB/s with the dataset's `sync=standard`
+(the disk full, writing each copy twice through the ZFS intent log); with
+`sync=disabled` on zpool3/zfs20 (TJ, QNAP UI) 224-230 MB/s, the disk's own
+rate, with `disk_transfers` 1 or 2 alike (2 kept). Reads off it 259 MB/s.
+`benchmarks/EYRIE-SPINNING-DISK.md`.
+
 ## 2026-11-26 — A host's copies on disks of their own; copies at once per host (ADR-094)
 
 `node.data_dir` puts a host's `objects/` and `staging/` in a folder apart
